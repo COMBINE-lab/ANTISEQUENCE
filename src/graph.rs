@@ -3,6 +3,7 @@ use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::env;
 
 use crate::errors::*;
 use crate::expr::*;
@@ -62,10 +63,101 @@ impl<T: Trace> Graph<T> {
     }
 
     fn run_trace_inner(&self, trace: &T) -> Result<()> {
+        // Enable naive batch processing if ANTISEQ_BATCH_SIZE > 1
+        let batch_size = env::var("ANTISEQ_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 1);
+
+        if let Some(bs) = batch_size {
+            return self.run_trace_inner_batched(trace, bs);
+        }
+
+        // Default single-read execution
         loop {
             let (_, done) = self.run_one(None, trace)?;
             if done {
                 break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_trace_inner_batched(&self, trace: &T, batch_size: usize) -> Result<()> {
+        // Naive batching: assume the first node is an input op that produces reads from None.
+        // We gather up to batch_size reads, then push them through the remaining nodes in order.
+        // No clever scheduling; just sequential per-node processing across the batch.
+
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+
+        let input_node = &self.nodes[0];
+
+        'outer: loop {
+            // 1) Fill a batch of reads from the input node.
+            let mut batch: Vec<Read> = Vec::with_capacity(batch_size);
+            let mut reached_done = false;
+
+            while batch.len() < batch_size {
+                let (maybe_read, done) = input_node.run(None, trace)?;
+                if let Some(r) = maybe_read {
+                    batch.push(r);
+                }
+                if done {
+                    reached_done = true;
+                    break;
+                }
+            }
+
+            if batch.is_empty() {
+                // Nothing more to process
+                break 'outer;
+            }
+
+            // 2) Process remaining nodes over the current batch.
+            let mut curr_batch = batch;
+            for node in self.nodes.iter().skip(1) {
+                // Apply required_names filter semantics: skip node if names not present.
+                let required = node.required_names();
+                let mut next_batch: Vec<Read> = Vec::with_capacity(curr_batch.len());
+                let mut node_signaled_done = false;
+
+                for read in curr_batch.into_iter() {
+                    if !read.has_names(required) {
+                        // Skip this node; keep the read
+                        next_batch.push(read);
+                        continue;
+                    }
+
+                    let (res, done) = node.run(Some(read), trace)?;
+                    if let Some(r) = res {
+                        next_batch.push(r);
+                    }
+                    if done {
+                        node_signaled_done = true;
+                        // Stop processing further reads to preserve original semantics
+                        // where a `done` signal halts the graph promptly.
+                        break;
+                    }
+                }
+
+                curr_batch = next_batch;
+
+                if curr_batch.is_empty() {
+                    break;
+                }
+
+                if node_signaled_done {
+                    // Stop after finishing current batch
+                    break 'outer;
+                }
+            }
+
+            if reached_done {
+                // No further input available; stop after finishing the processed batch
+                break 'outer;
             }
         }
 

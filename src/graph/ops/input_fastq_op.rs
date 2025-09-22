@@ -4,6 +4,7 @@ use thread_local::*;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,7 @@ pub struct InputFastqOp<'reader> {
     buf: ThreadLocal<RefCell<VecDeque<Read>>>,
     idx: AtomicUsize,
     interleaved: usize,
+    chunk_size: usize,
 }
 
 impl<'reader> InputFastqOp<'reader> {
@@ -35,6 +37,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved: 1,
+            chunk_size: default_chunk_size(),
         })
     }
 
@@ -56,6 +59,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved: 1,
+            chunk_size: default_chunk_size(),
         })
     }
 
@@ -71,6 +75,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved,
+            chunk_size: default_chunk_size(),
         })
     }
 
@@ -84,6 +89,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved: 1,
+            chunk_size: default_chunk_size(),
         })
     }
 
@@ -106,6 +112,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved: 1,
+            chunk_size: default_chunk_size(),
         })
     }
 
@@ -122,6 +129,7 @@ impl<'reader> InputFastqOp<'reader> {
             buf: ThreadLocal::new(),
             idx: AtomicUsize::new(0),
             interleaved,
+            chunk_size: default_chunk_size(),
         })
     }
 }
@@ -133,7 +141,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
 
         let buf = self
             .buf
-            .get_or(|| RefCell::new(VecDeque::with_capacity(CHUNK_SIZE)));
+            .get_or(|| RefCell::new(VecDeque::with_capacity(self.chunk_size)));
         let mut b = buf.borrow_mut();
 
         if b.is_empty() {
@@ -143,7 +151,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                 .map(|(r, o)| (r.lock().unwrap(), o))
                 .collect::<Vec<_>>();
 
-            'outer: for _ in 0..CHUNK_SIZE {
+            'outer: for _ in 0..self.chunk_size {
                 let idx = self.idx.fetch_add(self.interleaved, Ordering::Relaxed);
                 let mut curr_read = Read::new();
 
@@ -217,4 +225,12 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
     fn name(&self) -> &'static str {
         Self::NAME
     }
+}
+
+fn default_chunk_size() -> usize {
+    env::var("ANTISEQ_PREFETCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CHUNK_SIZE)
 }
