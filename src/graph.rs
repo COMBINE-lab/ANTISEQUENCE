@@ -35,6 +35,11 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+struct Stage<T: Trace> {
+    required: Vec<LabelOrAttr>,
+    nodes: Vec<Arc<dyn GraphNode<T>>>,
+}
+
 impl<T: Trace> Graph<T> {
     /// Create a new empty graph.
     pub fn new() -> Self {
@@ -63,47 +68,58 @@ impl<T: Trace> Graph<T> {
     }
 
     fn run_trace_inner(&self, trace: &T) -> Result<()> {
-        // Enable naive batch processing if ANTISEQ_BATCH_SIZE > 1
-        let batch_size = env::var("ANTISEQ_BATCH_SIZE")
+        // Always use batched execution. Choose a reasonable default batch size when not specified.
+        let bs = env::var("ANTISEQ_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 1);
+            .filter(|&n| n > 1)
+            .unwrap_or(256);
 
-        if let Some(bs) = batch_size {
-            return self.run_trace_inner_batched(trace, bs);
-        }
+        self.run_trace_inner_batched(trace, bs)
+    }
 
-        // Default single-read execution
-        loop {
-            let (_, done) = self.run_one(None, trace)?;
-            if done {
-                break;
+    fn build_stages(&self) -> Vec<Stage<T>> {
+        let mut stages: Vec<Stage<T>> = Vec::new();
+        for node in self.nodes.iter().skip(1) {
+            let req = node.required_names().to_vec();
+            match stages.last_mut() {
+                Some(s) if s.required == req => s.nodes.push(Arc::clone(node)),
+                _ => stages.push(Stage {
+                    required: req,
+                    nodes: vec![Arc::clone(node)],
+                }),
             }
         }
-
-        Ok(())
+        stages
     }
 
     fn run_trace_inner_batched(&self, trace: &T, batch_size: usize) -> Result<()> {
-        // Naive batching: assume the first node is an input op that produces reads from None.
-        // We gather up to batch_size reads, then push them through the remaining nodes in order.
-        // No clever scheduling; just sequential per-node processing across the batch.
+        // Stage-aware batching:
+        //  - Assume the first node is an input op that produces reads from None.
+        //  - Gather up to batch_size reads into a batch.
+        //  - Group remaining nodes into contiguous stages with identical required_names.
+        //  - For each stage, iterate reads in-order once to decide eligibility, then run the
+        //    stage's nodes on eligible reads, preserving read order and semantics.
 
         if self.nodes.is_empty() {
             return Ok(());
         }
 
         let input_node = &self.nodes[0];
+        let stages = self.build_stages();
+        // Simple pool: reuse these buffers across batches/stages to avoid allocation churn.
+        let mut batch_buf: Vec<Read> = Vec::with_capacity(batch_size);
+        let mut next_buf: Vec<Read> = Vec::with_capacity(batch_size);
 
         'outer: loop {
             // 1) Fill a batch of reads from the input node.
-            let mut batch: Vec<Read> = Vec::with_capacity(batch_size);
+            batch_buf.clear();
             let mut reached_done = false;
 
-            while batch.len() < batch_size {
+            while batch_buf.len() < batch_size {
                 let (maybe_read, done) = input_node.run(None, trace)?;
                 if let Some(r) = maybe_read {
-                    batch.push(r);
+                    batch_buf.push(r);
                 }
                 if done {
                     reached_done = true;
@@ -111,49 +127,68 @@ impl<T: Trace> Graph<T> {
                 }
             }
 
-            if batch.is_empty() {
+            if batch_buf.is_empty() {
                 // Nothing more to process
                 break 'outer;
             }
 
-            // 2) Process remaining nodes over the current batch.
-            let mut curr_batch = batch;
-            for node in self.nodes.iter().skip(1) {
-                // Apply required_names filter semantics: skip node if names not present.
-                let required = node.required_names();
-                let mut next_batch: Vec<Read> = Vec::with_capacity(curr_batch.len());
-                let mut node_signaled_done = false;
+            // 2) Process remaining nodes over the current batch, stage by stage.
+            let mut curr_batch = std::mem::take(&mut batch_buf);
+            for stage in stages.iter() {
+                let required = &stage.required;
+                next_buf.clear();
+                let mut stage_signaled_done = false;
 
-                for read in curr_batch.into_iter() {
+                for read in curr_batch.drain(..) {
                     if !read.has_names(required) {
-                        // Skip this node; keep the read
-                        next_batch.push(read);
+                        // Entire stage is ineligible for this read; carry forward unchanged.
+                        next_buf.push(read);
                         continue;
                     }
 
-                    let (res, done) = node.run(Some(read), trace)?;
-                    if let Some(r) = res {
-                        next_batch.push(r);
+                    // Run this read through all nodes in the stage, preserving order.
+                    // Although stage.required == node.required_names() for all nodes in this stage,
+                    // a node may change mappings; keep per-node has_names check for safety.
+                    let mut curr: Option<Read> = Some(read);
+                    for node in stage.nodes.iter() {
+                        if let Some(rdr) = &curr {
+                            if !rdr.has_names(node.required_names()) {
+                                continue;
+                            }
+                        }
+                        let (c, done) = node.run(curr, trace)?;
+                        curr = c;
+                        if done {
+                            stage_signaled_done = true;
+                            break;
+                        }
+                        if curr.is_none() {
+                            break;
+                        }
                     }
-                    if done {
-                        node_signaled_done = true;
-                        // Stop processing further reads to preserve original semantics
-                        // where a `done` signal halts the graph promptly.
+
+                    if let Some(r) = curr {
+                        next_buf.push(r);
+                    }
+                    if stage_signaled_done {
+                        // Stop processing further reads for this stage; exit promptly.
                         break;
                     }
                 }
 
-                curr_batch = next_batch;
+                std::mem::swap(&mut curr_batch, &mut next_buf);
 
                 if curr_batch.is_empty() {
                     break;
                 }
 
-                if node_signaled_done {
-                    // Stop after finishing current batch
+                if stage_signaled_done {
+                    // Stop after finishing current stage
                     break 'outer;
                 }
             }
+            // Return the buffer for reuse on the next iteration.
+            batch_buf = curr_batch;
 
             if reached_done {
                 // No further input available; stop after finishing the processed batch

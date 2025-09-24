@@ -1,6 +1,5 @@
 use block_aligner::{cigar::*, scan_block::*, scores::*};
 
-use rustc_hash::FxHashSet;
 
 use memchr::memmem;
 
@@ -13,11 +12,19 @@ use crate::graph::*;
 use crate::seed_search::*;
 use crate::Patterns;
 
+thread_local! {
+    static MATCH_ANY_FLAGS: RefCell<Vec<Option<Option<isize>>>> = RefCell::new(Vec::new());
+    static MATCH_ANY_USED: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    static MATCH_ANY_CANDS: RefCell<Vec<(usize, Option<isize>)>> = RefCell::new(Vec::new());
+}
+
 pub struct MatchAnyOp {
     required_names: Vec<LabelOrAttr>,
     label: Label,
     new_labels: [Option<Label>; 3],
     patterns: Patterns,
+    // Length of literal patterns by index (None for expr-based patterns)
+    literal_len: Vec<Option<usize>>,
     max_literal_len: usize,
     all_literals: bool,
     match_type: MatchType,
@@ -59,6 +66,13 @@ impl MatchAnyOp {
             .max()
             .unwrap_or(0);
         let all_literals = patterns.iter_exprs().count() == 0;
+        // Build a map of literal lengths by pattern index to allow quick sorting of candidates
+        let mut literal_len = vec![None; patterns.patterns().len()];
+        for (i, p) in patterns.iter_literals() {
+            if i < literal_len.len() {
+                literal_len[i] = Some(p.len());
+            }
+        }
         let mut required_names = vec![transform_expr.before(0).into()];
         required_names.extend(
             patterns
@@ -71,6 +85,7 @@ impl MatchAnyOp {
             label: transform_expr.before(0),
             new_labels,
             patterns,
+            literal_len,
             max_literal_len,
             all_literals,
             match_type,
@@ -145,7 +160,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             ((1.0 - identity).max(0.0) * (pattern_len as f64)).ceil() as usize
         };
 
-        let mut seed_hits = FxHashSet::default();
+        // Reuse thread-local buffers to record candidate pattern indices and their optional offsets.
+        // flags[i] = Some(Some(text_i)) means candidate with offset; Some(None) means candidate with no offset; None means absent.
+        let patterns_len = self.patterns.patterns().len();
 
         if let Some(seed_searcher) = &self.seed_searcher {
             let (text_slice, text_offset, use_i) = match self.match_type {
@@ -192,27 +209,72 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 }
             };
 
-            seed_searcher.search(
-                text_slice,
-                |SeedMatch {
-                     pattern_idx,
-                     pattern_i,
-                     text_i,
-                 }| {
-                    let text_i = if use_i {
-                        Some(((text_offset + text_i) as isize) - (pattern_i as isize))
-                    } else {
-                        None
-                    };
-                    seed_hits.insert((pattern_idx, text_i));
-                },
-            );
+            MATCH_ANY_FLAGS.with(|flags_cell| {
+                MATCH_ANY_USED.with(|used_cell| {
+                    let mut flags_ref = flags_cell.borrow_mut();
+                    let mut used_ref = used_cell.borrow_mut();
+                    if flags_ref.len() < patterns_len { flags_ref.resize(patterns_len, None); }
+                    seed_searcher.search(text_slice, |SeedMatch { pattern_idx, pattern_i, text_i }| {
+                        let ti = if use_i {
+                            Some(((text_offset + text_i) as isize) - (pattern_i as isize))
+                        } else {
+                            None
+                        };
+                        if flags_ref[pattern_idx].is_none() { used_ref.push(pattern_idx); }
+                        flags_ref[pattern_idx] = Some(ti);
+                    });
+                });
+            });
         } else {
-            seed_hits.extend(self.patterns.iter_literals().map(|(i, _)| (i, None)));
+            MATCH_ANY_FLAGS.with(|flags_cell| {
+                MATCH_ANY_USED.with(|used_cell| {
+                    let mut flags_ref = flags_cell.borrow_mut();
+                    let mut used_ref = used_cell.borrow_mut();
+                    if flags_ref.len() < patterns_len { flags_ref.resize(patterns_len, None); }
+                    used_ref.clear();
+                    for (i, _) in self.patterns.iter_literals() {
+                        if flags_ref[i].is_none() { used_ref.push(i); }
+                        flags_ref[i] = Some(None);
+                    }
+                });
+            });
         }
 
         if !self.all_literals {
-            seed_hits.extend(self.patterns.iter_exprs().map(|(i, _)| (i, None)));
+            MATCH_ANY_FLAGS.with(|flags_cell| {
+                MATCH_ANY_USED.with(|used_cell| {
+                    let mut flags_ref = flags_cell.borrow_mut();
+                    let mut used_ref = used_cell.borrow_mut();
+                    if flags_ref.len() < patterns_len { flags_ref.resize(patterns_len, None); }
+                    for (i, _) in self.patterns.iter_exprs() {
+                        if flags_ref[i].is_none() { used_ref.push(i); }
+                        flags_ref[i] = Some(None);
+                    }
+                });
+            });
+        }
+
+        // Collect to a TLS vector of (idx, text_i), then move it out to avoid per-read allocations.
+        let mut seed_hits_vec: Vec<(usize, Option<isize>)> = MATCH_ANY_CANDS.with(|cands_cell| {
+            MATCH_ANY_FLAGS.with(|flags_cell| {
+                MATCH_ANY_USED.with(|used_cell| {
+                    let mut cands = cands_cell.borrow_mut();
+                    cands.clear();
+                    let mut flags_ref = flags_cell.borrow_mut();
+                    let mut used_ref = used_cell.borrow_mut();
+                    cands.reserve(used_ref.len());
+                    for &idx in used_ref.iter() {
+                        let ti = flags_ref[idx].take().unwrap();
+                        cands.push((idx, ti));
+                    }
+                    used_ref.clear();
+                    std::mem::take(&mut *cands)
+                })
+            })
+        });
+        // Heuristic: prioritize longer literal patterns to increase early pruning by max_matches.
+        if seed_hits_vec.len() > 16 {
+            seed_hits_vec.sort_by_key(|(idx, _)| std::cmp::Reverse(self.literal_len.get(*idx).and_then(|x| *x).unwrap_or(0)));
         }
 
         let mut max_matches = 0;
@@ -222,7 +284,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         let mut max_cut_pos2 = 0;
         let mut multimatches = false;
 
-        for (pattern_idx, text_i) in seed_hits {
+        'candidates: for (pattern_idx, text_i) in seed_hits_vec.iter().copied() {
             let pattern = &self.patterns.patterns()[pattern_idx];
             let pattern_str_cow = pattern.get(&read).map_err(|e| Error::NameError {
                 source: e,
@@ -274,7 +336,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 }
                 ExactBoundedMatch { from, to } => {
                     let to = text.len().min(to);
-                    let text_around = &text[from..=to];
+                    let text_around = &text[from..to];
                     memmem::find(text_around, pattern_str)
                         .map(|i| (pattern_len, from + i, from + i + pattern_len))
                 }
@@ -321,60 +383,91 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 } => {
                     let t = t.get(pattern_len);
                     let to = text.len().min(to);
-                    let text_around = &text[from..=to];
+                    let text_around = &text[from..to];
                     hamming_search(text_around, pattern_str, t)
                         .map(|(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx))
                 }
-                GlobalAln(identity) => aligner_cell
-                    .as_ref()
-                    .unwrap()
-                    .borrow_mut()
-                    .align(text, pattern_str, identity, identity)
-                    .map(|(m, _, end_idx)| (m, end_idx, 0)),
-                LocalAln { identity, overlap } => {
-                    let a = additional(identity, pattern_len) as isize;
-                    let (text_start, text_end) = if let Some(text_i) = text_i {
-                        (
-                            (text_i - a).max(0) as usize,
-                            text.len()
-                                .min((text_i + (pattern_len as isize) + a) as usize),
-                        )
+                GlobalAln(identity) => {
+                    if (identity - 1.0).abs() < f64::EPSILON {
+                        if text == pattern_str {
+                            Some((pattern_len, pattern_len, 0))
+                        } else {
+                            None
+                        }
+                    } else if text.len() == pattern_len {
+                        // Fast path: equal lengths. Use Hamming to accept early if identity threshold is met
+                        // without invoking the aligner (gapless alignment is valid for global).
+                        let thr = (identity * (pattern_len as f64)).ceil() as usize;
+                        hamming(text, pattern_str, thr).map(|m| (m, pattern_len, 0))
                     } else {
-                        (0, text.len())
-                    };
-                    let text_around = &text[text_start..text_end];
-                    aligner_cell
-                        .as_ref()
-                        .unwrap()
-                        .borrow_mut()
-                        .align(text_around, pattern_str, identity, overlap)
-                        .map(|(m, start_idx, end_idx)| {
-                            (m, text_start + start_idx, text_start + end_idx)
-                        })
+                        aligner_cell
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .align(text, pattern_str, identity, identity)
+                            .map(|(m, _, end_idx)| (m, end_idx, 0))
+                    }
+                }
+                LocalAln { identity, overlap } => {
+                    if (identity - 1.0).abs() < f64::EPSILON && (overlap - 1.0).abs() < f64::EPSILON {
+                        if let Some(start) = memmem::find(text, pattern_str) {
+                            Some((pattern_len, start, start + pattern_len))
+                        } else {
+                            None
+                        }
+                    } else {
+                        let a = additional(identity, pattern_len) as isize;
+                        let (text_start, text_end) = if let Some(text_i) = text_i {
+                            (
+                                (text_i - a).max(0) as usize,
+                                text.len().min((text_i + (pattern_len as isize) + a) as usize),
+                            )
+                        } else {
+                            (0, text.len())
+                        };
+                        let text_around = &text[text_start..text_end];
+                        aligner_cell
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .align(text_around, pattern_str, identity, overlap)
+                            .map(|(m, start_idx, end_idx)| (m, text_start + start_idx, text_start + end_idx))
+                    }
                 }
                 PrefixAln { identity, overlap } => {
-                    let a = additional(identity, pattern_len);
-                    aligner_cell
-                        .as_ref()
-                        .unwrap()
-                        .borrow_mut()
-                        .align(
-                            &text[..text.len().min(pattern_len + a)],
-                            pattern_str,
-                            identity,
-                            overlap,
-                        )
-                        .map(|(m, _, end_idx)| (m, end_idx, 0))
+                    if (identity - 1.0).abs() < f64::EPSILON && (overlap - 1.0).abs() < f64::EPSILON {
+                        if pattern_len <= text.len() && &text[..pattern_len] == pattern_str {
+                            Some((pattern_len, pattern_len, 0))
+                        } else {
+                            None
+                        }
+                    } else {
+                        let a = additional(identity, pattern_len);
+                        aligner_cell
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .align(&text[..text.len().min(pattern_len + a)], pattern_str, identity, overlap)
+                            .map(|(m, _, end_idx)| (m, end_idx, 0))
+                    }
                 }
                 SuffixAln { identity, overlap } => {
-                    let a = additional(identity, pattern_len);
-                    let text_start = text.len().saturating_sub(pattern_len + a);
-                    aligner_cell
-                        .as_ref()
-                        .unwrap()
-                        .borrow_mut()
-                        .align(&text[text_start..], pattern_str, identity, overlap)
-                        .map(|(m, start_idx, _)| (m, text_start + start_idx, 0))
+                    if (identity - 1.0).abs() < f64::EPSILON && (overlap - 1.0).abs() < f64::EPSILON {
+                        if pattern_len <= text.len() && &text[text.len() - pattern_len..] == pattern_str {
+                            Some((pattern_len, text.len() - pattern_len, 0))
+                        } else {
+                            None
+                        }
+                    } else {
+                        let a = additional(identity, pattern_len);
+                        let text_start = text.len().saturating_sub(pattern_len + a);
+                        aligner_cell
+                            .as_ref()
+                            .unwrap()
+                            .borrow_mut()
+                            .align(&text[text_start..], pattern_str, identity, overlap)
+                            .map(|(m, start_idx, _)| (m, text_start + start_idx, 0))
+                    }
                 }
             };
 
@@ -386,20 +479,39 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     max_cut_pos1 = cut_pos1;
                     max_cut_pos2 = cut_pos2;
                     multimatches = false;
+                    // Early-exit: if all patterns are literals and we achieved a perfect match
+                    // of the maximum literal length, no other candidate can surpass this.
+                    if self.all_literals && matches == self.max_literal_len {
+                        break 'candidates;
+                    }
                 } else if matches == max_matches && pattern_idx != max_pattern_idx {
                     multimatches = true;
                 }
             }
         }
 
-        if let Some((pattern_str, pattern_attrs)) = max_pattern {
-            let pattern_str = pattern_str.into_owned();
+        // Return the candidates Vec to TLS pool for reuse
+        MATCH_ANY_CANDS.with(|cell| {
+            *cell.borrow_mut() = seed_hits_vec;
+        });
+
+        if let Some((pattern_str_cow, pattern_attrs)) = max_pattern {
+            // Convert only if we actually need to store the pattern bytes; ensure no immutable borrow of `read` remains
+            // before we take a mutable borrow for mapping updates.
+            let maybe_owned = if self.patterns.pattern_name().is_some() {
+                Some(pattern_str_cow.into_owned())
+            } else {
+                // Explicitly drop to end borrow.
+                drop(pattern_str_cow);
+                None
+            };
             let mapping = read
                 .mapping_mut(self.label.str_type, self.label.label)
                 .unwrap();
 
             if let Some(pattern_name) = self.patterns.pattern_name() {
-                *mapping.data_mut(pattern_name) = Data::Bytes(pattern_str);
+                // safe to unwrap: we created owned bytes when pattern_name was Some
+                *mapping.data_mut(pattern_name) = Data::Bytes(maybe_owned.unwrap());
             }
 
             if let Some(multimatch_name) = self.patterns.multimatch_name() {
@@ -581,7 +693,6 @@ struct GlobalLocalAligner<const LOCAL: bool> {
 }
 
 impl<const LOCAL: bool> GlobalLocalAligner<LOCAL> {
-    const MIN_SIZE: usize = 32;
     const MAX_SIZE: usize = 512;
     const GAPS: Gaps = Gaps {
         open: -2,
@@ -632,14 +743,13 @@ impl<const LOCAL: bool> Aligner for GlobalLocalAligner<LOCAL> {
         let max_size = pattern
             .len()
             .min(read.len())
-            .next_power_of_two()
             .min(Self::MAX_SIZE);
 
         self.read_padded.set_bytes::<NucMatrix>(read, max_size);
         self.pattern_padded
             .set_bytes::<NucMatrix>(pattern, max_size);
 
-        let min_size = if LOCAL { max_size } else { Self::MIN_SIZE };
+        let min_size = max_size;
 
         self.block.align(
             &self.pattern_padded,
@@ -662,27 +772,33 @@ impl<const LOCAL: bool> Aligner for GlobalLocalAligner<LOCAL> {
         let mut matches = 0;
         let mut total = 0;
 
-        self.cigar.reverse();
-        let mut read_start_idx = res.reference_idx;
-
-        for i in 0..self.cigar.len() {
-            let OpLen { op, len } = self.cigar.get(i);
-
-            match op {
-                Operation::Eq => {
-                    read_start_idx -= len;
-                    matches += len;
+        // Compute start index only when LOCAL == true; for global alignment (LOCAL == false)
+        // the caller ignores the start index, so avoid reverse + index math.
+        let mut read_start_idx = if LOCAL { res.reference_idx } else { 0 };
+        if LOCAL {
+            self.cigar.reverse();
+            for i in 0..self.cigar.len() {
+                let OpLen { op, len } = self.cigar.get(i);
+                match op {
+                    Operation::Eq => {
+                        read_start_idx -= len;
+                        matches += len;
+                    }
+                    Operation::X | Operation::D => {
+                        read_start_idx -= len;
+                    }
+                    _ => (),
                 }
-                Operation::X => {
-                    read_start_idx -= len;
-                }
-                Operation::D => {
-                    read_start_idx -= len;
-                }
-                _ => (),
+                total += len;
             }
-
-            total += len;
+        } else {
+            // LOCAL == false: we still need matches/total for scoring, but no need to reverse
+            // or compute the start index.
+            for i in 0..self.cigar.len() {
+                let OpLen { op, len } = self.cigar.get(i);
+                if op == Operation::Eq { matches += len; }
+                if let Operation::Eq | Operation::X | Operation::D = op { total += len; }
+            }
         }
 
         let identity = (matches as f64) / (total as f64);
@@ -761,7 +877,6 @@ impl<const PREFIX: bool> Aligner for PrefixSuffixAligner<PREFIX> {
         let max_size = pattern
             .len()
             .min(read.len())
-            .next_power_of_two()
             .min(Self::MAX_SIZE);
 
         if PREFIX {
@@ -843,9 +958,10 @@ impl<const PREFIX: bool> Aligner for PrefixSuffixAligner<PREFIX> {
         }
 
         // count matches and total columns for calculating identity and overlap
+        // We must include all alignment columns (Eq/X/ins/del) in total regardless of whether the
+        // second alignment spanned the entire pattern.
         let mut matches = 0;
         let mut total = 0;
-
         for i in 0..self.cigar.len() {
             let OpLen { op, len } = self.cigar.get(i);
             if op == Operation::Eq {
