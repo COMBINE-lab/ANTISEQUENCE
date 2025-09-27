@@ -32,6 +32,38 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     }
     fn required_names(&self) -> &[LabelOrAttr];
     fn name(&self) -> &'static str;
+    /// Called once at end-of-stream for flushing or cleanup in batch mode.
+    /// Default: no-op.
+    fn finish(&self) -> Result<()> { Ok(()) }
+
+    /// Default batch processing: map `run` across reads in order, skipping when
+    /// required names are unavailable, and stop early if any call signals `done`.
+    fn run_batch(&self, mut reads: Vec<Read>, _trace: &T) -> Result<(Vec<Read>, bool)> {
+        let mut out = Vec::with_capacity(reads.len());
+        let req = self.required_names();
+        for read in reads.drain(..) {
+            if !read.has_names(req) {
+                out.push(read);
+                continue;
+            }
+            let (maybe_read, done) = self.run_inner(read)?;
+            if let Some(r) = maybe_read { out.push(r); }
+            if done { return Ok((out, true)); }
+        }
+        Ok((out, false))
+    }
+
+    /// Default batch sourcing for source nodes: repeatedly call `run(None, ..)`
+    /// until at least `min_batch` reads are collected or `done` is signaled.
+    fn next_batch(&self, min_batch: usize, trace: &T) -> Result<(Vec<Read>, bool)> {
+        let mut batch = Vec::with_capacity(min_batch);
+        loop {
+            if batch.len() >= min_batch { return Ok((batch, false)); }
+            let (maybe_read, done) = self.run(None, trace)?;
+            if done { return Ok((batch, true)); }
+            if let Some(r) = maybe_read { batch.push(r); } else { return Ok((batch, false)); }
+        }
+    }
 }
 
 impl<T: Trace> Graph<T> {
@@ -56,7 +88,11 @@ impl<T: Trace> Graph<T> {
     /// Run a graph until all reads processed, outputting the trace to the specified path.
     pub fn run_trace(&self, trace_path: impl AsRef<Path>) -> Result<()> {
         let trace = T::new(trace_path);
-        let res = self.run_trace_inner(&trace);
+        let res = if batch_enabled_from_env() {
+            self.run_batched_trace_inner(&trace)
+        } else {
+            self.run_trace_inner(&trace)
+        };
         trace.finish();
         res
     }
@@ -90,8 +126,13 @@ impl<T: Trace> Graph<T> {
         thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    self.run_trace_inner(&trace)
-                        .unwrap_or_else(|e| panic!("{e}"))
+                    if batch_enabled_from_env() {
+                        self.run_batched_trace_inner(&trace)
+                            .unwrap_or_else(|e| panic!("{e}"))
+                    } else {
+                        self.run_trace_inner(&trace)
+                            .unwrap_or_else(|e| panic!("{e}"))
+                    }
                 });
             }
         });
@@ -154,6 +195,72 @@ impl<T: Trace> Graph<T> {
 
         Ok((curr, false, false))
     }
+
+    /// Run the graph in batched mode until all reads processed.
+    pub fn run_batched(&self) -> Result<()> {
+        self.run_batched_trace(DEFAULT_TRACE_PATH)
+    }
+
+    /// Run the graph in batched mode until all reads processed, outputting the trace.
+    pub fn run_batched_trace(&self, trace_path: impl AsRef<Path>) -> Result<()> {
+        let trace = T::new(trace_path);
+        let res = self.run_batched_trace_inner(&trace);
+        trace.finish();
+        res
+    }
+
+    fn run_batched_trace_inner(&self, trace: &T) -> Result<()> {
+        let min_batch = batch_size_from_env();
+
+        loop {
+            // 1) Source batch from first node using its batch API.
+            let (mut batch, src_done) = self.nodes[0].next_batch(min_batch, trace)?;
+            if src_done && batch.is_empty() {
+                for node in &self.nodes { node.finish().unwrap_or(()); }
+                return Ok(());
+            }
+
+            if batch.is_empty() {
+                // Not enough reads yet; try again. This can happen if the source returned
+                // fewer than min_batch but not done (e.g., temporary pause).
+                continue;
+            }
+
+            // 2) Run the rest of the nodes over the batch via their batch API.
+            for node in self.nodes.iter().skip(1) {
+                let (next_batch, done) = node.run_batch(batch, trace)?;
+                batch = next_batch;
+                if done {
+                    for node in &self.nodes { node.finish().unwrap_or(()); }
+                    return Ok(());
+                }
+                if batch.is_empty() { break; }
+            }
+
+            // If source already signaled done, and after processing batch we have nothing more,
+            // flush and exit.
+            if src_done {
+                for node in &self.nodes { node.finish().unwrap_or(()); }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn batch_enabled_from_env() -> bool {
+    std::env::var("ANTISEQ_BATCH_ENABLE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn batch_size_from_env() -> usize {
+    const DEFAULT_BATCH_SIZE: usize = 1024;
+    const MIN_BATCH_SIZE: usize = 1000;
+    std::env::var("ANTISEQ_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+        .max(MIN_BATCH_SIZE)
 }
 
 pub use MatchType::*;

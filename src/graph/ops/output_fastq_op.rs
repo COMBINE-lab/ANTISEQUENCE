@@ -74,6 +74,60 @@ impl OutputFastqFileOp {
 }
 
 impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
+    fn run_batch(&self, reads: Vec<Read>, _trace: &T) -> Result<(Vec<Read>, bool)> {
+        // If required names are not present for a read, skip writing but keep the read.
+        // Aggregate bytes per output file to minimize lock contention and syscalls.
+        let mut buffers: FxHashMap<Vec<u8>, Vec<u8>> = FxHashMap::default();
+
+        for read in reads.iter() {
+            // If this node requires names and they are missing, skip this read entirely.
+            if !read.has_names(&self.required_names) {
+                continue;
+            }
+
+            for (i, file_expr) in self.file_exprs.iter().enumerate() {
+                let file_name = file_expr
+                    .eval_bytes(read, false)
+                    .map_err(|e| Error::NameError {
+                        source: e,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?;
+
+                let record = read
+                    .to_fastq((i + 1) as _)
+                    .map_err(|e| Error::NameError {
+                        source: e,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?;
+
+                let file_key = file_name.into_owned();
+                let buf = buffers.entry(file_key).or_insert_with(|| {
+                    // Heuristic: pre-size for a handful of records on first encounter.
+                    let approx = 4 + record.0.len() + record.1.len() + record.2.len();
+                    Vec::with_capacity(approx * 8)
+                });
+                append_fastq_record(buf, record);
+            }
+        }
+
+        // Drain buffers to their corresponding writers, one lock per file.
+        for (file_name, buf) in buffers.into_iter() {
+            let locked_writer = self.get_writer(&file_name).map_err(|e| Error::FileIo {
+                file: utf8(&file_name),
+                source: Box::new(e),
+            })?;
+
+            let mut writer = locked_writer.lock().unwrap();
+            writer
+                .write_all(&buf)
+                .map_err(|e| Error::BytesIo(Box::new(e)))?;
+        }
+
+        Ok((reads, false))
+    }
+
     fn run_inner(&self, read: Read) -> Result<(Option<Read>, bool)> {
         for (i, file_expr) in self.file_exprs.iter().enumerate() {
             let file_name = file_expr
@@ -109,6 +163,15 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
     fn name(&self) -> &'static str {
         Self::NAME
     }
+
+    fn finish(&self) -> Result<()> {
+        let map = self.file_writers.lock().unwrap();
+        for w in map.values() {
+            let mut writer = w.lock().unwrap();
+            writer.flush().map_err(|e| Error::BytesIo(Box::new(e)))?;
+        }
+        Ok(())
+    }
 }
 
 pub struct OutputFastqOp<'writer> {
@@ -140,6 +203,45 @@ impl<'writer> OutputFastqOp<'writer> {
 }
 
 impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
+    fn run_batch(&self, reads: Vec<Read>, _trace: &T) -> Result<(Vec<Read>, bool)> {
+        // Aggregate bytes per fixed writer index; lock once per writer.
+        let n_writers = self.writers.len();
+        let mut bufs: Vec<Vec<u8>> = (0..n_writers).map(|_| Vec::new()).collect();
+
+        // Pre-size using the first read as a heuristic if available.
+        if let Some(first) = reads.get(0) {
+            for i in 0..n_writers {
+                if let Ok(r) = first.to_fastq((i + 1) as _) {
+                    let approx = 4 + r.0.len() + r.1.len() + r.2.len();
+                    bufs[i].reserve(approx * reads.len());
+                }
+            }
+        }
+
+        for read in reads.iter() {
+            for (i, buf) in bufs.iter_mut().enumerate() {
+                let record = read
+                    .to_fastq((i + 1) as _)
+                    .map_err(|e| Error::NameError {
+                        source: e,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?;
+                append_fastq_record(buf, record);
+            }
+        }
+
+        for (i, writer) in self.writers.iter().enumerate() {
+            let mut writer = writer.lock().unwrap();
+            use std::io::Write as _;
+            writer
+                .write_all(&bufs[i])
+                .map_err(|e| Error::BytesIo(Box::new(e)))?;
+        }
+
+        Ok((reads, false))
+    }
+
     fn run_inner(&self, read: Read) -> Result<(Option<Read>, bool)> {
         for (i, writer) in self.writers.iter().enumerate() {
             let record = read.to_fastq((i + 1) as _).map_err(|e| Error::NameError {
@@ -162,6 +264,14 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
     fn name(&self) -> &'static str {
         Self::NAME
     }
+
+    fn finish(&self) -> Result<()> {
+        for w in &self.writers {
+            let mut writer = w.lock().unwrap();
+            writer.flush().map_err(|e| Error::BytesIo(Box::new(e)))?;
+        }
+        Ok(())
+    }
 }
 
 pub fn write_fastq_record(
@@ -175,4 +285,17 @@ pub fn write_fastq_record(
     writer.write_all(b"\n+\n").unwrap();
     writer.write_all(&record.2).unwrap();
     writer.write_all(b"\n").unwrap();
+}
+
+/// Append a FASTQ record directly into a Vec<u8> buffer.
+#[inline]
+fn append_fastq_record(buf: &mut Vec<u8>, record: (&[u8], &[u8], &[u8])) {
+    buf.reserve(3 + record.0.len() + record.1.len() + record.2.len());
+    buf.push(b'@');
+    buf.extend_from_slice(record.0);
+    buf.push(b'\n');
+    buf.extend_from_slice(record.1);
+    buf.extend_from_slice(b"\n+\n");
+    buf.extend_from_slice(record.2);
+    buf.push(b'\n');
 }
