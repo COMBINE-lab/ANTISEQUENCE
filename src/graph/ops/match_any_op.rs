@@ -416,7 +416,6 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     *mapping.data_mut(multimatch_name) = Data::Bytes(val);
                 }
 
-                use crate::inline_string::InlineString;
                 for (&attr, data) in self.patterns.attr_names().iter().zip(pattern_attrs) {
                     *mapping.data_mut(attr) = data.clone();
                 }
