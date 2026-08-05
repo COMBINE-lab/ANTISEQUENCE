@@ -375,6 +375,7 @@ mod pipeline_tests {
             }
 
             let stats = graph.input_stats().unwrap();
+            assert!(stats.lengths_collected);
             assert_eq!(stats.read_counts, vec![5_000]);
             assert_eq!(stats.read_length_min, vec![4]);
             assert_eq!(stats.read_length_max, vec![4]);
@@ -401,7 +402,9 @@ mod pipeline_tests {
         graph.run().unwrap();
 
         assert_eq!(graph.statistics_level(), StatisticsLevel::Basic);
-        assert_eq!(graph.input_stats().unwrap().read_counts, vec![2]);
+        let stats = graph.input_stats().unwrap();
+        assert_eq!(stats.read_counts, vec![2]);
+        assert!(!stats.lengths_collected);
         assert!(graph.match_distance_counts().is_empty());
     }
 

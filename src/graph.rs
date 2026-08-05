@@ -78,6 +78,7 @@ pub struct MatchDistanceCounts {
 #[derive(Debug, Clone)]
 pub struct InputStats {
     pub n_fastqs: usize,
+    pub lengths_collected: bool,
     pub read_counts: Vec<usize>,
     pub read_length_min: Vec<usize>,
     pub read_length_max: Vec<usize>,

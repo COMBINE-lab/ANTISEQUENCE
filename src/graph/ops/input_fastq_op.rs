@@ -268,9 +268,9 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let cs = self.batch_size.load(Ordering::Relaxed);
-        let collect_stats =
-            self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8;
-        let stats_cell = collect_stats.then(|| {
+        let statistics_level = self.statistics_level.load(Ordering::Relaxed);
+        let collect_lengths = statistics_level == StatisticsLevel::Detailed as u8;
+        let stats_cell = collect_lengths.then(|| {
             self.local_stats
                 .get_or(|| Mutex::new(InputStatsAccumulator::new(self.n_fastqs)))
         });
@@ -388,6 +388,16 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             b.truncate(i);
         }
 
+        if statistics_level == StatisticsLevel::Basic as u8 && !b.is_empty() {
+            let mut stats = self
+                .local_stats
+                .get_or(|| Mutex::new(InputStatsAccumulator::new(self.n_fastqs)))
+                .lock();
+            for lane in &mut stats.lanes {
+                lane.count += b.len();
+            }
+        }
+
         if b.is_empty() {
             return Ok((None, true));
         }
@@ -457,6 +467,8 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
 
         Some(InputStats {
             n_fastqs,
+            lengths_collected: self.statistics_level.load(Ordering::Relaxed)
+                == StatisticsLevel::Detailed as u8,
             read_counts,
             read_length_min,
             read_length_max,

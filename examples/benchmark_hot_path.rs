@@ -27,7 +27,7 @@ struct Args {
     reads: usize,
     threads: usize,
     repetitions: usize,
-    collect_statistics: bool,
+    statistics_level: StatisticsLevel,
     mode: Mode,
     execution: Execution,
     queue_capacity: Option<usize>,
@@ -105,7 +105,7 @@ fn parse_args() -> Args {
         reads: 1_000_000,
         threads: 4,
         repetitions: 5,
-        collect_statistics: false,
+        statistics_level: StatisticsLevel::Off,
         mode: Mode::Hamming,
         execution: Execution::WholeGraphWorkers,
         queue_capacity: None,
@@ -143,7 +143,18 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("repetitions")
             }
-            "--statistics" => args.collect_statistics = true,
+            "--statistics" => args.statistics_level = StatisticsLevel::Detailed,
+            "--statistics-level" => {
+                args.statistics_level = match cli.next().expect("--statistics-level value").as_str()
+                {
+                    "off" => StatisticsLevel::Off,
+                    "basic" => StatisticsLevel::Basic,
+                    "detailed" => StatisticsLevel::Detailed,
+                    value => panic!(
+                        "unknown statistics level {value:?}; expected off, basic, or detailed"
+                    ),
+                }
+            }
             "--execution" => {
                 args.execution = match cli.next().expect("--execution value").as_str() {
                     "whole-graph" => Execution::WholeGraphWorkers,
@@ -302,6 +313,7 @@ fn parse_args() -> Args {
                 eprintln!(
                     "usage: benchmark_hot_path [--reads N] [--threads N] \
                      [--repetitions N] [--statistics] \
+                     [--statistics-level off|basic|detailed] \
                      [--mode passthrough|hamming|seeded|edit-dp] \
                      [--execution whole-graph|pipeline|pipeline-ordered] \
                      [--queue-capacity N] [--max-in-flight-batches N] [--batch-size N] \
@@ -481,7 +493,7 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
             ));
         }
     }
-    graph.set_collect_statistics(args.collect_statistics);
+    graph.set_statistics_level(args.statistics_level);
     match args.output {
         OutputMode::Null => {
             graph.add(NullOutputOp::new());
@@ -526,6 +538,7 @@ fn main() {
     let input = make_fastq(args.reads, &args);
     let mut graph_build_seconds = Vec::with_capacity(args.repetitions);
     let mut seconds = Vec::with_capacity(args.repetitions);
+    let mut statistics_aggregation_seconds = Vec::with_capacity(args.repetitions);
     let mut pipeline_reports = Vec::with_capacity(args.repetitions);
     let mut output_byte_counts = Vec::with_capacity(args.repetitions);
 
@@ -554,6 +567,16 @@ fn main() {
                 Some(graph.try_run_pipeline(config).expect("pipeline run"))
             }
         };
+        let aggregation_start = Instant::now();
+        if args.statistics_level.is_enabled() {
+            std::hint::black_box((
+                graph.input_stats(),
+                graph.match_distance_counts(),
+                graph.failed_reads(),
+                graph.final_output_reads(),
+            ));
+        }
+        statistics_aggregation_seconds.push(aggregation_start.elapsed().as_secs_f64());
         // Include writer flush/finalization (notably the gzip trailer) in the
         // end-to-end interval. Output nodes flush in their Drop implementations.
         drop(graph);
@@ -601,6 +624,11 @@ fn main() {
         SeedScenario::Repetitive => "repetitive",
     };
     let default_pipeline_config = PipelineConfig::new(args.threads);
+    let statistics_level = match args.statistics_level {
+        StatisticsLevel::Off => "off",
+        StatisticsLevel::Basic => "basic",
+        StatisticsLevel::Detailed => "detailed",
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -630,7 +658,9 @@ fn main() {
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),
             "max_in_flight_batches": args.max_in_flight_batches.unwrap_or(default_pipeline_config.max_in_flight_batches),
             "batch_size": args.batch_size.unwrap_or(default_pipeline_config.batch_size),
-            "statistics": args.collect_statistics,
+            "statistics": args.statistics_level.is_enabled(),
+            "statistics_level": statistics_level,
+            "statistics_aggregation_seconds": statistics_aggregation_seconds,
             "repetitions": args.repetitions,
             "seconds": seconds,
             "mean_seconds": mean_seconds,
