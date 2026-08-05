@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use parking_lot::Mutex;
+use thread_local::ThreadLocal;
 
 use crate::graph::*;
 
 pub struct CountOp {
     required_names: Vec<LabelOrAttr>,
     selector_exprs: Vec<Expr>,
-    counts: Vec<AtomicUsize>,
+    counts: ThreadLocal<Mutex<Vec<usize>>>,
 }
 
 impl CountOp {
@@ -22,35 +23,39 @@ impl CountOp {
             .iter()
             .flat_map(|n| n.required_names())
             .collect();
-        let counts = (0..selector_exprs.len())
-            .map(|_| AtomicUsize::new(0))
-            .collect();
         Self {
             required_names,
             selector_exprs,
-            counts,
+            counts: ThreadLocal::new(),
         }
     }
 
     /// Returns the counts.
     pub fn counts(&self) -> Vec<usize> {
-        self.counts
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .collect()
+        let mut totals = vec![0usize; self.selector_exprs.len()];
+        for local in self.counts.iter() {
+            for (total, count) in totals.iter_mut().zip(local.lock().iter()) {
+                *total += count;
+            }
+        }
+        totals
     }
 }
 
 impl<T: Trace> GraphNode<T> for CountOp {
     fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+        let counts = self
+            .counts
+            .get_or(|| Mutex::new(vec![0usize; self.selector_exprs.len()]));
+        let mut counts = counts.lock();
         for read in &reads {
-            for (c, n) in self.counts.iter().zip(&self.selector_exprs) {
-                if n.eval_bool(read).map_err(|e| Error::NameError {
+            for (count, selector) in counts.iter_mut().zip(&self.selector_exprs) {
+                if selector.eval_bool(read).map_err(|e| Error::NameError {
                     source: e,
                     read: read.clone(),
                     context: Self::NAME,
                 })? {
-                    c.fetch_add(1, Ordering::Relaxed);
+                    *count += 1;
                 }
             }
         }

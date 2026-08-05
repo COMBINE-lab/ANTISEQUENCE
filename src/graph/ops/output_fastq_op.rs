@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufWriter, IoSlice, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -58,13 +58,20 @@ pub struct OutputFastqFileOp {
     gzip_level: u32,
     parallel_gzip_members: bool,
     parallel_gzip_stream: Option<ParallelGzipStreamConfig>,
-    collect_statistics: AtomicBool,
-    emitted_reads: AtomicUsize,
+    statistics_level: AtomicU8,
+    emitted_reads: ThreadLocal<Mutex<usize>>,
 }
 
 impl OutputFastqFileOp {
     const NAME: &'static str = "OutputFastqFileOp";
     pub const DEFAULT_GZIP_LEVEL: u32 = 6;
+
+    #[inline]
+    fn record_emitted(&self, count: usize) {
+        if self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8 {
+            *self.emitted_reads.get_or(|| Mutex::new(0)).lock() += count;
+        }
+    }
 
     fn validate_gzip_level(level: u32) -> std::io::Result<()> {
         if level <= 9 {
@@ -105,8 +112,8 @@ impl OutputFastqFileOp {
             gzip_level: Self::DEFAULT_GZIP_LEVEL,
             parallel_gzip_members: false,
             parallel_gzip_stream: None,
-            collect_statistics: AtomicBool::new(false),
-            emitted_reads: AtomicUsize::new(0),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         }
     }
 
@@ -149,8 +156,8 @@ impl OutputFastqFileOp {
             gzip_level: Self::DEFAULT_GZIP_LEVEL,
             parallel_gzip_members: false,
             parallel_gzip_stream: None,
-            collect_statistics: AtomicBool::new(false),
-            emitted_reads: AtomicUsize::new(0),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         }
     }
 
@@ -483,9 +490,7 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         let prepared = self.prepare_fastq_files(reads, recycled)?;
-        if self.collect_statistics.load(Ordering::Relaxed) {
-            self.emitted_reads.fetch_add(reads.len(), Ordering::Relaxed);
-        }
+        self.record_emitted(reads.len());
         Ok(prepared)
     }
 
@@ -495,9 +500,7 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
 
     fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         if stub_output() {
-            if self.collect_statistics.load(Ordering::Relaxed) {
-                self.emitted_reads.fetch_add(reads.len(), Ordering::Relaxed);
-            }
+            self.record_emitted(reads.len());
             return Ok((Some(reads), false));
         }
 
@@ -597,20 +600,17 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
             }
         }
 
-        if self.collect_statistics.load(Ordering::Relaxed) {
-            self.emitted_reads.fetch_add(reads.len(), Ordering::Relaxed);
-        }
+        self.record_emitted(reads.len());
         Ok((Some(reads), false))
     }
 
-    fn set_collect_statistics(&self, enabled: bool) {
-        self.collect_statistics.store(enabled, Ordering::Relaxed);
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
     }
 
     fn emitted_reads(&self) -> Option<usize> {
-        self.collect_statistics
-            .load(Ordering::Relaxed)
-            .then(|| self.emitted_reads.load(Ordering::Relaxed))
+        (self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8)
+            .then(|| self.emitted_reads.iter().map(|count| *count.lock()).sum())
     }
 
     fn required_names(&self) -> &[LabelOrAttr] {

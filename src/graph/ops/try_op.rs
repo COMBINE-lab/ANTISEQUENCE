@@ -1,11 +1,13 @@
 use crate::graph::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+use thread_local::ThreadLocal;
 
 pub struct TryOp<T: Trace = NoTrace> {
     try_graph: Graph<T>,
     catch_graph: Graph<T>,
-    collect_stats: AtomicBool,
-    failed_reads: AtomicUsize,
+    statistics_level: AtomicU8,
+    failed_reads: ThreadLocal<Mutex<usize>>,
 }
 
 impl<T: Trace> TryOp<T> {
@@ -22,8 +24,8 @@ impl<T: Trace> TryOp<T> {
         Self {
             try_graph,
             catch_graph,
-            collect_stats: AtomicBool::new(false),
-            failed_reads: AtomicUsize::new(0),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            failed_reads: ThreadLocal::new(),
         }
     }
 }
@@ -33,7 +35,9 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
         let start = trace.start(&reads);
         let reads = reads.ok_or(Error::MissingNodeInput(Self::NAME))?;
         let mut accepted = Vec::with_capacity(reads.len());
-        let collect_stats = self.collect_stats.load(Ordering::Relaxed);
+        let collect_stats =
+            self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8;
+        let mut rejected_count = 0usize;
 
         // Label availability can differ after matching and conditional
         // transformations. Checking only the first read would route a mixed
@@ -47,12 +51,16 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
             let rejected = failed || output.as_ref().is_none_or(Vec::is_empty);
             if rejected {
                 if collect_stats {
-                    self.failed_reads.fetch_add(1, Ordering::Relaxed);
+                    rejected_count += 1;
                 }
                 let _ = self.catch_graph.run_one(Some(vec![original]), trace)?;
             } else if let Some(mut output) = output {
                 accepted.append(&mut output);
             }
+        }
+
+        if rejected_count > 0 {
+            *self.failed_reads.get_or(|| Mutex::new(0)).lock() += rejected_count;
         }
 
         let res = (Some(accepted), false);
@@ -69,16 +77,15 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
         Self::NAME
     }
 
-    fn set_collect_statistics(&self, enabled: bool) {
-        self.collect_stats.store(enabled, Ordering::Relaxed);
-        self.try_graph.set_collect_statistics(enabled);
-        self.catch_graph.set_collect_statistics(enabled);
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
+        self.try_graph.set_statistics_level(level);
+        self.catch_graph.set_statistics_level(level);
     }
 
     fn failed_reads(&self) -> Option<usize> {
-        self.collect_stats
-            .load(Ordering::Relaxed)
-            .then(|| self.failed_reads.load(Ordering::Relaxed))
+        (self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8)
+            .then(|| self.failed_reads.iter().map(|count| *count.lock()).sum())
     }
 
     fn all_match_distance_counts(&self) -> Vec<MatchDistanceCounts> {

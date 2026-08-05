@@ -6,13 +6,12 @@ use smallvec::SmallVec;
 
 use memchr::memmem;
 use parking_lot::Mutex;
-
 use thread_local::*;
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::marker::Send;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::graph::*;
 use crate::seed_search::*;
@@ -185,12 +184,17 @@ pub struct MatchAnyOp {
     seed_searcher: Option<SeedSearchers>,
     /// Fast hash-based lookup for Hamming matching (when applicable)
     hamming_lookup: Option<HammingLookup>,
-    collect_stats: AtomicBool,
-    // Per-thread match-distance histograms; each thread stores counts by
-    // exact edit distance, and we aggregate across threads when queried.
-    distance_counts: ThreadLocal<Mutex<Vec<usize>>>,
-    // Total number of reads that reached this node (across all threads).
-    total_attempts: AtomicUsize,
+    statistics_level: AtomicU8,
+    // Each worker mutates only its own accumulator. Graph execution joins all
+    // workers before these cells are read and aggregated.
+    local_stats: ThreadLocal<Mutex<LocalMatchStats>>,
+}
+
+#[derive(Default)]
+struct LocalMatchStats {
+    attempts: usize,
+    distance_counts: Vec<usize>,
+    ambiguity: AmbiguityCounts,
 }
 
 impl MatchAnyOp {
@@ -284,9 +288,8 @@ impl MatchAnyOp {
             seed_hits: ThreadLocal::new(),
             seed_searcher,
             hamming_lookup,
-            collect_stats: AtomicBool::new(false),
-            distance_counts: ThreadLocal::new(),
-            total_attempts: AtomicUsize::new(0),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            local_stats: ThreadLocal::new(),
         }
     }
 
@@ -406,6 +409,7 @@ impl MatchAnyOp {
         text: &[u8],
         quality: Option<&[u8]>,
         candidates: &[usize],
+        mut stats: Option<&mut LocalMatchStats>,
     ) -> Result<Option<usize>> {
         debug_assert!(candidates.len() > 1);
         let mut ordered: SmallVec<[usize; 4]> = candidates.iter().copied().collect();
@@ -415,9 +419,23 @@ impl MatchAnyOp {
             return Ok(ordered.first().copied());
         }
 
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.ambiguity.total += 1;
+        }
         match self.effective_ambiguity_policy() {
-            AmbiguityPolicy::Accept | AmbiguityPolicy::First => Ok(ordered.first().copied()),
-            AmbiguityPolicy::NoMatch => Ok(None),
+            AmbiguityPolicy::Accept | AmbiguityPolicy::First => {
+                if let Some(stats) = stats {
+                    stats.ambiguity.accepted += 1;
+                    stats.ambiguity.resolved_first += 1;
+                }
+                Ok(ordered.first().copied())
+            }
+            AmbiguityPolicy::NoMatch => {
+                if let Some(stats) = stats {
+                    stats.ambiguity.dropped += 1;
+                }
+                Ok(None)
+            }
             AmbiguityPolicy::Error => Err(Error::GraphExecution(format!(
                 "ambiguous equal-best match for {}.{} against pattern indices {:?}",
                 self.label.str_type, self.label.label, ordered
@@ -432,6 +450,10 @@ impl MatchAnyOp {
                     }
                 }
                 let selected = (hasher.finish() as usize) % ordered.len();
+                if let Some(stats) = stats {
+                    stats.ambiguity.accepted += 1;
+                    stats.ambiguity.resolved_random += 1;
+                }
                 Ok(Some(ordered[selected]))
             }
             AmbiguityPolicy::Quality { min_delta } => {
@@ -483,8 +505,15 @@ impl MatchAnyOp {
                 if best_score < runner_up_score
                     && runner_up_score - best_score >= u64::from(min_delta)
                 {
+                    if let Some(stats) = stats {
+                        stats.ambiguity.accepted += 1;
+                        stats.ambiguity.resolved_quality += 1;
+                    }
                     Ok(Some(best_idx))
                 } else {
+                    if let Some(stats) = stats {
+                        stats.ambiguity.dropped += 1;
+                    }
                     Ok(None)
                 }
             }
@@ -494,14 +523,16 @@ impl MatchAnyOp {
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
-        let collect_stats = self.collect_stats.load(Ordering::Relaxed);
-        if collect_stats {
-            self.total_attempts
-                .fetch_add(reads.len(), Ordering::Relaxed);
+        let collect_stats =
+            self.statistics_level.load(Ordering::Relaxed) == StatisticsLevel::Detailed as u8;
+        let stats_cell = collect_stats.then(|| {
+            self.local_stats
+                .get_or(|| Mutex::new(LocalMatchStats::default()))
+        });
+        let mut stats = stats_cell.map(Mutex::lock);
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.attempts += reads.len();
         }
-        let distance_counts_cell =
-            collect_stats.then(|| self.distance_counts.get_or(|| Mutex::new(Vec::new())));
-        let mut distance_counts = distance_counts_cell.map(Mutex::lock);
 
         // Access thread-local aligner once per batch
         use MatchType::*;
@@ -556,12 +587,18 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                                     read: read.clone(),
                                     context: Self::NAME,
                                 })?;
-                            self.resolve_ambiguity(read, text, quality, candidates)?
-                                .map(|pattern_idx| HammingLookupEntry {
-                                    pattern_idx,
-                                    distance: hit.distance,
-                                    tie_index: 0,
-                                })
+                            self.resolve_ambiguity(
+                                read,
+                                text,
+                                quality,
+                                candidates,
+                                stats.as_deref_mut(),
+                            )?
+                            .map(|pattern_idx| HammingLookupEntry {
+                                pattern_idx,
+                                distance: hit.distance,
+                                tie_index: 0,
+                            })
                         } else {
                             Some(hit)
                         }
@@ -571,9 +608,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 match resolved_hit {
                     Some(hit) => {
                         // Fast path matched
-                        if collect_stats {
+                        if let Some(stats) = stats.as_deref_mut() {
                             Self::record_distance(
-                                distance_counts.as_deref_mut().unwrap(),
+                                &mut stats.distance_counts,
                                 pattern_len,
                                 pattern_len.saturating_sub(hit.distance as usize),
                             );
@@ -1001,7 +1038,13 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     .iter()
                     .map(|&(pattern_idx, _, _, _)| pattern_idx)
                     .collect();
-                self.resolve_ambiguity(read, text, quality, &candidate_indices)?
+                self.resolve_ambiguity(
+                    read,
+                    text,
+                    quality,
+                    &candidate_indices,
+                    stats.as_deref_mut(),
+                )?
             } else {
                 best_candidates.first().map(|candidate| candidate.0)
             };
@@ -1021,12 +1064,8 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             context: Self::NAME,
                         })?;
                 let pattern_attrs = selected_pattern.attrs();
-                if collect_stats {
-                    Self::record_distance(
-                        distance_counts.as_deref_mut().unwrap(),
-                        max_pattern_len,
-                        max_matches,
-                    );
+                if let Some(stats) = stats.as_deref_mut() {
+                    Self::record_distance(&mut stats.distance_counts, max_pattern_len, max_matches);
                 }
                 let pattern_value = self
                     .patterns
@@ -1149,22 +1188,31 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         Self::NAME
     }
 
-    fn set_collect_statistics(&self, enabled: bool) {
-        self.collect_stats.store(enabled, Ordering::Relaxed);
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
     }
 
     fn match_distance_counts(&self) -> Option<MatchDistanceCounts> {
-        if !self.collect_stats.load(Ordering::Relaxed) {
+        if self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Detailed as u8 {
             return None;
         }
         let mut totals: Vec<usize> = Vec::new();
+        let mut total_attempts = 0usize;
+        let mut ambiguity = AmbiguityCounts::default();
 
-        for local in self.distance_counts.iter() {
+        for local in self.local_stats.iter() {
             let local = local.lock();
-            if local.len() > totals.len() {
-                totals.resize(local.len(), 0);
+            total_attempts += local.attempts;
+            ambiguity.total += local.ambiguity.total;
+            ambiguity.accepted += local.ambiguity.accepted;
+            ambiguity.dropped += local.ambiguity.dropped;
+            ambiguity.resolved_first += local.ambiguity.resolved_first;
+            ambiguity.resolved_random += local.ambiguity.resolved_random;
+            ambiguity.resolved_quality += local.ambiguity.resolved_quality;
+            if local.distance_counts.len() > totals.len() {
+                totals.resize(local.distance_counts.len(), 0);
             }
-            for (d, &count) in local.iter().enumerate() {
+            for (d, &count) in local.distance_counts.iter().enumerate() {
                 totals[d] += count;
             }
         }
@@ -1177,7 +1225,8 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         Some(MatchDistanceCounts {
             label: self.stats_label(),
             counts: totals,
-            total: self.total_attempts.load(Ordering::Relaxed),
+            total: total_attempts,
+            ambiguity,
         })
     }
 }

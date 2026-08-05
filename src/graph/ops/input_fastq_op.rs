@@ -2,8 +2,9 @@ use needletail::*;
 use parking_lot::Mutex;
 use rapidgzip_core::Decoder as RapidGzipDecoder;
 use smallvec::SmallVec;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use thread_local::ThreadLocal;
 
 use crate::errors::*;
 use crate::expr::LabelOrAttr;
@@ -68,11 +69,9 @@ pub struct InputFastqOp<'reader> {
     idx: AtomicUsize,
     interleaved: usize,
     batch_size: AtomicUsize,
-    collect_stats: AtomicBool,
-    read_counts: Vec<AtomicUsize>,
-    read_length_min: Vec<AtomicUsize>,
-    read_length_max: Vec<AtomicUsize>,
-    read_length_sum: Vec<AtomicUsize>,
+    statistics_level: AtomicU8,
+    n_fastqs: usize,
+    local_stats: ThreadLocal<Mutex<InputStatsAccumulator>>,
 }
 
 impl<'reader> InputFastqOp<'reader> {
@@ -91,13 +90,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -124,13 +119,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -179,13 +170,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -202,13 +189,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -223,13 +206,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -254,13 +233,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 
@@ -278,13 +253,9 @@ impl<'reader> InputFastqOp<'reader> {
             idx: AtomicUsize::new(0),
             interleaved,
             batch_size: AtomicUsize::new(chunk_size()),
-            collect_stats: AtomicBool::new(false),
-            read_counts: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_min: (0..n_fastqs)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-            read_length_max: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
-            read_length_sum: (0..n_fastqs).map(|_| AtomicUsize::new(0)).collect(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            n_fastqs,
+            local_stats: ThreadLocal::new(),
         })
     }
 }
@@ -297,9 +268,13 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let cs = self.batch_size.load(Ordering::Relaxed);
-        let collect_stats = self.collect_stats.load(Ordering::Relaxed);
-        let mut input_stats =
-            collect_stats.then(|| InputStatsAccumulator::new(self.read_counts.len()));
+        let collect_stats =
+            self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8;
+        let stats_cell = collect_stats.then(|| {
+            self.local_stats
+                .get_or(|| Mutex::new(InputStatsAccumulator::new(self.n_fastqs)))
+        });
+        let mut input_stats = stats_cell.map(Mutex::lock);
         let mut b = reads.unwrap_or_else(|| Vec::with_capacity(cs));
         // Do NOT clear b here, we want to reuse its elements.
 
@@ -338,7 +313,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                     })?;
 
                     let seq = record.seq();
-                    if let Some(stats) = &mut input_stats {
+                    if let Some(stats) = input_stats.as_deref_mut() {
                         stats.update(j, seq.len());
                     }
                     curr_read.set_fastq_entry(
@@ -382,7 +357,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                         source: Box::new(e),
                     })?;
                     let seq = record.seq();
-                    if let Some(stats) = &mut input_stats {
+                    if let Some(stats) = input_stats.as_deref_mut() {
                         stats.update(j, seq.len());
                     }
                     curr_read.set_fastq_entry(
@@ -413,10 +388,6 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             b.truncate(i);
         }
 
-        if let Some(stats) = input_stats {
-            self.commit_length_stats(stats);
-        }
-
         if b.is_empty() {
             return Ok((None, true));
         }
@@ -434,8 +405,8 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
         Self::NAME
     }
 
-    fn set_collect_statistics(&self, enabled: bool) {
-        self.collect_stats.store(enabled, Ordering::Relaxed);
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
     }
 
     fn set_batch_size(&self, batch_size: usize) {
@@ -457,32 +428,31 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
     }
 
     fn input_stats(&self) -> Option<InputStats> {
-        if !self.collect_stats.load(Ordering::Relaxed) {
+        if self.statistics_level.load(Ordering::Relaxed) == StatisticsLevel::Off as u8 {
             return None;
         }
-        let n_fastqs = self.read_counts.len();
+        let n_fastqs = self.n_fastqs;
 
         let mut read_counts = Vec::with_capacity(n_fastqs);
         let mut read_length_min = Vec::with_capacity(n_fastqs);
         let mut read_length_max = Vec::with_capacity(n_fastqs);
         let mut read_length_sum = Vec::with_capacity(n_fastqs);
 
-        for i in 0..n_fastqs {
-            let count = self.read_counts[i].load(Ordering::Relaxed);
-            read_counts.push(count);
-
-            let min = self.read_length_min[i].load(Ordering::Relaxed);
-            let max = self.read_length_max[i].load(Ordering::Relaxed);
-            let sum = self.read_length_sum[i].load(Ordering::Relaxed);
-
-            if count == 0 {
-                read_length_min.push(0);
-                read_length_max.push(0);
-            } else {
-                read_length_min.push(min);
-                read_length_max.push(max);
+        let mut totals = InputStatsAccumulator::new(n_fastqs);
+        for local in self.local_stats.iter() {
+            let local = local.lock();
+            for (total, observed) in totals.lanes.iter_mut().zip(&local.lanes) {
+                total.count += observed.count;
+                total.min = total.min.min(observed.min);
+                total.max = total.max.max(observed.max);
+                total.sum += observed.sum;
             }
-            read_length_sum.push(sum);
+        }
+        for lane in totals.lanes {
+            read_counts.push(lane.count);
+            read_length_min.push(if lane.count == 0 { 0 } else { lane.min });
+            read_length_max.push(if lane.count == 0 { 0 } else { lane.max });
+            read_length_sum.push(lane.sum);
         }
 
         Some(InputStats {
@@ -492,19 +462,5 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             read_length_max,
             read_length_sum,
         })
-    }
-}
-
-impl<'reader> InputFastqOp<'reader> {
-    fn commit_length_stats(&self, stats: InputStatsAccumulator) {
-        for (lane, stats) in stats.lanes.into_iter().enumerate() {
-            if stats.count == 0 {
-                continue;
-            }
-            self.read_counts[lane].fetch_add(stats.count, Ordering::Relaxed);
-            self.read_length_sum[lane].fetch_add(stats.sum, Ordering::Relaxed);
-            self.read_length_min[lane].fetch_min(stats.min, Ordering::Relaxed);
-            self.read_length_max[lane].fetch_max(stats.max, Ordering::Relaxed);
-        }
     }
 }

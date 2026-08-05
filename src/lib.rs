@@ -388,6 +388,69 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn test_basic_statistics_omit_detailed_match_histograms() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "ACGC", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            Patterns::from_strs(["ACGT"]),
+            Hamming(Count(3)),
+        ));
+        graph.set_statistics_level(StatisticsLevel::Basic);
+        graph.run().unwrap();
+
+        assert_eq!(graph.statistics_level(), StatisticsLevel::Basic);
+        assert_eq!(graph.input_stats().unwrap().read_counts, vec![2]);
+        assert!(graph.match_distance_counts().is_empty());
+    }
+
+    fn ambiguity_statistics(policy: AmbiguityPolicy, quality: &str) -> MatchDistanceCounts {
+        let fq = fastq_bytes(&[("read1", "AAAA", quality)]);
+        let patterns = Patterns::new(
+            [
+                Pattern::from_literal(b"CAAA", Vec::<Data>::new()),
+                Pattern::from_literal(b"AAAC", Vec::<Data>::new()),
+            ],
+            std::iter::empty::<&str>(),
+        )
+        .with_ambiguity_policy(policy);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(3)),
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        graph.match_distance_counts().remove(0)
+    }
+
+    #[test]
+    fn test_detailed_statistics_report_ambiguity_policy_outcomes() {
+        let first = ambiguity_statistics(AmbiguityPolicy::First, "IIII");
+        assert_eq!(first.ambiguity.total, 1);
+        assert_eq!(first.ambiguity.accepted, 1);
+        assert_eq!(first.ambiguity.resolved_first, 1);
+        assert_eq!(first.ambiguity.dropped, 0);
+
+        let random = ambiguity_statistics(AmbiguityPolicy::Random { seed: 7 }, "IIII");
+        assert_eq!(random.ambiguity.accepted, 1);
+        assert_eq!(random.ambiguity.resolved_random, 1);
+
+        let quality = ambiguity_statistics(AmbiguityPolicy::Quality { min_delta: 1 }, "!III");
+        assert_eq!(quality.ambiguity.accepted, 1);
+        assert_eq!(quality.ambiguity.resolved_quality, 1);
+
+        let dropped = ambiguity_statistics(AmbiguityPolicy::NoMatch, "IIII");
+        assert_eq!(dropped.ambiguity.total, 1);
+        assert_eq!(dropped.ambiguity.dropped, 1);
+        assert_eq!(dropped.ambiguity.accepted, 0);
+    }
+
+    #[test]
     fn test_graph_interleaved_reader() {
         let fq = fastq_bytes(&[
             ("read1_R1", "AAAA", "IIII"),

@@ -1,7 +1,7 @@
 use std::marker::{Send, Sync};
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -19,6 +19,52 @@ pub use ops::*;
 /// Computation graph of read operations, where each operation is a node.
 pub struct Graph<T: Trace = NoTrace> {
     nodes: Vec<Arc<dyn GraphNode<T>>>,
+    statistics_level: AtomicU8,
+}
+
+/// Controls the amount of runtime instrumentation collected by graph nodes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum StatisticsLevel {
+    /// Do not collect data-dependent counters or histograms.
+    #[default]
+    Off = 0,
+    /// Collect input, output, and rejection totals.
+    Basic = 1,
+    /// Also collect per-match distance and ambiguity outcomes.
+    Detailed = 2,
+}
+
+impl StatisticsLevel {
+    #[inline(always)]
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    #[inline(always)]
+    pub fn is_detailed(self) -> bool {
+        self == Self::Detailed
+    }
+
+    #[inline(always)]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Basic,
+            2 => Self::Detailed,
+            _ => Self::Off,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AmbiguityCounts {
+    pub total: usize,
+    pub accepted: usize,
+    pub dropped: usize,
+    pub resolved_first: usize,
+    pub resolved_random: usize,
+    pub resolved_quality: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +72,7 @@ pub struct MatchDistanceCounts {
     pub label: String,
     pub counts: Vec<usize>,
     pub total: usize,
+    pub ambiguity: AmbiguityCounts,
 }
 
 #[derive(Debug, Clone)]
@@ -334,12 +381,22 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         )))
     }
 
-    /// Enable or disable optional runtime statistics for this node.
+    /// Select optional runtime statistics for this node.
     ///
     /// Statistics are disabled by default so ordinary graph execution does not
     /// pay for counters, histogram locks, or read-length aggregation.
     #[inline]
-    fn set_collect_statistics(&self, _enabled: bool) {}
+    fn set_statistics_level(&self, _level: StatisticsLevel) {}
+
+    /// Backward-compatible detailed-statistics switch.
+    #[inline]
+    fn set_collect_statistics(&self, enabled: bool) {
+        self.set_statistics_level(if enabled {
+            StatisticsLevel::Detailed
+        } else {
+            StatisticsLevel::Off
+        });
+    }
 
     /// Set the preferred number of reads produced per input batch.
     #[inline]
@@ -411,7 +468,10 @@ impl<T: Trace> Default for Graph<T> {
 impl<T: Trace> Graph<T> {
     /// Create a new empty graph.
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+        }
     }
 
     /// Add a read operation node to the graph and return the node.
@@ -424,9 +484,23 @@ impl<T: Trace> Graph<T> {
 
     /// Enable or disable optional runtime statistics on every graph node.
     pub fn set_collect_statistics(&self, enabled: bool) {
+        self.set_statistics_level(if enabled {
+            StatisticsLevel::Detailed
+        } else {
+            StatisticsLevel::Off
+        });
+    }
+
+    /// Select the runtime statistics level for this graph and nested nodes.
+    pub fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
         for node in &self.nodes {
-            node.set_collect_statistics(enabled);
+            node.set_statistics_level(level);
         }
+    }
+
+    pub fn statistics_level(&self) -> StatisticsLevel {
+        StatisticsLevel::from_u8(self.statistics_level.load(Ordering::Relaxed))
     }
 
     /// Run a graph until all reads processed.
