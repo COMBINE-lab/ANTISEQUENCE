@@ -1,3 +1,6 @@
+#[cfg(not(feature = "seed-baseline"))]
+use hashbrown::HashTable;
+#[cfg(feature = "seed-baseline")]
 use rustc_hash::FxHashMap;
 
 use cfg_if::cfg_if;
@@ -240,8 +243,8 @@ impl SeedSearcher for GeneralSearcher {
 
 struct HashToPatternIdx {
     filter: Filter,
-    map: FxHashMap<u64, (u32, u32)>, // hash to intervals in pattern_idxs
-    pattern_idxs: Vec<(u32, u32)>,   // (pattern_idx, pattern_i)
+    table: SeedTable,
+    pattern_idxs: Vec<(u32, u32)>, // (pattern_idx, pattern_i)
 }
 
 impl HashToPatternIdx {
@@ -249,15 +252,11 @@ impl HashToPatternIdx {
         assert!(hash_pattern_idxs.len() <= u32::MAX as usize);
         hash_pattern_idxs.sort_unstable();
         let filter = Filter::new(hash_pattern_idxs.iter().map(|(h, _, _)| *h));
-        let mut map = FxHashMap::default();
-
-        for (i, (hash, _, _)) in hash_pattern_idxs.iter().enumerate() {
-            map.entry(*hash).or_insert((i as u32, i as u32)).1 += 1;
-        }
+        let table = SeedTable::new(&hash_pattern_idxs);
 
         Self {
             filter,
-            map,
+            table,
             pattern_idxs: hash_pattern_idxs
                 .into_iter()
                 .map(|(_, idx, i)| (idx as u32, i as u32))
@@ -289,7 +288,7 @@ impl HashToPatternIdx {
             contains &= contains - 1;
 
             let hash = hashes[i];
-            let Some(&(start, end)) = self.map.get(&hash) else {
+            let Some((start, end)) = self.table.get(hash) else {
                 continue;
             };
 
@@ -301,6 +300,50 @@ impl HashToPatternIdx {
                 });
             }
         }
+    }
+}
+
+#[cfg(not(feature = "seed-baseline"))]
+struct SeedTable(HashTable<(u64, (u32, u32))>);
+
+#[cfg(not(feature = "seed-baseline"))]
+impl SeedTable {
+    fn new(entries: &[(u64, usize, usize)]) -> Self {
+        let mut table: HashTable<(u64, (u32, u32))> = HashTable::with_capacity(entries.len());
+        for (i, (hash, _, _)) in entries.iter().enumerate() {
+            if let Some((_, interval)) = table.find_mut(*hash, |(key, _)| key == hash) {
+                interval.1 += 1;
+            } else {
+                table.insert_unique(*hash, (*hash, (i as u32, i as u32 + 1)), |(key, _)| *key);
+            }
+        }
+        Self(table)
+    }
+
+    #[inline(always)]
+    fn get(&self, hash: u64) -> Option<(u32, u32)> {
+        self.0
+            .find(hash, |(key, _)| *key == hash)
+            .map(|(_, interval)| *interval)
+    }
+}
+
+#[cfg(feature = "seed-baseline")]
+struct SeedTable(FxHashMap<u64, (u32, u32)>);
+
+#[cfg(feature = "seed-baseline")]
+impl SeedTable {
+    fn new(entries: &[(u64, usize, usize)]) -> Self {
+        let mut table = FxHashMap::default();
+        for (i, (hash, _, _)) in entries.iter().enumerate() {
+            table.entry(*hash).or_insert((i as u32, i as u32)).1 += 1;
+        }
+        Self(table)
+    }
+
+    #[inline(always)]
+    fn get(&self, hash: u64) -> Option<(u32, u32)> {
+        self.0.get(&hash).copied()
     }
 }
 
@@ -424,8 +467,78 @@ cfg_if! {
 
 #[inline(always)]
 fn wyhash_byte(b: u8) -> u64 {
+    #[cfg(feature = "seed-baseline")]
+    {
+        return wyhash_byte_const(b);
+    }
+    #[cfg(not(feature = "seed-baseline"))]
+    WYHASH_BYTE_LOOKUP[b as usize]
+}
+
+#[cfg(not(feature = "seed-baseline"))]
+const WYHASH_BYTE_LOOKUP: [u64; 256] = {
+    let mut lookup = [0u64; 256];
+    let mut byte = 0;
+    while byte < lookup.len() {
+        lookup[byte] = wyhash_byte_const(byte as u8);
+        byte += 1;
+    }
+    lookup
+};
+
+const fn wyhash_byte_const(byte: u8) -> u64 {
     let a = 0xa076_1d64_78bd_642fu64;
-    let b = (b as u64) ^ 0xe703_7ed1_a0b4_28dbu64;
+    let b = (byte as u64) ^ 0xe703_7ed1_a0b4_28dbu64;
     let c = (a as u128).wrapping_mul(b as u128);
     (c ^ (c >> 64)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn direct_hash(kmer: &[u8]) -> u64 {
+        kmer.iter()
+            .fold(0u64, |hash, &byte| hash.rotate_left(1) ^ wyhash_byte(byte))
+    }
+
+    #[test]
+    fn rolling_hash_matches_direct_recomputation_for_all_byte_values() {
+        let sequence = (0u8..=255).collect::<Vec<_>>();
+        for k in [1, 2, 7, 31, 64] {
+            let mut observed = Vec::new();
+            unsafe {
+                GeneralSearcher::get_hashes(&sequence, k, |hashes, len, _| {
+                    observed.extend_from_slice(&hashes[..len]);
+                });
+            }
+            let expected = sequence.windows(k).map(direct_hash).collect::<Vec<_>>();
+            assert_eq!(observed, expected, "rolling hash mismatch at k={k}");
+        }
+    }
+
+    #[test]
+    fn general_searcher_emits_every_exact_seed_candidate() {
+        let patterns = [b"ACGTNacgt".as_slice(), b"NacgtXYZ".as_slice()];
+        let text = b"--ACGTNacgt--NacgtXYZ--";
+        let k = 4;
+        let searcher = GeneralSearcher::new(patterns.iter().copied().enumerate(), k);
+        let mut observed = BTreeSet::new();
+        searcher.search(text, |seed| {
+            observed.insert((seed.pattern_idx, seed.pattern_i - k, seed.text_i - k));
+        });
+
+        let mut expected = BTreeSet::new();
+        for (pattern_idx, pattern) in patterns.iter().enumerate() {
+            for (pattern_i, pattern_seed) in pattern.windows(k).enumerate() {
+                for (text_i, text_seed) in text.windows(k).enumerate() {
+                    if pattern_seed == text_seed {
+                        expected.insert((pattern_idx, pattern_i, text_i));
+                    }
+                }
+            }
+        }
+        assert!(expected.is_subset(&observed));
+    }
 }

@@ -57,6 +57,8 @@ pub struct StrMappings {
 }
 
 impl StrMappings {
+    const MAX_RETAINED_FASTQ_BYTES: usize = 64 * 1024;
+
     #[inline(always)]
     pub fn new(string: Vec<u8>, origin: Arc<Origin>, idx: usize) -> Self {
         let mut mappings: SmallVec<[Mapping; 4]> = SmallVec::new();
@@ -81,6 +83,54 @@ impl StrMappings {
             origin,
             idx,
         }
+    }
+
+    #[inline(always)]
+    fn reset_buffer(buffer: &mut Vec<u8>, bytes: &[u8]) {
+        if buffer.capacity() > Self::MAX_RETAINED_FASTQ_BYTES
+            && bytes.len() <= Self::MAX_RETAINED_FASTQ_BYTES
+        {
+            *buffer = Vec::with_capacity(bytes.len());
+        } else {
+            buffer.clear();
+        }
+        buffer.extend_from_slice(bytes);
+    }
+
+    #[inline(always)]
+    fn reset_default_mapping(&mut self, len: usize) {
+        if let Some(default) = self.mappings.first_mut() {
+            default.label = InlineString::new(b"*");
+            default.start = 0;
+            default.len = len;
+            if let Some(data) = default.data.as_mut() {
+                data.clear();
+            }
+            self.mappings.truncate(1);
+        } else {
+            self.mappings.push(Mapping::new_default(len));
+        }
+    }
+
+    #[inline(always)]
+    fn reset_fastq_entry(
+        &mut self,
+        string: &[u8],
+        qual: Option<&[u8]>,
+        origin: Arc<Origin>,
+        idx: usize,
+    ) {
+        Self::reset_buffer(&mut self.string, string);
+        match qual {
+            Some(bytes) => {
+                let quality = self.qual.get_or_insert_with(Vec::new);
+                Self::reset_buffer(quality, bytes);
+            }
+            None => self.qual = None,
+        }
+        self.reset_default_mapping(string.len());
+        self.origin = origin;
+        self.idx = idx;
     }
 
     #[inline(always)]
@@ -532,6 +582,8 @@ pub enum Data {
     Bool(bool),
     Int(isize),
     Float(f64),
+    /// Allocation-free byte storage for values up to 24 non-NUL bytes.
+    InlineBytes(InlineString),
     Bytes(Vec<u8>),
 }
 
@@ -944,19 +996,7 @@ impl Read {
         if slot_idx < self.str_mappings.len() {
             let (t, sm) = &mut self.str_mappings[slot_idx];
             *t = str_type;
-
-            let mut s = std::mem::take(&mut sm.string);
-            s.clear();
-            s.extend_from_slice(string);
-
-            if let Some(q_bytes) = qual {
-                let mut q = sm.qual.take().unwrap_or_default();
-                q.clear();
-                q.extend_from_slice(q_bytes);
-                sm.recycle_with_qual(s, q, origin, idx);
-            } else {
-                sm.recycle(s, origin, idx);
-            }
+            sm.reset_fastq_entry(string, qual, origin, idx);
         } else {
             let sm = if let Some(q) = qual {
                 StrMappings::new_with_qual(string.to_owned(), q.to_owned(), origin, idx)
@@ -965,6 +1005,11 @@ impl Read {
             };
             self.str_mappings.push((str_type, sm));
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn truncate_fastq_entries(&mut self, len: usize) {
+        self.str_mappings.truncate(len);
     }
 
     /// Returns (name, sequence, quality) for the given string type index.
@@ -1146,12 +1191,41 @@ impl Read {
 }
 
 impl Data {
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() <= 24 && !bytes.contains(&0) {
+            Self::InlineBytes(InlineString::new(bytes))
+        } else {
+            Self::Bytes(bytes.to_vec())
+        }
+    }
+
+    #[inline]
+    pub fn compact(self) -> Self {
+        match self {
+            Self::Bytes(bytes) if bytes.len() <= 24 && !bytes.contains(&0) => {
+                Self::InlineBytes(InlineString::new(&bytes))
+            }
+            other => other,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::InlineBytes(bytes) => Some(bytes.as_bytes()),
+            Self::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
     pub fn as_bool(&self) -> bool {
         use Data::*;
         match self {
             Bool(x) => *x,
             Int(x) => *x != 0,
             Float(x) => *x != 0.0,
+            InlineBytes(x) => !x.as_bytes().is_empty(),
             Bytes(x) => !x.is_empty(),
         }
     }
@@ -1162,7 +1236,7 @@ impl Data {
             Bool(x) => Ok(if *x { 1 } else { 0 }),
             Int(x) => Ok(*x),
             Float(x) => Ok(*x as isize),
-            Bytes(_) => Err(NameError::Type("bool or uint", vec![self.clone()])),
+            InlineBytes(_) | Bytes(_) => Err(NameError::Type("bool or uint", vec![self.clone()])),
         }
     }
 
@@ -1172,6 +1246,7 @@ impl Data {
             Bool(_) => Err(NameError::Type("bytes", vec![self.clone()])),
             Int(_) => Err(NameError::Type("bytes", vec![self.clone()])),
             Float(_) => Err(NameError::Type("bytes", vec![self.clone()])),
+            InlineBytes(x) => Ok(x.len()),
             Bytes(x) => Ok(x.len()),
         }
     }
@@ -1277,6 +1352,7 @@ impl fmt::Display for Data {
             Bool(x) => write!(f, "{}", x),
             Int(x) => write!(f, "{}", x),
             Float(x) => write!(f, "{}", x),
+            InlineBytes(x) => write!(f, "{}", x),
             Bytes(x) => write!(f, "{}", std::str::from_utf8(x).unwrap()),
         }
     }
@@ -1289,6 +1365,7 @@ impl fmt::Debug for Data {
             Bool(x) => write!(f, "bool {}", x),
             Int(x) => write!(f, "int {}", x),
             Float(x) => write!(f, "float {}", x),
+            InlineBytes(x) => write!(f, "bytes \"{}\"", x),
             Bytes(x) => write!(f, "bytes \"{}\"", std::str::from_utf8(x).unwrap()),
         }
     }
@@ -1778,6 +1855,25 @@ mod read_tests {
         assert!(Data::Float(2.71).len().is_err());
     }
 
+    #[test]
+    fn test_inline_bytes_match_bytes_semantics_and_serialization() {
+        let inline = Data::from_bytes(b"false");
+        assert!(matches!(inline, Data::InlineBytes(_)));
+        assert!(inline.as_bool());
+        assert_eq!(inline.len().unwrap(), 5);
+        assert_eq!(inline.as_bytes(), Some(b"false".as_slice()));
+        assert_eq!(
+            serde_json::to_string(&inline).unwrap(),
+            serde_json::to_string(&Data::Bytes(b"false".to_vec())).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_inline_bytes_falls_back_for_long_or_nul_values() {
+        assert!(matches!(Data::from_bytes(&[b'x'; 25]), Data::Bytes(_)));
+        assert!(matches!(Data::from_bytes(b"a\0b"), Data::Bytes(_)));
+    }
+
     // -- Read methods --
 
     #[test]
@@ -2058,6 +2154,84 @@ mod read_tests {
         assert_eq!(name, b"read2");
         assert_eq!(seq, b"TGCA");
         assert_eq!(qual, b"!!!!");
+    }
+
+    #[test]
+    fn test_set_fastq_entry_resets_mapping_in_place() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(
+            1,
+            b"read1",
+            b"ACGTACGT",
+            b"IIIIIIII",
+            Arc::clone(&origin),
+            0,
+        );
+        let sequence = &mut read.str_mappings[1].1;
+        sequence.add_mapping(Some(InlineString::new(b"part")), 0, 4);
+        *sequence
+            .data_mut(InlineString::new(b"*"), InlineString::new(b"tag"))
+            .unwrap() = Data::Bytes(b"value".to_vec());
+        let string_pointer = sequence.string.as_ptr();
+        let quality_pointer = sequence.qual.as_ref().unwrap().as_ptr();
+
+        read.set_fastq_entry(
+            1,
+            StrType::Seq(1),
+            b"TGCATGCA",
+            Some(b"!!!!!!!!"),
+            origin,
+            1,
+        );
+
+        let sequence = &read.str_mappings[1].1;
+        assert_eq!(sequence.string(), b"TGCATGCA");
+        assert_eq!(sequence.qual(), Some(&b"!!!!!!!!"[..]));
+        assert_eq!(sequence.mappings.len(), 1);
+        assert_eq!(sequence.mappings[0].label, InlineString::new(b"*"));
+        assert_eq!(sequence.mappings[0].start, 0);
+        assert_eq!(sequence.mappings[0].len, 8);
+        assert!(sequence
+            .data(InlineString::new(b"*"), InlineString::new(b"tag"))
+            .is_none());
+        assert_eq!(sequence.string.as_ptr(), string_pointer);
+        assert_eq!(sequence.qual.as_ref().unwrap().as_ptr(), quality_pointer);
+    }
+
+    #[test]
+    fn test_set_fastq_entry_drops_pathological_retained_capacity() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        let long = vec![b'A'; StrMappings::MAX_RETAINED_FASTQ_BYTES * 4];
+        read.set_fastq_entry(
+            0,
+            StrType::Seq(1),
+            &long,
+            Some(&long),
+            Arc::clone(&origin),
+            0,
+        );
+        assert!(read.str_mappings[0].1.string.capacity() > 64 * 1024);
+
+        read.set_fastq_entry(0, StrType::Seq(1), b"ACGT", Some(b"IIII"), origin, 1);
+        let sequence = &read.str_mappings[0].1;
+        assert!(sequence.string.capacity() <= StrMappings::MAX_RETAINED_FASTQ_BYTES);
+        assert!(
+            sequence.qual.as_ref().unwrap().capacity() <= StrMappings::MAX_RETAINED_FASTQ_BYTES
+        );
+    }
+
+    #[test]
+    fn test_truncate_fastq_entries_removes_stale_lanes() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"ACGT", b"IIII", Arc::clone(&origin), 0);
+        read.add_fastq(2, b"read2", b"TGCA", b"!!!!", origin, 1);
+        assert_eq!(read.str_mappings.len(), 4);
+        read.truncate_fastq_entries(2);
+        assert_eq!(read.str_mappings.len(), 2);
+        assert!(read.str_mappings(StrType::Seq(2)).is_none());
     }
 
     // -- StrMappings set with size changes --

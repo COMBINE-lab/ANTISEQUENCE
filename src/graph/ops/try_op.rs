@@ -1,8 +1,11 @@
 use crate::graph::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct TryOp<T: Trace = NoTrace> {
     try_graph: Graph<T>,
     catch_graph: Graph<T>,
+    collect_stats: AtomicBool,
+    failed_reads: AtomicUsize,
 }
 
 impl<T: Trace> TryOp<T> {
@@ -19,6 +22,8 @@ impl<T: Trace> TryOp<T> {
         Self {
             try_graph,
             catch_graph,
+            collect_stats: AtomicBool::new(false),
+            failed_reads: AtomicUsize::new(0),
         }
     }
 }
@@ -26,45 +31,31 @@ impl<T: Trace> TryOp<T> {
 impl<T: Trace> GraphNode<T> for TryOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
-        let (reads, failed, done) = self.try_graph.try_run_one(reads, trace)?;
+        let reads = reads.ok_or(Error::MissingNodeInput(Self::NAME))?;
+        let mut accepted = Vec::with_capacity(reads.len());
+        let collect_stats = self.collect_stats.load(Ordering::Relaxed);
 
-        let res = if !done && failed {
-            // In batch mode, `try_run_one` returns failed=true if *any* read failed requirements?
-            // Or does it filter?
-            // `try_run_one` in Graph checks requirements on the *first* read of the batch (as per my implementation).
-            // If the first read fails, it returns `(reads, true, false)`.
-            // So we assume the whole batch is "failed" / "skipped" by try_graph.
-            // Then we run the whole batch through catch_graph.
+        // Label availability can differ after matching and conditional
+        // transformations. Checking only the first read would route a mixed
+        // batch together, so catch/unassigned mode evaluates each read.
+        for read in reads {
+            let original = read.clone();
+            let (output, failed, done) = self.try_graph.try_run_one(Some(vec![read]), trace)?;
+            if done {
+                return Ok((output, true));
+            }
+            let rejected = failed || output.as_ref().is_none_or(Vec::is_empty);
+            if rejected {
+                if collect_stats {
+                    self.failed_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = self.catch_graph.run_one(Some(vec![original]), trace)?;
+            } else if let Some(mut output) = output {
+                accepted.append(&mut output);
+            }
+        }
 
-            let (_, done) = self.catch_graph.run_one(reads, trace)?;
-            (None, done)
-            // Wait, if we run catch_graph, we should return its output?
-            // The original code returns `(None, done)`.
-            // Ah, original code:
-            // `let (read, failed, done) = self.try_graph.try_run_one(read, trace)?;`
-            // `if ... failed { let (_, done) = self.catch_graph.run_one(read, trace)?; (None, done) }`
-            // It discards the output of catch_graph? That seems odd.
-            // Looking at original code: `(None, done)`.
-            // It seems TryOp in original code *consumes* the read if it goes to catch block?
-            // Or maybe `try_run_one` returns the read if it failed?
-
-            // Let's check `Graph::try_run_one`:
-            // if !read.has_names(...) { return Ok((curr, true, false)); }
-            // It returns the read back.
-
-            // So `TryOp` logic:
-            // 1. Try running `try_graph`.
-            // 2. If it failed (requirements not met), run `catch_graph`.
-            // 3. Return `(None, done)`.
-            // This implies `TryOp` acts as a sink if it goes to catch?
-            // Or maybe it assumes `catch_graph` handles the output/storage?
-            // If `catch_graph` has output nodes, they write.
-            // But `TryOp` itself returns `None` as the read.
-
-            // So for batch, we follow same logic.
-        } else {
-            (reads, done)
-        };
+        let res = (Some(accepted), false);
 
         trace.add(self.name(), start, &res.0);
         Ok(res)
@@ -76,5 +67,23 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
 
     fn name(&self) -> &'static str {
         Self::NAME
+    }
+
+    fn set_collect_statistics(&self, enabled: bool) {
+        self.collect_stats.store(enabled, Ordering::Relaxed);
+        self.try_graph.set_collect_statistics(enabled);
+        self.catch_graph.set_collect_statistics(enabled);
+    }
+
+    fn failed_reads(&self) -> Option<usize> {
+        self.collect_stats
+            .load(Ordering::Relaxed)
+            .then(|| self.failed_reads.load(Ordering::Relaxed))
+    }
+
+    fn all_match_distance_counts(&self) -> Vec<MatchDistanceCounts> {
+        let mut counts = self.try_graph.match_distance_counts();
+        counts.extend(self.catch_graph.match_distance_counts());
+        counts
     }
 }

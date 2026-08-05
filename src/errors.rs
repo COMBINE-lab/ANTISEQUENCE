@@ -9,6 +9,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("Number of threads must be greater than zero (received {0})")]
+    InvalidThreadCount(usize),
+
+    #[error("Graph execution failed in a worker: {0}")]
+    GraphExecution(String),
+
+    #[error("Invalid pipeline configuration: {0}")]
+    InvalidPipelineConfig(String),
+
+    #[error("Graph cannot be executed as a staged pipeline: {0}")]
+    InvalidPipelineGraph(String),
+
+    #[error("Graph node {0} requires an input batch")]
+    MissingNodeInput(&'static str),
+
     #[error("Error reading or writing \"{file}\": {source}")]
     FileIo {
         file: String,

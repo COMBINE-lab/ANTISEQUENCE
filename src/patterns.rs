@@ -45,7 +45,10 @@ impl Patterns {
             .into_iter()
             .map(|v| InlineString::new(v.as_ref()))
             .collect::<Vec<_>>();
-        let patterns = patterns.into_iter().collect::<Vec<_>>();
+        let patterns = patterns
+            .into_iter()
+            .map(Pattern::compact_attrs)
+            .collect::<Vec<_>>();
 
         for p in &patterns {
             assert_eq!(
@@ -119,7 +122,7 @@ impl Pattern {
     pub fn from_literal(bytes: &[u8], attrs: Vec<Data>) -> Self {
         Self::Literal {
             bytes: bytes.to_owned(),
-            attrs,
+            attrs: attrs.into_iter().map(Data::compact).collect(),
         }
     }
 
@@ -150,6 +153,16 @@ impl Pattern {
             Literal { attrs, .. } => attrs,
             Expr { attrs, .. } => attrs,
         }
+    }
+
+    fn compact_attrs(mut self) -> Self {
+        let attrs = match &mut self {
+            Self::Literal { attrs, .. } | Self::Expr { attrs, .. } => attrs,
+        };
+        for data in attrs {
+            *data = std::mem::replace(data, Data::Bool(false)).compact();
+        }
+        self
     }
 }
 
