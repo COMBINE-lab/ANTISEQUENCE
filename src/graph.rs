@@ -477,6 +477,7 @@ impl<T: Trace> Graph<T> {
 
     /// Add a read operation node to the graph and return the node.
     pub fn add<G: GraphNode<T> + 'static>(&mut self, node: G) -> Arc<G> {
+        node.set_statistics_level(self.statistics_level());
         let a = Arc::new(node);
         let b = Arc::clone(&a);
         self.nodes.push(a);

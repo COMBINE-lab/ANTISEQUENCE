@@ -392,13 +392,13 @@ mod pipeline_tests {
     fn test_basic_statistics_omit_detailed_match_histograms() {
         let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "ACGC", "IIII")]);
         let mut graph = Graph::<NoTrace>::new();
+        graph.set_statistics_level(StatisticsLevel::Basic);
         graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
         graph.add(MatchAnyOp::new(
             te("seq1.* -> seq1.*"),
             Patterns::from_strs(["ACGT"]),
             Hamming(Count(3)),
         ));
-        graph.set_statistics_level(StatisticsLevel::Basic);
         graph.run().unwrap();
 
         assert_eq!(graph.statistics_level(), StatisticsLevel::Basic);
