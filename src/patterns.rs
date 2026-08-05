@@ -5,11 +5,30 @@ use crate::expr::*;
 use crate::inline_string::*;
 use crate::read::*;
 
+/// Determines how an equal-best match against multiple distinct patterns is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AmbiguityPolicy {
+    /// Accept the match and select the first pattern in input order.
+    Accept,
+    /// Treat an equal-best tie exactly like an unmatched query.
+    NoMatch,
+    /// Select the first pattern in input order.
+    First,
+    /// Select a candidate deterministically from the run seed and read identity.
+    Random { seed: u64 },
+    /// Select the candidate whose mismatching bases have the lowest summed Phred score.
+    /// The best candidate must beat the runner-up by at least `min_delta` Phred points.
+    Quality { min_delta: u8 },
+    /// Return an execution error when an equal-best tie is encountered.
+    Error,
+}
+
 pub struct Patterns {
     pattern_name: Option<InlineString>,
     multimatch_name: Option<InlineString>,
     attr_names: Vec<InlineString>,
     patterns: Vec<Pattern>,
+    ambiguity_policy: Option<AmbiguityPolicy>,
 }
 
 impl Patterns {
@@ -22,6 +41,7 @@ impl Patterns {
                 .into_iter()
                 .map(|v| Pattern::from_literal(v.as_ref(), Vec::new()))
                 .collect(),
+            ambiguity_policy: None,
         }
     }
 
@@ -34,6 +54,7 @@ impl Patterns {
                 .into_iter()
                 .map(|v| Pattern::from_expr(v, Vec::new()))
                 .collect(),
+            ambiguity_policy: None,
         }
     }
 
@@ -63,6 +84,7 @@ impl Patterns {
             multimatch_name: None,
             attr_names,
             patterns,
+            ambiguity_policy: None,
         }
     }
 
@@ -76,12 +98,21 @@ impl Patterns {
         self
     }
 
+    pub fn with_ambiguity_policy(mut self, ambiguity_policy: AmbiguityPolicy) -> Self {
+        self.ambiguity_policy = Some(ambiguity_policy);
+        self
+    }
+
     pub fn pattern_name(&self) -> Option<InlineString> {
         self.pattern_name
     }
 
     pub fn multimatch_name(&self) -> Option<InlineString> {
         self.multimatch_name
+    }
+
+    pub fn ambiguity_policy(&self) -> Option<AmbiguityPolicy> {
+        self.ambiguity_policy
     }
 
     pub fn attr_names(&self) -> &[InlineString] {
@@ -189,6 +220,16 @@ mod tests {
     fn test_patterns_with_multimatch_name() {
         let p = Patterns::from_strs(vec!["ACGT"]).with_multimatch_name("multi");
         assert!(p.multimatch_name().is_some());
+    }
+
+    #[test]
+    fn test_patterns_with_ambiguity_policy() {
+        let p = Patterns::from_strs(["ACGT"])
+            .with_ambiguity_policy(AmbiguityPolicy::Quality { min_delta: 3 });
+        assert_eq!(
+            p.ambiguity_policy(),
+            Some(AmbiguityPolicy::Quality { min_delta: 3 })
+        );
     }
 
     #[test]

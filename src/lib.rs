@@ -120,7 +120,7 @@ mod pipeline_tests {
     use crate::expr::*;
     use crate::graph::*;
     use crate::inline_string::InlineString;
-    use crate::patterns::Patterns;
+    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns};
     use crate::read::*;
     use crate::trace::NoTrace;
     use std::io::{Cursor, Write};
@@ -1389,6 +1389,146 @@ mod pipeline_tests {
             ),
             2,
         );
+    }
+
+    fn resolve_ambiguous_hamming(
+        name: &str,
+        query: &str,
+        quality: &str,
+        patterns: &[(&str, &str)],
+        policy: AmbiguityPolicy,
+    ) -> crate::errors::Result<Vec<u8>> {
+        let fq = fastq_bytes(&[(name, query, quality)]);
+        let patterns = Patterns::new(
+            patterns.iter().map(|(sequence, value)| {
+                Pattern::from_literal(
+                    sequence.as_bytes(),
+                    vec![Data::from_bytes(value.as_bytes())],
+                )
+            }),
+            ["choice"],
+        )
+        .with_multimatch_name("ambig")
+        .with_ambiguity_policy(policy);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.matched"),
+            patterns,
+            Hamming(Count(query.len() - 1)),
+        ));
+        let (output, _) = graph.run_one(None, &NoTrace)?;
+        let read = &output.unwrap()[0];
+        Ok(read
+            .data(
+                StrType::Seq(1),
+                InlineString::new(b"*"),
+                InlineString::new(b"choice"),
+            )
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .to_vec())
+    }
+
+    #[test]
+    fn ambiguity_first_is_input_ordered_on_fast_and_general_hamming_paths() {
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "IIII",
+                &[("CAAA", "first"), ("AAAC", "second")],
+                AmbiguityPolicy::First,
+            )
+            .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAAAAAAA",
+                "IIIIIIIII",
+                &[("CAAAAAAAA", "first"), ("AAAAAAAAC", "second")],
+                AmbiguityPolicy::First,
+            )
+            .unwrap(),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn ambiguity_no_match_and_error_policies_are_distinct() {
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "IIII",
+                &[("CAAA", "first"), ("AAAC", "second")],
+                AmbiguityPolicy::NoMatch,
+            )
+            .unwrap(),
+            b""
+        );
+        let error = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            &[("CAAA", "first"), ("AAAC", "second")],
+            AmbiguityPolicy::Error,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous equal-best match"));
+    }
+
+    #[test]
+    fn ambiguity_quality_uses_mismatch_position_phred_scores() {
+        let patterns = &[("CAAA", "left"), ("AAAC", "right")];
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "!III",
+                patterns,
+                AmbiguityPolicy::Quality { min_delta: 1 },
+            )
+            .unwrap(),
+            b"left"
+        );
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "III!",
+                patterns,
+                AmbiguityPolicy::Quality { min_delta: 1 },
+            )
+            .unwrap(),
+            b"right"
+        );
+    }
+
+    #[test]
+    fn ambiguity_random_is_reproducible_for_seed_and_read_identity() {
+        let patterns = &[("CAAA", "left"), ("AAAC", "right")];
+        let first = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            patterns,
+            AmbiguityPolicy::Random { seed: 1234 },
+        )
+        .unwrap();
+        let repeated = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            patterns,
+            AmbiguityPolicy::Random { seed: 1234 },
+        )
+        .unwrap();
+        assert_eq!(first, repeated);
     }
 
     #[test]

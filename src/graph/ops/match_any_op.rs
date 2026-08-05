@@ -1,7 +1,8 @@
 use bio::pattern_matching::myers::long::Myers as LongMyers;
 use block_aligner::{cigar::*, scan_block::*, scores::*};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
 use memchr::memmem;
 use parking_lot::Mutex;
@@ -9,12 +10,13 @@ use parking_lot::Mutex;
 use thread_local::*;
 
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::marker::Send;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::graph::*;
 use crate::seed_search::*;
-use crate::{Pattern, Patterns};
+use crate::{AmbiguityPolicy, Pattern, Patterns};
 
 /// Pre-computed lookup table for fast Hamming matching.
 ///
@@ -30,13 +32,17 @@ struct HammingLookup {
     table: FxHashMap<u64, HammingLookupEntry>,
     /// Pattern length (all patterns must be same length, <= 8)
     pattern_len: usize,
+    /// Equal-best candidate lists. Entries refer to this arena using a
+    /// one-based index, keeping the common unique-hit table entry compact.
+    ties: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HammingLookupEntry {
     pattern_idx: usize,
     distance: u8,
-    multimatch: bool,
+    /// Zero for a unique hit; otherwise one plus the index in `HammingLookup::ties`.
+    tie_index: u32,
 }
 
 impl HammingLookup {
@@ -68,7 +74,7 @@ impl HammingLookup {
         let candidate = HammingLookupEntry {
             pattern_idx,
             distance,
-            multimatch: false,
+            tie_index: 0,
         };
         match self.table.entry(key) {
             Entry::Vacant(entry) => {
@@ -79,7 +85,15 @@ impl HammingLookup {
                 if distance < current.distance {
                     *current = candidate;
                 } else if distance == current.distance && pattern_idx != current.pattern_idx {
-                    current.multimatch = true;
+                    if current.tie_index == 0 {
+                        self.ties.push(vec![current.pattern_idx, pattern_idx]);
+                        current.tie_index = self.ties.len() as u32;
+                    } else {
+                        let ties = &mut self.ties[(current.tie_index - 1) as usize];
+                        if !ties.contains(&pattern_idx) {
+                            ties.push(pattern_idx);
+                        }
+                    }
                 }
             }
         }
@@ -94,6 +108,7 @@ impl HammingLookup {
         let mut lookup = Self {
             table: FxHashMap::default(),
             pattern_len,
+            ties: Vec::new(),
         };
 
         for (pattern_idx, pattern) in patterns {
@@ -144,6 +159,15 @@ impl HammingLookup {
             return None;
         }
         self.table.get(&Self::encode(seq)).copied()
+    }
+
+    #[inline]
+    fn tied_candidates(&self, hit: HammingLookupEntry) -> Option<&[usize]> {
+        if hit.tie_index == 0 {
+            None
+        } else {
+            Some(&self.ties[(hit.tie_index - 1) as usize])
+        }
     }
 }
 
@@ -364,6 +388,108 @@ impl MatchAnyOp {
     pub fn stats_label(&self) -> String {
         format!("{}.{}", self.label.str_type, self.label.label)
     }
+
+    #[inline]
+    fn effective_ambiguity_policy(&self) -> AmbiguityPolicy {
+        self.patterns.ambiguity_policy().unwrap_or_else(|| {
+            if self.patterns.multimatch_name().is_some() {
+                AmbiguityPolicy::NoMatch
+            } else {
+                AmbiguityPolicy::Accept
+            }
+        })
+    }
+
+    fn resolve_ambiguity(
+        &self,
+        read: &Read,
+        text: &[u8],
+        quality: Option<&[u8]>,
+        candidates: &[usize],
+    ) -> Result<Option<usize>> {
+        debug_assert!(candidates.len() > 1);
+        let mut ordered: SmallVec<[usize; 4]> = candidates.iter().copied().collect();
+        ordered.sort_unstable();
+        ordered.dedup();
+        if ordered.len() == 1 {
+            return Ok(ordered.first().copied());
+        }
+
+        match self.effective_ambiguity_policy() {
+            AmbiguityPolicy::Accept | AmbiguityPolicy::First => Ok(ordered.first().copied()),
+            AmbiguityPolicy::NoMatch => Ok(None),
+            AmbiguityPolicy::Error => Err(Error::GraphExecution(format!(
+                "ambiguous equal-best match for {}.{} against pattern indices {:?}",
+                self.label.str_type, self.label.label, ordered
+            ))),
+            AmbiguityPolicy::Random { seed } => {
+                let mut hasher = FxHasher::default();
+                seed.hash(&mut hasher);
+                text.hash(&mut hasher);
+                if let StrType::Seq(read_idx) = self.label.str_type {
+                    if let Some(name) = read.str_mappings(StrType::Name(read_idx)) {
+                        name.string().hash(&mut hasher);
+                    }
+                }
+                let selected = (hasher.finish() as usize) % ordered.len();
+                Ok(Some(ordered[selected]))
+            }
+            AmbiguityPolicy::Quality { min_delta } => {
+                let quality = quality.ok_or_else(|| {
+                    Error::GraphExecution(format!(
+                        "quality ambiguity policy requires quality scores for {}.{}",
+                        self.label.str_type, self.label.label
+                    ))
+                })?;
+                if quality.len() != text.len() {
+                    return Err(Error::GraphExecution(format!(
+                        "quality length {} does not match sequence length {} for {}.{}",
+                        quality.len(),
+                        text.len(),
+                        self.label.str_type,
+                        self.label.label
+                    )));
+                }
+
+                let mut scores: SmallVec<[(u64, usize); 4]> = SmallVec::new();
+                for &pattern_idx in &ordered {
+                    let pattern =
+                        self.patterns.patterns()[pattern_idx]
+                            .get(read)
+                            .map_err(|source| Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            })?;
+                    if pattern.len() != text.len() {
+                        return Err(Error::GraphExecution(
+                            "quality ambiguity policy currently requires equal-length patterns"
+                                .to_string(),
+                        ));
+                    }
+                    let mismatch_quality = pattern
+                        .iter()
+                        .zip(text)
+                        .zip(quality)
+                        .filter_map(|((&pattern_base, &query_base), &q)| {
+                            (pattern_base != query_base).then_some(u64::from(q.saturating_sub(33)))
+                        })
+                        .sum();
+                    scores.push((mismatch_quality, pattern_idx));
+                }
+                scores.sort_unstable();
+                let (best_score, best_idx) = scores[0];
+                let runner_up_score = scores[1].0;
+                if best_score < runner_up_score
+                    && runner_up_score - best_score >= u64::from(min_delta)
+                {
+                    Ok(Some(best_idx))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
@@ -420,7 +546,29 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             // Fast path: use pre-computed hash lookup for Hamming matching
             if let Some(ref lookup) = self.hamming_lookup {
                 let pattern_len = lookup.pattern_len;
-                match lookup.lookup(text) {
+                let resolved_hit = match lookup.lookup(text) {
+                    Some(hit) => {
+                        if let Some(candidates) = lookup.tied_candidates(hit) {
+                            let quality = read
+                                .substring_qual(self.label.str_type, self.label.label)
+                                .map_err(|source| Error::NameError {
+                                    source,
+                                    read: read.clone(),
+                                    context: Self::NAME,
+                                })?;
+                            self.resolve_ambiguity(read, text, quality, candidates)?
+                                .map(|pattern_idx| HammingLookupEntry {
+                                    pattern_idx,
+                                    distance: hit.distance,
+                                    tie_index: 0,
+                                })
+                        } else {
+                            Some(hit)
+                        }
+                    }
+                    None => None,
+                };
+                match resolved_hit {
                     Some(hit) => {
                         // Fast path matched
                         if collect_stats {
@@ -448,8 +596,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             *mapping.data_mut(pattern_name) = value;
                         }
                         if let Some(multimatch_name) = self.patterns.multimatch_name() {
-                            let value: &[u8] = if hit.multimatch { b"true" } else { b"false" };
-                            *mapping.data_mut(multimatch_name) = Data::from_bytes(value);
+                            *mapping.data_mut(multimatch_name) = Data::from_bytes(b"false");
                         }
                         for (&attr, data) in self.patterns.attr_names().iter().zip(pattern.attrs())
                         {
@@ -595,12 +742,8 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             }
 
             let mut max_matches = 0;
-            let mut max_pattern_len = 0;
-            let mut max_pattern = None;
             let mut max_pattern_idx = usize::MAX;
-            let mut max_cut_pos1 = 0;
-            let mut max_cut_pos2 = 0;
-            let mut multimatches = false;
+            let mut best_candidates: SmallVec<[(usize, usize, usize, usize); 4]> = SmallVec::new();
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -830,21 +973,54 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 };
 
                 if let Some((matches, cut_pos1, cut_pos2)) = matches {
-                    if matches > max_matches {
+                    if max_pattern_idx == usize::MAX || matches > max_matches {
                         max_matches = matches;
-                        max_pattern_len = pattern_len;
-                        max_pattern = Some((pattern_str_cow, pattern.attrs()));
                         max_pattern_idx = pattern_idx;
-                        max_cut_pos1 = cut_pos1;
-                        max_cut_pos2 = cut_pos2;
-                        multimatches = false;
+                        best_candidates.clear();
+                        best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
                     } else if matches == max_matches && pattern_idx != max_pattern_idx {
-                        multimatches = true;
+                        if !best_candidates
+                            .iter()
+                            .any(|&(candidate_idx, _, _, _)| candidate_idx == pattern_idx)
+                        {
+                            best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
+                        }
                     }
                 }
             }
 
-            if let Some((pattern_str, pattern_attrs)) = max_pattern {
+            let selected_pattern_idx = if best_candidates.len() > 1 {
+                let quality = read
+                    .substring_qual(self.label.str_type, self.label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?;
+                let candidate_indices: SmallVec<[usize; 4]> = best_candidates
+                    .iter()
+                    .map(|&(pattern_idx, _, _, _)| pattern_idx)
+                    .collect();
+                self.resolve_ambiguity(read, text, quality, &candidate_indices)?
+            } else {
+                best_candidates.first().map(|candidate| candidate.0)
+            };
+
+            if let Some(selected_pattern_idx) = selected_pattern_idx {
+                let &(_, max_pattern_len, max_cut_pos1, max_cut_pos2) = best_candidates
+                    .iter()
+                    .find(|&&(pattern_idx, _, _, _)| pattern_idx == selected_pattern_idx)
+                    .expect("resolved candidate must be present in equal-best candidate set");
+                let selected_pattern = &self.patterns.patterns()[selected_pattern_idx];
+                let pattern_str =
+                    selected_pattern
+                        .get(read)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?;
+                let pattern_attrs = selected_pattern.attrs();
                 if collect_stats {
                     Self::record_distance(
                         distance_counts.as_deref_mut().unwrap(),
@@ -865,8 +1041,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 }
 
                 if let Some(multimatch_name) = self.patterns.multimatch_name() {
-                    let value: &[u8] = if multimatches { b"true" } else { b"false" };
-                    *mapping.data_mut(multimatch_name) = Data::from_bytes(value);
+                    *mapping.data_mut(multimatch_name) = Data::from_bytes(b"false");
                 }
 
                 for (&attr, data) in self.patterns.attr_names().iter().zip(pattern_attrs) {
@@ -2316,16 +2491,12 @@ mod edit_distance_tests {
             Some(HammingLookupEntry {
                 pattern_idx: 1,
                 distance: 0,
-                multimatch: false,
+                tie_index: 0,
             })
         );
-        assert_eq!(
-            lookup.lookup(b"AAAG"),
-            Some(HammingLookupEntry {
-                pattern_idx: 0,
-                distance: 1,
-                multimatch: true,
-            })
-        );
+        let tied = lookup.lookup(b"AAAG").unwrap();
+        assert_eq!(tied.pattern_idx, 0);
+        assert_eq!(tied.distance, 1);
+        assert_eq!(lookup.tied_candidates(tied), Some(&[0, 1][..]));
     }
 }
