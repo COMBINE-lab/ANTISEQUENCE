@@ -209,6 +209,9 @@ struct ShortEditSearcher {
 }
 
 impl ShortEditSearcher {
+    const MIN_TEXT_LEN_FOR_PIGEONHOLE_SEARCH: usize = 256;
+    const MAX_PIGEONHOLE_CANDIDATES: usize = 64;
+
     fn new(pattern: &[u8]) -> Self {
         debug_assert!(!pattern.is_empty() && pattern.len() <= 64);
         let mut peq = [0u64; 256];
@@ -298,6 +301,83 @@ impl ShortEditSearcher {
         })?;
 
         Some((expected_matches, start, best_end))
+    }
+
+    /// Search long text using the edit-distance pigeonhole principle.
+    ///
+    /// Splitting a pattern into `k + 1` disjoint pieces guarantees that an
+    /// alignment with at most `k` edits contains at least one exact piece.
+    /// `memmem` finds those pieces quickly; Myers then verifies only small
+    /// windows around the implied starts. Repetitive inputs fall back to the
+    /// linear full-text Myers scan once candidate density becomes unfavorable.
+    fn search_pigeonhole(
+        &self,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        if text.len() < Self::MIN_TEXT_LEN_FOR_PIGEONHOLE_SEARCH || max_edits >= self.pattern_len {
+            return self.search(text, max_edits);
+        }
+
+        let part_count = max_edits + 1;
+        let short_part_len = self.pattern_len / part_count;
+        // Four- and five-byte seeds are too dense in real long-read data;
+        // scanning and deduplicating their candidates costs more than Myers.
+        if short_part_len < 6 {
+            return self.search(text, max_edits);
+        }
+
+        let long_part_count = self.pattern_len % part_count;
+        let mut pattern_offset = 0;
+        let mut candidate_starts: SmallVec<[isize; 8]> = SmallVec::new();
+        for part_idx in 0..part_count {
+            let part_len = short_part_len + usize::from(part_idx < long_part_count);
+            let seed = &pattern[pattern_offset..pattern_offset + part_len];
+            for seed_start in memmem::find_iter(text, seed) {
+                let predicted_start = seed_start as isize - pattern_offset as isize;
+                if !candidate_starts.contains(&predicted_start) {
+                    candidate_starts.push(predicted_start);
+                    if candidate_starts.len() > Self::MAX_PIGEONHOLE_CANDIDATES {
+                        return self.search(text, max_edits);
+                    }
+                }
+            }
+            pattern_offset += part_len;
+        }
+
+        let mut best: Option<(usize, usize, usize)> = None;
+        let text_len = text.len() as isize;
+        for predicted_start in candidate_starts {
+            // Indels before the exact seed can shift the implied start by up
+            // to k bases. The match itself can also be k bases longer than
+            // the pattern, hence the asymmetric +2k right boundary.
+            let window_start = (predicted_start - max_edits as isize).clamp(0, text_len) as usize;
+            let window_end =
+                (predicted_start + self.pattern_len as isize + (2 * max_edits) as isize)
+                    .clamp(0, text_len) as usize;
+            if window_start >= window_end {
+                continue;
+            }
+            let Some((matches, local_start, local_end)) =
+                self.search(&text[window_start..window_end], max_edits)
+            else {
+                continue;
+            };
+            let candidate = (
+                matches,
+                window_start + local_start,
+                window_start + local_end,
+            );
+            if best.is_none_or(|current| {
+                candidate.0 > current.0
+                    || (candidate.0 == current.0
+                        && (candidate.2, candidate.1) < (current.2, current.1))
+            }) {
+                best = Some(candidate);
+            }
+        }
+        best
     }
 }
 
@@ -480,7 +560,11 @@ impl MatchAnyOp {
             .as_ref()
             .expect("short literal patterns have a precomputed edit searcher");
         debug_assert_eq!(searcher.pattern_len, pattern.len());
-        searcher.search(text, max_edits)
+        if matches!(self.match_type, MatchType::EditSearch(_)) {
+            searcher.search_pigeonhole(text, pattern, max_edits)
+        } else {
+            searcher.search(text, max_edits)
+        }
     }
 
     #[inline]
@@ -2327,6 +2411,61 @@ mod edit_distance_tests {
                 reference_edit_search(&text, &pattern, max_edits),
                 "precomputed short Myers differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
                 String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_pigeonhole_short_myers_matches_full_search() {
+        let mut state = 0xa409_3822_299f_31d0u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..5_000 {
+            let pattern_len = 20 + next() as usize % 29;
+            let max_edits = 1 + next() as usize % 3;
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let mut text = (0..(256 + next() as usize % 257))
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+
+            if case_idx % 5 != 0 {
+                let mut placed = pattern.clone();
+                let edit_count = 1 + next() as usize % max_edits;
+                for _ in 0..edit_count {
+                    match next() % 3 {
+                        0 => {
+                            let idx = next() as usize % placed.len();
+                            placed[idx] = BASES[next() as usize % BASES.len()];
+                        }
+                        1 => {
+                            let idx = next() as usize % (placed.len() + 1);
+                            placed.insert(idx, BASES[next() as usize % BASES.len()]);
+                        }
+                        _ if placed.len() > 1 => {
+                            let idx = next() as usize % placed.len();
+                            placed.remove(idx);
+                        }
+                        _ => {}
+                    }
+                }
+                let start = next() as usize % (text.len() - placed.len() + 1);
+                text.splice(start..start + placed.len(), placed);
+            }
+
+            let searcher = ShortEditSearcher::new(&pattern);
+            assert_eq!(
+                searcher.search_pigeonhole(&text, &pattern, max_edits),
+                searcher.search(&text, max_edits),
+                "pigeonhole differential failure in case {case_idx}: pattern={:?}, max_edits={max_edits}",
                 String::from_utf8_lossy(&pattern),
             );
         }
