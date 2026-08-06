@@ -179,6 +179,7 @@ pub struct MatchAnyOp {
     all_literals: bool,
     match_type: MatchType,
     aligner: ThreadLocal<Option<RefCell<Box<dyn Aligner + Send>>>>,
+    short_edit_searchers: Vec<Option<ShortEditSearcher>>,
     long_edit_searchers: ThreadLocal<RefCell<FxHashMap<usize, LongMyers<u64>>>>,
     seed_hits: ThreadLocal<RefCell<FxHashSet<(usize, Option<isize>)>>>,
     seed_searcher: Option<SeedSearchers>,
@@ -195,6 +196,109 @@ struct LocalMatchStats {
     attempts: usize,
     distance_counts: Vec<usize>,
     ambiguity: AmbiguityCounts,
+}
+
+/// Immutable, precomputed Myers bit masks for a literal pattern up to 64 bytes.
+///
+/// Keeping these on the graph node avoids a thread-local map lookup and pattern
+/// preprocessing on every read. All per-search state lives on the stack, so a
+/// searcher can be shared safely by every worker.
+struct ShortEditSearcher {
+    peq: [u64; 256],
+    pattern_len: usize,
+}
+
+impl ShortEditSearcher {
+    fn new(pattern: &[u8]) -> Self {
+        debug_assert!(!pattern.is_empty() && pattern.len() <= 64);
+        let mut peq = [0u64; 256];
+        for (i, &base) in pattern.iter().enumerate() {
+            peq[base as usize] |= 1u64 << i;
+        }
+        Self {
+            peq,
+            pattern_len: pattern.len(),
+        }
+    }
+
+    #[inline]
+    fn global_matches(&self, text: &[u8], max_edits: usize) -> Option<usize> {
+        if text.len().abs_diff(self.pattern_len) > max_edits {
+            return None;
+        }
+
+        let mut pv = !0u64;
+        let mut mv = 0u64;
+        let mut score = self.pattern_len;
+        let high_bit = 1u64 << (self.pattern_len - 1);
+
+        for &base in text {
+            let eq = self.peq[base as usize];
+            let xv = eq | mv;
+            let xh = ((eq & pv).wrapping_add(pv)) ^ pv | eq;
+            let ph = mv | !(xh | pv);
+            let mh = pv & xh;
+
+            score += usize::from((ph & high_bit) != 0);
+            score -= usize::from((mh & high_bit) != 0);
+
+            let ph_shifted = (ph << 1) | 1;
+            pv = (mh << 1) | !(xv | ph_shifted);
+            mv = ph_shifted & xv;
+        }
+
+        (score <= max_edits).then(|| self.pattern_len.saturating_sub(score))
+    }
+
+    #[inline]
+    fn search(&self, text: &[u8], max_edits: usize) -> Option<(usize, usize, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let mut pv = !0u64;
+        let mut mv = 0u64;
+        let mut score = self.pattern_len;
+        let high_bit = 1u64 << (self.pattern_len - 1);
+        let mut best_score = usize::MAX;
+        let mut best_end = 0;
+
+        for (i, &base) in text.iter().enumerate() {
+            let eq = self.peq[base as usize];
+            let xv = eq | mv;
+            let xh = ((eq & pv).wrapping_add(pv)) ^ pv | eq;
+            let ph = mv | !(xh | pv);
+            let mh = pv & xh;
+
+            score += usize::from((ph & high_bit) != 0);
+            score -= usize::from((mh & high_bit) != 0);
+
+            if score <= max_edits && score < best_score {
+                best_score = score;
+                best_end = i + 1;
+            }
+
+            // No low boundary bit here: leading text is free for a
+            // semi-global search.
+            pv = (mh << 1) | !(xv | (ph << 1));
+            mv = (ph << 1) & xv;
+        }
+
+        if best_score > max_edits {
+            return None;
+        }
+
+        let shortest = self.pattern_len.saturating_sub(best_score);
+        let longest = self.pattern_len + best_score;
+        let earliest_start = best_end.saturating_sub(longest);
+        let latest_start = best_end.saturating_sub(shortest);
+        let expected_matches = self.pattern_len.saturating_sub(best_score);
+        let start = (earliest_start..=latest_start).find(|&candidate| {
+            self.global_matches(&text[candidate..best_end], best_score) == Some(expected_matches)
+        })?;
+
+        Some((expected_matches, start, best_end))
+    }
 }
 
 impl MatchAnyOp {
@@ -240,6 +344,16 @@ impl MatchAnyOp {
             .min()
             .unwrap_or(0);
         let all_literals = patterns.iter_exprs().count() == 0;
+        let short_edit_searchers = patterns
+            .patterns()
+            .iter()
+            .map(|pattern| match pattern {
+                Pattern::Literal { bytes, .. } if !bytes.is_empty() && bytes.len() <= 64 => {
+                    Some(ShortEditSearcher::new(bytes))
+                }
+                _ => None,
+            })
+            .collect();
         let mut required_names = vec![transform_expr.before(0).into()];
         required_names.extend(
             patterns
@@ -284,6 +398,7 @@ impl MatchAnyOp {
             all_literals,
             match_type,
             aligner: ThreadLocal::new(),
+            short_edit_searchers,
             long_edit_searchers: ThreadLocal::new(),
             seed_hits: ThreadLocal::new(),
             seed_searcher,
@@ -354,6 +469,21 @@ impl MatchAnyOp {
     }
 
     #[inline]
+    fn edit_search_short_literal(
+        &self,
+        pattern_idx: usize,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let searcher = self.short_edit_searchers[pattern_idx]
+            .as_ref()
+            .expect("short literal patterns have a precomputed edit searcher");
+        debug_assert_eq!(searcher.pattern_len, pattern.len());
+        searcher.search(text, max_edits)
+    }
+
+    #[inline]
     fn edit_search_long_literal(
         &self,
         pattern_idx: usize,
@@ -380,8 +510,12 @@ impl MatchAnyOp {
         pattern: &[u8],
         max_edits: usize,
     ) -> Option<(usize, usize, usize)> {
-        if pattern_is_literal && pattern.len() > 64 {
-            self.edit_search_long_literal(pattern_idx, text, pattern, max_edits)
+        if pattern_is_literal {
+            if pattern.len() <= 64 {
+                self.edit_search_short_literal(pattern_idx, text, pattern, max_edits)
+            } else {
+                self.edit_search_long_literal(pattern_idx, text, pattern, max_edits)
+            }
         } else {
             edit_search(text, pattern, max_edits)
         }
@@ -1378,9 +1512,13 @@ fn edit_distance_myers(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<
             score -= 1;
         }
 
-        // Shift for next iteration
-        pv = (mh << 1) | !(xv | (ph << 1));
-        mv = (ph << 1) & xv;
+        // Shift for the next global-alignment row. The low boundary bit
+        // charges text-prefix insertions; omitting it turns this into a
+        // semi-global recurrence and undercounts some unequal-length inputs.
+        let ph_shifted = (ph << 1) | 1;
+        let mh_shifted = mh << 1;
+        pv = mh_shifted | !(xv | ph_shifted);
+        mv = ph_shifted & xv;
     }
 
     if score <= max_edits {
@@ -2095,6 +2233,41 @@ mod edit_distance_tests {
     }
 
     #[test]
+    fn test_short_edit_distance_matches_levenshtein_oracle() {
+        let mut state = 0x1319_8a2e_0370_7344u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..5_000 {
+            let pattern_len = 1 + next() as usize % 64;
+            let max_edits = next() as usize % 5;
+            let min_text_len = pattern_len.saturating_sub(max_edits);
+            let text_len = min_text_len + next() as usize % (2 * max_edits + 1);
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let text = (0..text_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let distance = reference_levenshtein(&text, &pattern);
+            let expected = (distance <= max_edits).then_some(pattern_len.saturating_sub(distance));
+
+            assert_eq!(
+                edit_distance_myers(&text, &pattern, max_edits),
+                expected,
+                "distance differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
     fn test_edit_search_matches_bruteforce_oracle() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
@@ -2120,6 +2293,39 @@ mod edit_distance_tests {
                 edit_search(&text, &pattern, max_edits),
                 reference_edit_search(&text, &pattern, max_edits),
                 "differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_precomputed_short_myers_matches_bruteforce_oracle() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..10_000 {
+            let pattern_len = 1 + next() as usize % 32;
+            let text_len = 1 + next() as usize % 64;
+            let max_edits = next() as usize % (pattern_len.saturating_sub(1).min(3) + 1);
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let text = (0..text_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let searcher = ShortEditSearcher::new(&pattern);
+
+            assert_eq!(
+                searcher.search(&text, max_edits),
+                reference_edit_search(&text, &pattern, max_edits),
+                "precomputed short Myers differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
                 String::from_utf8_lossy(&text),
                 String::from_utf8_lossy(&pattern),
             );
