@@ -21,6 +21,9 @@ pub use take_op::*;
 mod set_op;
 pub use set_op::*;
 
+mod project_op;
+pub use project_op::*;
+
 mod for_each_op;
 pub use for_each_op::*;
 

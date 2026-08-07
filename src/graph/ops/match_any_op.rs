@@ -185,10 +185,16 @@ pub struct MatchAnyOp {
     seed_searcher: Option<SeedSearchers>,
     /// Fast hash-based lookup for Hamming matching (when applicable)
     hamming_lookup: Option<HammingLookup>,
+    post_match_retention: Option<PostMatchRetention>,
     statistics_level: AtomicU8,
     // Each worker mutates only its own accumulator. Graph execution joins all
     // workers before these cells are read and aggregated.
     local_stats: ThreadLocal<Mutex<LocalMatchStats>>,
+}
+
+enum PostMatchRetention {
+    LabelPresent(Label),
+    AttributeAbsent(Attr),
 }
 
 #[derive(Default)]
@@ -316,6 +322,14 @@ impl ShortEditSearcher {
         pattern: &[u8],
         max_edits: usize,
     ) -> Option<(usize, usize, usize)> {
+        // A zero-edit hit is globally optimal. Trying the full literal once is
+        // substantially cheaper than either Myers or k + 1 seed scans on the
+        // common high-quality-anchor case, while preserving the exact search
+        // result (the first exact occurrence also has the earliest end).
+        if let Some(start) = memmem::find(text, pattern) {
+            return Some((self.pattern_len, start, start + self.pattern_len));
+        }
+
         if text.len() < Self::MIN_TEXT_LEN_FOR_PIGEONHOLE_SEARCH || max_edits >= self.pattern_len {
             return self.search(text, max_edits);
         }
@@ -483,9 +497,32 @@ impl MatchAnyOp {
             seed_hits: ThreadLocal::new(),
             seed_searcher,
             hamming_lookup,
+            post_match_retention: None,
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             local_stats: ThreadLocal::new(),
         }
+    }
+
+    /// Retain only reads for which this match created `label`.
+    ///
+    /// This fuses the common `MatchAnyOp` + `RetainOp(label_exists(...))`
+    /// sequence into one graph node and a direct post-match predicate.
+    pub fn retain_label_present(mut self, label: impl AsRef<[u8]>) -> Self {
+        self.post_match_retention = Some(PostMatchRetention::LabelPresent(
+            Label::new(label.as_ref()).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        self
+    }
+
+    /// Retain only reads for which `attribute` is absent after matching.
+    ///
+    /// This preserves the exact semantics of
+    /// `RetainOp(attr_exists(...).not())` without generic expression dispatch.
+    pub fn retain_attribute_absent(mut self, attribute: impl AsRef<[u8]>) -> Self {
+        self.post_match_retention = Some(PostMatchRetention::AttributeAbsent(
+            Attr::new(attribute.as_ref()).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        self
     }
 
     fn get_searcher(patterns: &Patterns, match_type: &MatchType) -> Option<SeedSearchers> {
@@ -1392,6 +1429,20 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         *mapping.data_mut(attr) = Data::from_bytes(b"");
                     }
                 }
+            }
+        }
+
+        if let Some(retention) = &self.post_match_retention {
+            reads.retain(|read| match retention {
+                PostMatchRetention::LabelPresent(label) => {
+                    read.mapping(label.str_type, label.label).is_ok()
+                }
+                PostMatchRetention::AttributeAbsent(attr) => {
+                    read.data(attr.str_type, attr.label, attr.attr).is_err()
+                }
+            });
+            if reads.is_empty() {
+                return Ok((None, false));
             }
         }
 

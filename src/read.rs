@@ -476,6 +476,68 @@ impl StrMappings {
         Ok(())
     }
 
+    /// Replace the whole string with the concatenation of existing mappings.
+    ///
+    /// Output projections normally select intervals in their original order.
+    /// In that case the bytes can be compacted toward the front of the existing
+    /// allocation without a temporary concatenation buffer. Reordered or
+    /// overlapping projections use an owned fallback to preserve semantics.
+    pub fn project_whole(&mut self, labels: &[InlineString]) -> Result<(), NameError> {
+        let mut intervals: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+        let mut total_len = 0usize;
+        let mut in_place = true;
+        for &label in labels {
+            let mapping = self
+                .mapping(label)
+                .ok_or(NameError::NotInRead(Name::Label(label)))?;
+            in_place &= total_len <= mapping.start;
+            total_len = total_len
+                .checked_add(mapping.len)
+                .ok_or(NameError::Other("projected read length overflow"))?;
+            intervals.push((mapping.start, mapping.len));
+        }
+
+        if in_place {
+            let string_ptr = self.string.as_mut_ptr();
+            let qual_ptr = self.qual.as_mut().map(Vec::as_mut_ptr);
+            let mut destination = 0usize;
+            for &(source, len) in &intervals {
+                if len != 0 && source != destination {
+                    // SAFETY: every interval was obtained from a live mapping
+                    // into this allocation. `copy` explicitly permits overlap.
+                    unsafe {
+                        std::ptr::copy(string_ptr.add(source), string_ptr.add(destination), len);
+                        if let Some(ptr) = qual_ptr {
+                            std::ptr::copy(ptr.add(source), ptr.add(destination), len);
+                        }
+                    }
+                }
+                destination += len;
+            }
+            self.string.truncate(total_len);
+            if let Some(qual) = &mut self.qual {
+                qual.truncate(total_len);
+            }
+        } else {
+            let mut projected = Vec::with_capacity(total_len);
+            for &(start, len) in &intervals {
+                projected.extend_from_slice(&self.string[start..start + len]);
+            }
+            self.string = projected;
+
+            if let Some(qual) = &self.qual {
+                let mut projected_qual = Vec::with_capacity(total_len);
+                for &(start, len) in &intervals {
+                    projected_qual.extend_from_slice(&qual[start..start + len]);
+                }
+                self.qual = Some(projected_qual);
+            }
+        }
+
+        self.reset_default_mapping(total_len);
+        Ok(())
+    }
+
     pub fn trim(&mut self, label: InlineString) -> Result<(), NameError> {
         let trimmed = self
             .mapping(label)
@@ -1135,6 +1197,18 @@ impl Read {
         self.str_mappings_mut(str_type)
             .ok_or(NameError::NotInRead(Name::StrType(str_type)))?
             .cut(label, new_label1, new_label2, cut_idx)
+    }
+
+    /// Replace one FASTQ lane with a terminal projection of its labeled
+    /// intervals. All non-default mappings for that lane are discarded.
+    pub fn project_whole(
+        &mut self,
+        str_type: StrType,
+        labels: &[InlineString],
+    ) -> Result<(), NameError> {
+        self.str_mappings_mut(str_type)
+            .ok_or(NameError::NotInRead(Name::StrType(str_type)))?
+            .project_whole(labels)
     }
 
     pub fn intersect(
@@ -2090,6 +2164,49 @@ mod read_tests {
                 .unwrap(),
             Some(b"IIII".as_slice())
         );
+    }
+
+    #[test]
+    fn test_project_whole_compacts_ordered_intervals_in_place() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"AACCGGTT", b"12345678", origin, 0);
+        let sm = read.str_mappings_mut(StrType::Seq(1)).unwrap();
+        sm.add_mapping(Some(InlineString::new(b"a")), 0, 2);
+        sm.add_mapping(Some(InlineString::new(b"b")), 4, 2);
+
+        read.project_whole(
+            StrType::Seq(1),
+            &[InlineString::new(b"a"), InlineString::new(b"b")],
+        )
+        .unwrap();
+
+        let (_, seq, qual) = read.to_fastq(1).unwrap();
+        assert_eq!(seq, b"AAGG");
+        assert_eq!(qual, b"1256");
+        assert!(read
+            .mapping(StrType::Seq(1), InlineString::new(b"a"))
+            .is_err());
+    }
+
+    #[test]
+    fn test_project_whole_preserves_reordered_projection_semantics() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"AACCGGTT", b"12345678", origin, 0);
+        let sm = read.str_mappings_mut(StrType::Seq(1)).unwrap();
+        sm.add_mapping(Some(InlineString::new(b"a")), 0, 2);
+        sm.add_mapping(Some(InlineString::new(b"b")), 4, 2);
+
+        read.project_whole(
+            StrType::Seq(1),
+            &[InlineString::new(b"b"), InlineString::new(b"a")],
+        )
+        .unwrap();
+
+        let (_, seq, qual) = read.to_fastq(1).unwrap();
+        assert_eq!(seq, b"GGAA");
+        assert_eq!(qual, b"5612");
     }
 
     #[test]
