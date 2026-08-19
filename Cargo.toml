@@ -2,6 +2,13 @@
 name = "antisequence"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
+description = "A high-performance graph execution backend for sequencing-read preprocessing"
+license = "MIT"
+repository = "https://github.com/COMBINE-lab/ANTISEQUENCE"
+readme = "README.md"
+keywords = ["bioinformatics", "fastq", "sequencing", "preprocessing"]
+categories = ["science"]
 
 [dependencies]
 needletail = "0.5"
@@ -13,7 +20,9 @@ gzp = { version = "2.0.2", default-features = false, features = ["deflate", "fla
 rapidgzip-core = "0.2.0"
 regex = "1.8"
 thiserror = "1.0"
-rand = { version = "0.8", default-features = false }
+# 0.8.6 fixes RUSTSEC-2026-0097 while preserving the deterministic 0.8 API
+# and Xoshiro stream used by ambiguity-policy regression tests.
+rand = { version = "0.8.6", default-features = false }
 rand_xoshiro = "0.6"
 thread_local = "1.1"
 memchr = "2.5"
