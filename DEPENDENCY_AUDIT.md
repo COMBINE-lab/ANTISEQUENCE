@@ -20,16 +20,38 @@ ANTISEQUENCE dependency closure used for releases and paper benchmarks.
 - Compatible patch/minor releases are accepted by the existing caret
   requirements and are exercised by lockfile-free library CI.
 
-## Updates requiring targeted validation
+## Complete direct-dependency disposition
 
-| Dependency | Current line | Latest | Decision |
+“Resolved” is the version selected by a fresh resolution on the audit date;
+“latest” is the crates.io `max_stable_version`. Caret requirements already
+admit the current compatible releases in the “keep” rows.
+
+| Dependency | Resolved | Latest | Decision |
 |---|---:|---:|---|
-| `colored` | 2 | 3.1.1 | Low-risk API migration, but no runtime or security benefit; defer. |
-| `needletail` | 0.5 | 0.7.3 | Affects FASTQ parsing and I/O; benchmark and differentially test before adopting. |
-| `rand` / `rand_xoshiro` | 0.8 / 0.6 | 0.10.2 / 0.8.1 | May change deterministic random ambiguity choices; require golden-output tests. |
-| `rapidgzip-core` | 0.2 | 0.3.1 | Changes the parallel gzip backend; require gzip correctness and throughput A/B tests. |
-| `rustc-hash` | 1.1 | 2.1.3 | Hot-path hash implementation change; require determinism and performance A/B tests. |
-| `thiserror` | 1 | 2.0.20 | Straightforward source migration, but `bio` still brings the 1.x line, so it would not remove the duplicate. |
+| `needletail` | 0.5.1 | 0.7.3 | Defer: benchmark and differentially test the FASTQ/I/O migration. |
+| `bio` | 4.0.1 | 4.0.1 | Keep; current. Reconsider only to remove the Myers-only dependency. |
+| `rustc-hash` | 1.1.0 | 2.1.3 | Defer: hot-path hash change needs determinism and performance A/B tests. |
+| `hashbrown` | 0.17.1 | 0.17.1 | Keep; current. |
+| `flate2` | 1.1.9 | 1.1.9 | Keep; current. |
+| `gzp` | 2.0.4 | 2.0.4 | Keep; current. |
+| `rapidgzip-core` | 0.2.1 | 0.3.1 | Defer: validate gzip correctness, memory, and throughput. |
+| `regex` | 1.13.1 | 1.13.1 | Keep; current. |
+| `thiserror` | 1.0.69 | 2.0.20 | Defer: no security need, and `bio` still brings the 1.x line. |
+| `rand` | 0.8.7 | 0.10.2 | Keep 0.8 after its security patch; preserve deterministic ambiguity choices. |
+| `rand_xoshiro` | 0.6.0 | 0.8.1 | Keep with rand 0.8; migrate and golden-test together. |
+| `thread_local` | 1.1.10 | 1.1.10 | Keep; current. |
+| `memchr` | 2.8.3 | 2.8.3 | Keep; current. |
+| `colored` | 2.2.0 | 3.1.1 | Defer: low-value UI-only major migration. |
+| `serde_json` | 1.0.151 | 1.0.151 | Keep; current. |
+| `serde` | 1.0.229 | 1.0.229 | Keep; current. |
+| `cfg-if` | 1.0.4 | 1.0.4 | Keep; current. |
+| `rayon` | 1.12.0 | 1.12.0 | Keep; current. |
+| `smallvec` | 1.15.2 | 1.15.2 | Keep; current. |
+| `parking_lot` | 0.12.5 | 0.12.5 | Keep; current. |
+| `crossbeam-channel` | 0.5.16 | 0.5.16 | Keep; current. |
+| `mimalloc` (optional) | 0.1.52 | 0.1.52 | Keep; current. |
+| `jemallocator` (optional) | 0.5.4 | 0.5.4 | Keep; current. |
+| `block-aligner` | 0.5.1 | 0.5.1 | Keep; current; architecture-specific SIMD features are intentional. |
 
 ## Transitive findings
 
