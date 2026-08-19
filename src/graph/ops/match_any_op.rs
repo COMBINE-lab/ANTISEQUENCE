@@ -1,23 +1,23 @@
+use bio::pattern_matching::myers::long::Myers as LongMyers;
 use block_aligner::{cigar::*, scan_block::*, scores::*};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
 use memchr::memmem;
-
+use parking_lot::Mutex;
 use thread_local::*;
 
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::marker::Send;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::graph::*;
-use crate::inline_string::InlineString;
 use crate::seed_search::*;
-use crate::Patterns;
+use crate::{AmbiguityPolicy, Pattern, Patterns};
 
 /// Pre-computed lookup table for fast Hamming matching.
-/// Stores substitution IDs as InlineString (Copy, stack-allocated) to avoid allocation.
 ///
 /// Limitations:
 /// - Pattern length must be <= 8 bytes (encoded as u64).
@@ -26,10 +26,22 @@ use crate::Patterns;
 ///   so the lookup may produce false negatives for such inputs. The slow
 ///   Hamming path handles all byte values correctly.
 struct HammingLookup {
-    /// Maps encoded sequence -> substitution_id as InlineString (Copy type)
-    table: FxHashMap<u64, InlineString>,
+    /// Maps encoded sequence to the best pattern and whether another pattern
+    /// tied it at the same Hamming distance.
+    table: FxHashMap<u64, HammingLookupEntry>,
     /// Pattern length (all patterns must be same length, <= 8)
     pattern_len: usize,
+    /// Equal-best candidate lists. Entries refer to this arena using a
+    /// one-based index, keeping the common unique-hit table entry compact.
+    ties: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HammingLookupEntry {
+    pattern_idx: usize,
+    distance: u8,
+    /// Zero for a unique hit; otherwise one plus the index in `HammingLookup::ties`.
+    tie_index: u32,
 }
 
 impl HammingLookup {
@@ -54,24 +66,53 @@ impl HammingLookup {
         key
     }
 
+    #[inline]
+    fn insert(&mut self, key: u64, pattern_idx: usize, distance: u8) {
+        use std::collections::hash_map::Entry;
+
+        let candidate = HammingLookupEntry {
+            pattern_idx,
+            distance,
+            tie_index: 0,
+        };
+        match self.table.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            Entry::Occupied(mut entry) => {
+                let current = entry.get_mut();
+                if distance < current.distance {
+                    *current = candidate;
+                } else if distance == current.distance && pattern_idx != current.pattern_idx {
+                    if current.tie_index == 0 {
+                        self.ties.push(vec![current.pattern_idx, pattern_idx]);
+                        current.tie_index = self.ties.len() as u32;
+                    } else {
+                        let ties = &mut self.ties[(current.tie_index - 1) as usize];
+                        if !ties.contains(&pattern_idx) {
+                            ties.push(pattern_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Build lookup table with all mismatch variants up to max_mismatches.
-    /// sub_ids contains the substitution ID for each pattern index.
     fn new<'a>(
         patterns: impl Iterator<Item = (usize, &'a [u8])>,
-        sub_ids: &[InlineString],
         pattern_len: usize,
         max_mismatches: usize,
     ) -> Self {
-        let mut table = FxHashMap::default();
+        let mut lookup = Self {
+            table: FxHashMap::default(),
+            pattern_len,
+            ties: Vec::new(),
+        };
 
         for (pattern_idx, pattern) in patterns {
-            let sub_id = sub_ids
-                .get(pattern_idx)
-                .copied()
-                .unwrap_or_else(|| InlineString::new(b""));
-
             // Add exact match
-            table.entry(Self::encode(pattern)).or_insert(sub_id);
+            lookup.insert(Self::encode(pattern), pattern_idx, 0);
 
             // Add 1-mismatch variants
             if max_mismatches >= 1 {
@@ -80,7 +121,7 @@ impl HammingLookup {
                         if nuc != pattern[i] {
                             let mut variant = pattern.to_vec();
                             variant[i] = nuc;
-                            table.entry(Self::encode(&variant)).or_insert(sub_id);
+                            lookup.insert(Self::encode(&variant), pattern_idx, 1);
                         }
                     }
                 }
@@ -97,7 +138,7 @@ impl HammingLookup {
                                         let mut variant = pattern.to_vec();
                                         variant[i] = nuc1;
                                         variant[j] = nuc2;
-                                        table.entry(Self::encode(&variant)).or_insert(sub_id);
+                                        lookup.insert(Self::encode(&variant), pattern_idx, 2);
                                     }
                                 }
                             }
@@ -107,16 +148,25 @@ impl HammingLookup {
             }
         }
 
-        Self { table, pattern_len }
+        lookup
     }
 
-    /// Lookup a sequence, returns the substitution ID if found.
+    /// Lookup a sequence and return the best matching pattern.
     #[inline]
-    fn lookup(&self, seq: &[u8]) -> Option<InlineString> {
+    fn lookup(&self, seq: &[u8]) -> Option<HammingLookupEntry> {
         if seq.len() != self.pattern_len {
             return None;
         }
         self.table.get(&Self::encode(seq)).copied()
+    }
+
+    #[inline]
+    fn tied_candidates(&self, hit: HammingLookupEntry) -> Option<&[usize]> {
+        if hit.tie_index == 0 {
+            None
+        } else {
+            Some(&self.ties[(hit.tie_index - 1) as usize])
+        }
     }
 }
 
@@ -129,14 +179,220 @@ pub struct MatchAnyOp {
     all_literals: bool,
     match_type: MatchType,
     aligner: ThreadLocal<Option<RefCell<Box<dyn Aligner + Send>>>>,
+    short_edit_searchers: Vec<Option<ShortEditSearcher>>,
+    long_edit_searchers: ThreadLocal<RefCell<FxHashMap<usize, LongMyers<u64>>>>,
+    seed_hits: ThreadLocal<RefCell<FxHashSet<(usize, Option<isize>)>>>,
     seed_searcher: Option<SeedSearchers>,
     /// Fast hash-based lookup for Hamming matching (when applicable)
     hamming_lookup: Option<HammingLookup>,
-    // Per-thread match-distance histograms; each thread stores counts by
-    // exact edit distance, and we aggregate across threads when queried.
-    distance_counts: ThreadLocal<RwLock<Vec<usize>>>,
-    // Total number of reads that reached this node (across all threads).
-    total_attempts: AtomicUsize,
+    post_match_retention: Option<PostMatchRetention>,
+    statistics_level: AtomicU8,
+    // Each worker mutates only its own accumulator. Graph execution joins all
+    // workers before these cells are read and aggregated.
+    local_stats: ThreadLocal<Mutex<LocalMatchStats>>,
+}
+
+enum PostMatchRetention {
+    LabelPresent(Label),
+    AttributeAbsent(Attr),
+}
+
+#[derive(Default)]
+struct LocalMatchStats {
+    attempts: usize,
+    distance_counts: Vec<usize>,
+    ambiguity: AmbiguityCounts,
+}
+
+/// Immutable, precomputed Myers bit masks for a literal pattern up to 64 bytes.
+///
+/// Keeping these on the graph node avoids a thread-local map lookup and pattern
+/// preprocessing on every read. All per-search state lives on the stack, so a
+/// searcher can be shared safely by every worker.
+struct ShortEditSearcher {
+    peq: [u64; 256],
+    pattern_len: usize,
+}
+
+impl ShortEditSearcher {
+    const MIN_TEXT_LEN_FOR_PIGEONHOLE_SEARCH: usize = 256;
+    const MAX_PIGEONHOLE_CANDIDATES: usize = 64;
+
+    fn new(pattern: &[u8]) -> Self {
+        debug_assert!(!pattern.is_empty() && pattern.len() <= 64);
+        let mut peq = [0u64; 256];
+        for (i, &base) in pattern.iter().enumerate() {
+            peq[base as usize] |= 1u64 << i;
+        }
+        Self {
+            peq,
+            pattern_len: pattern.len(),
+        }
+    }
+
+    #[inline]
+    fn global_matches(&self, text: &[u8], max_edits: usize) -> Option<usize> {
+        if text.len().abs_diff(self.pattern_len) > max_edits {
+            return None;
+        }
+
+        let mut pv = !0u64;
+        let mut mv = 0u64;
+        let mut score = self.pattern_len;
+        let high_bit = 1u64 << (self.pattern_len - 1);
+
+        for &base in text {
+            let eq = self.peq[base as usize];
+            let xv = eq | mv;
+            let xh = ((eq & pv).wrapping_add(pv)) ^ pv | eq;
+            let ph = mv | !(xh | pv);
+            let mh = pv & xh;
+
+            score += usize::from((ph & high_bit) != 0);
+            score -= usize::from((mh & high_bit) != 0);
+
+            let ph_shifted = (ph << 1) | 1;
+            pv = (mh << 1) | !(xv | ph_shifted);
+            mv = ph_shifted & xv;
+        }
+
+        (score <= max_edits).then(|| self.pattern_len.saturating_sub(score))
+    }
+
+    #[inline]
+    fn search(&self, text: &[u8], max_edits: usize) -> Option<(usize, usize, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let mut pv = !0u64;
+        let mut mv = 0u64;
+        let mut score = self.pattern_len;
+        let high_bit = 1u64 << (self.pattern_len - 1);
+        let mut best_score = usize::MAX;
+        let mut best_end = 0;
+
+        for (i, &base) in text.iter().enumerate() {
+            let eq = self.peq[base as usize];
+            let xv = eq | mv;
+            let xh = ((eq & pv).wrapping_add(pv)) ^ pv | eq;
+            let ph = mv | !(xh | pv);
+            let mh = pv & xh;
+
+            score += usize::from((ph & high_bit) != 0);
+            score -= usize::from((mh & high_bit) != 0);
+
+            if score <= max_edits && score < best_score {
+                best_score = score;
+                best_end = i + 1;
+            }
+
+            // No low boundary bit here: leading text is free for a
+            // semi-global search.
+            pv = (mh << 1) | !(xv | (ph << 1));
+            mv = (ph << 1) & xv;
+        }
+
+        if best_score > max_edits {
+            return None;
+        }
+
+        let shortest = self.pattern_len.saturating_sub(best_score);
+        let longest = self.pattern_len + best_score;
+        let earliest_start = best_end.saturating_sub(longest);
+        let latest_start = best_end.saturating_sub(shortest);
+        let expected_matches = self.pattern_len.saturating_sub(best_score);
+        let start = (earliest_start..=latest_start).find(|&candidate| {
+            self.global_matches(&text[candidate..best_end], best_score) == Some(expected_matches)
+        })?;
+
+        Some((expected_matches, start, best_end))
+    }
+
+    /// Search long text using the edit-distance pigeonhole principle.
+    ///
+    /// Splitting a pattern into `k + 1` disjoint pieces guarantees that an
+    /// alignment with at most `k` edits contains at least one exact piece.
+    /// `memmem` finds those pieces quickly; Myers then verifies only small
+    /// windows around the implied starts. Repetitive inputs fall back to the
+    /// linear full-text Myers scan once candidate density becomes unfavorable.
+    fn search_pigeonhole(
+        &self,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        // A zero-edit hit is globally optimal. Trying the full literal once is
+        // substantially cheaper than either Myers or k + 1 seed scans on the
+        // common high-quality-anchor case, while preserving the exact search
+        // result (the first exact occurrence also has the earliest end).
+        if let Some(start) = memmem::find(text, pattern) {
+            return Some((self.pattern_len, start, start + self.pattern_len));
+        }
+
+        if text.len() < Self::MIN_TEXT_LEN_FOR_PIGEONHOLE_SEARCH || max_edits >= self.pattern_len {
+            return self.search(text, max_edits);
+        }
+
+        let part_count = max_edits + 1;
+        let short_part_len = self.pattern_len / part_count;
+        // Four- and five-byte seeds are too dense in real long-read data;
+        // scanning and deduplicating their candidates costs more than Myers.
+        if short_part_len < 6 {
+            return self.search(text, max_edits);
+        }
+
+        let long_part_count = self.pattern_len % part_count;
+        let mut pattern_offset = 0;
+        let mut candidate_starts: SmallVec<[isize; 8]> = SmallVec::new();
+        for part_idx in 0..part_count {
+            let part_len = short_part_len + usize::from(part_idx < long_part_count);
+            let seed = &pattern[pattern_offset..pattern_offset + part_len];
+            for seed_start in memmem::find_iter(text, seed) {
+                let predicted_start = seed_start as isize - pattern_offset as isize;
+                if !candidate_starts.contains(&predicted_start) {
+                    candidate_starts.push(predicted_start);
+                    if candidate_starts.len() > Self::MAX_PIGEONHOLE_CANDIDATES {
+                        return self.search(text, max_edits);
+                    }
+                }
+            }
+            pattern_offset += part_len;
+        }
+
+        let mut best: Option<(usize, usize, usize)> = None;
+        let text_len = text.len() as isize;
+        for predicted_start in candidate_starts {
+            // Indels before the exact seed can shift the implied start by up
+            // to k bases. The match itself can also be k bases longer than
+            // the pattern, hence the asymmetric +2k right boundary.
+            let window_start = (predicted_start - max_edits as isize).clamp(0, text_len) as usize;
+            let window_end =
+                (predicted_start + self.pattern_len as isize + (2 * max_edits) as isize)
+                    .clamp(0, text_len) as usize;
+            if window_start >= window_end {
+                continue;
+            }
+            let Some((matches, local_start, local_end)) =
+                self.search(&text[window_start..window_end], max_edits)
+            else {
+                continue;
+            };
+            let candidate = (
+                matches,
+                window_start + local_start,
+                window_start + local_end,
+            );
+            if best.is_none_or(|current| {
+                candidate.0 > current.0
+                    || (candidate.0 == current.0
+                        && (candidate.2, candidate.1) < (current.2, current.1))
+            }) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
 }
 
 impl MatchAnyOp {
@@ -182,6 +438,16 @@ impl MatchAnyOp {
             .min()
             .unwrap_or(0);
         let all_literals = patterns.iter_exprs().count() == 0;
+        let short_edit_searchers = patterns
+            .patterns()
+            .iter()
+            .map(|pattern| match pattern {
+                Pattern::Literal { bytes, .. } if !bytes.is_empty() && bytes.len() <= 64 => {
+                    Some(ShortEditSearcher::new(bytes))
+                }
+                _ => None,
+            })
+            .collect();
         let mut required_names = vec![transform_expr.before(0).into()];
         required_names.extend(
             patterns
@@ -205,33 +471,8 @@ impl MatchAnyOp {
                 && max_literal_len > 0
                 && max_literal_len <= 8
             {
-                // Extract substitution IDs from pattern attributes as InlineStrings
-                let sub_ids: Vec<InlineString> = patterns
-                    .patterns()
-                    .iter()
-                    .map(|p| {
-                        p.attrs()
-                            .iter()
-                            .find(|d| matches!(d, Data::Bytes(_)))
-                            .and_then(|d| {
-                                if let Data::Bytes(b) = d {
-                                    // Convert to InlineString (up to 24 bytes)
-                                    if b.len() <= 24 {
-                                        Some(InlineString::new(b))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| InlineString::new(b""))
-                    })
-                    .collect();
-
                 Some(HammingLookup::new(
                     patterns.iter_literals(),
-                    &sub_ids,
                     max_literal_len,
                     max_mismatches,
                 ))
@@ -251,11 +492,37 @@ impl MatchAnyOp {
             all_literals,
             match_type,
             aligner: ThreadLocal::new(),
+            short_edit_searchers,
+            long_edit_searchers: ThreadLocal::new(),
+            seed_hits: ThreadLocal::new(),
             seed_searcher,
             hamming_lookup,
-            distance_counts: ThreadLocal::new(),
-            total_attempts: AtomicUsize::new(0),
+            post_match_retention: None,
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            local_stats: ThreadLocal::new(),
         }
+    }
+
+    /// Retain only reads for which this match created `label`.
+    ///
+    /// This fuses the common `MatchAnyOp` + `RetainOp(label_exists(...))`
+    /// sequence into one graph node and a direct post-match predicate.
+    pub fn retain_label_present(mut self, label: impl AsRef<[u8]>) -> Self {
+        self.post_match_retention = Some(PostMatchRetention::LabelPresent(
+            Label::new(label.as_ref()).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        self
+    }
+
+    /// Retain only reads for which `attribute` is absent after matching.
+    ///
+    /// This preserves the exact semantics of
+    /// `RetainOp(attr_exists(...).not())` without generic expression dispatch.
+    pub fn retain_attribute_absent(mut self, attribute: impl AsRef<[u8]>) -> Self {
+        self.post_match_retention = Some(PostMatchRetention::AttributeAbsent(
+            Attr::new(attribute.as_ref()).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        self
     }
 
     fn get_searcher(patterns: &Patterns, match_type: &MatchType) -> Option<SeedSearchers> {
@@ -307,30 +574,220 @@ impl MatchAnyOp {
     }
 
     #[inline]
-    fn record_distance(&self, pattern_len: usize, matches: usize) {
+    fn record_distance(counts: &mut Vec<usize>, pattern_len: usize, matches: usize) {
         if pattern_len == 0 {
             return;
         }
         let distance = pattern_len.saturating_sub(matches);
-        let cell = self.distance_counts.get_or(|| RwLock::new(Vec::new()));
-        let mut counts = cell.write().unwrap();
         if distance >= counts.len() {
             counts.resize(distance + 1, 0);
         }
         counts[distance] += 1;
     }
 
+    #[inline]
+    fn edit_search_short_literal(
+        &self,
+        pattern_idx: usize,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let searcher = self.short_edit_searchers[pattern_idx]
+            .as_ref()
+            .expect("short literal patterns have a precomputed edit searcher");
+        debug_assert_eq!(searcher.pattern_len, pattern.len());
+        if matches!(self.match_type, MatchType::EditSearch(_)) {
+            searcher.search_pigeonhole(text, pattern, max_edits)
+        } else {
+            searcher.search(text, max_edits)
+        }
+    }
+
+    #[inline]
+    fn edit_search_long_literal(
+        &self,
+        pattern_idx: usize,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let cell = self
+            .long_edit_searchers
+            .get_or(|| RefCell::new(FxHashMap::default()));
+        let mut searchers = cell.borrow_mut();
+        let searcher = searchers
+            .entry(pattern_idx)
+            .or_insert_with(|| LongMyers::<u64>::new(pattern));
+        edit_search_long_myers(searcher, text, pattern.len(), max_edits)
+    }
+
+    #[inline(always)]
+    fn edit_search_dispatch(
+        &self,
+        pattern_idx: usize,
+        pattern_is_literal: bool,
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        if pattern_is_literal {
+            if pattern.len() <= 64 {
+                self.edit_search_short_literal(pattern_idx, text, pattern, max_edits)
+            } else {
+                self.edit_search_long_literal(pattern_idx, text, pattern, max_edits)
+            }
+        } else {
+            edit_search(text, pattern, max_edits)
+        }
+    }
+
     /// Human-readable label for statistics, e.g. "seq1.brc".
     pub fn stats_label(&self) -> String {
         format!("{}.{}", self.label.str_type, self.label.label)
+    }
+
+    #[inline]
+    fn effective_ambiguity_policy(&self) -> AmbiguityPolicy {
+        self.patterns.ambiguity_policy().unwrap_or_else(|| {
+            if self.patterns.multimatch_name().is_some() {
+                AmbiguityPolicy::NoMatch
+            } else {
+                AmbiguityPolicy::Accept
+            }
+        })
+    }
+
+    fn resolve_ambiguity(
+        &self,
+        read: &Read,
+        text: &[u8],
+        quality: Option<&[u8]>,
+        candidates: &[usize],
+        mut stats: Option<&mut LocalMatchStats>,
+    ) -> Result<Option<usize>> {
+        debug_assert!(candidates.len() > 1);
+        let mut ordered: SmallVec<[usize; 4]> = candidates.iter().copied().collect();
+        ordered.sort_unstable();
+        ordered.dedup();
+        if ordered.len() == 1 {
+            return Ok(ordered.first().copied());
+        }
+
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.ambiguity.total += 1;
+        }
+        match self.effective_ambiguity_policy() {
+            AmbiguityPolicy::Accept | AmbiguityPolicy::First => {
+                if let Some(stats) = stats {
+                    stats.ambiguity.accepted += 1;
+                    stats.ambiguity.resolved_first += 1;
+                }
+                Ok(ordered.first().copied())
+            }
+            AmbiguityPolicy::NoMatch => {
+                if let Some(stats) = stats {
+                    stats.ambiguity.dropped += 1;
+                }
+                Ok(None)
+            }
+            AmbiguityPolicy::Error => Err(Error::GraphExecution(format!(
+                "ambiguous equal-best match for {}.{} against pattern indices {:?}",
+                self.label.str_type, self.label.label, ordered
+            ))),
+            AmbiguityPolicy::Random { seed } => {
+                let mut hasher = FxHasher::default();
+                seed.hash(&mut hasher);
+                text.hash(&mut hasher);
+                if let StrType::Seq(read_idx) = self.label.str_type {
+                    if let Some(name) = read.str_mappings(StrType::Name(read_idx)) {
+                        name.string().hash(&mut hasher);
+                    }
+                }
+                let selected = (hasher.finish() as usize) % ordered.len();
+                if let Some(stats) = stats {
+                    stats.ambiguity.accepted += 1;
+                    stats.ambiguity.resolved_random += 1;
+                }
+                Ok(Some(ordered[selected]))
+            }
+            AmbiguityPolicy::Quality { min_delta } => {
+                let quality = quality.ok_or_else(|| {
+                    Error::GraphExecution(format!(
+                        "quality ambiguity policy requires quality scores for {}.{}",
+                        self.label.str_type, self.label.label
+                    ))
+                })?;
+                if quality.len() != text.len() {
+                    return Err(Error::GraphExecution(format!(
+                        "quality length {} does not match sequence length {} for {}.{}",
+                        quality.len(),
+                        text.len(),
+                        self.label.str_type,
+                        self.label.label
+                    )));
+                }
+
+                let mut scores: SmallVec<[(u64, usize); 4]> = SmallVec::new();
+                for &pattern_idx in &ordered {
+                    let pattern =
+                        self.patterns.patterns()[pattern_idx]
+                            .get(read)
+                            .map_err(|source| Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            })?;
+                    if pattern.len() != text.len() {
+                        return Err(Error::GraphExecution(
+                            "quality ambiguity policy currently requires equal-length patterns"
+                                .to_string(),
+                        ));
+                    }
+                    let mismatch_quality = pattern
+                        .iter()
+                        .zip(text)
+                        .zip(quality)
+                        .filter_map(|((&pattern_base, &query_base), &q)| {
+                            (pattern_base != query_base).then_some(u64::from(q.saturating_sub(33)))
+                        })
+                        .sum();
+                    scores.push((mismatch_quality, pattern_idx));
+                }
+                scores.sort_unstable();
+                let (best_score, best_idx) = scores[0];
+                let runner_up_score = scores[1].0;
+                if best_score < runner_up_score
+                    && runner_up_score - best_score >= u64::from(min_delta)
+                {
+                    if let Some(stats) = stats {
+                        stats.ambiguity.accepted += 1;
+                        stats.ambiguity.resolved_quality += 1;
+                    }
+                    Ok(Some(best_idx))
+                } else {
+                    if let Some(stats) = stats {
+                        stats.ambiguity.dropped += 1;
+                    }
+                    Ok(None)
+                }
+            }
+        }
     }
 }
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
-        // Count how many reads reach this node in this batch.
-        self.total_attempts
-            .fetch_add(reads.len(), Ordering::Relaxed);
+        let collect_stats =
+            self.statistics_level.load(Ordering::Relaxed) == StatisticsLevel::Detailed as u8;
+        let stats_cell = collect_stats.then(|| {
+            self.local_stats
+                .get_or(|| Mutex::new(LocalMatchStats::default()))
+        });
+        let mut stats = stats_cell.map(Mutex::lock);
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.attempts += reads.len();
+        }
 
         // Access thread-local aligner once per batch
         use MatchType::*;
@@ -375,18 +832,68 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             // Fast path: use pre-computed hash lookup for Hamming matching
             if let Some(ref lookup) = self.hamming_lookup {
                 let pattern_len = lookup.pattern_len;
-                match lookup.lookup(text) {
-                    Some(sub_id) => {
+                let resolved_hit = match lookup.lookup(text) {
+                    Some(hit) => {
+                        if let Some(candidates) = lookup.tied_candidates(hit) {
+                            let quality = read
+                                .substring_qual(self.label.str_type, self.label.label)
+                                .map_err(|source| Error::NameError {
+                                    source,
+                                    read: read.clone(),
+                                    context: Self::NAME,
+                                })?;
+                            self.resolve_ambiguity(
+                                read,
+                                text,
+                                quality,
+                                candidates,
+                                stats.as_deref_mut(),
+                            )?
+                            .map(|pattern_idx| HammingLookupEntry {
+                                pattern_idx,
+                                distance: hit.distance,
+                                tie_index: 0,
+                            })
+                        } else {
+                            Some(hit)
+                        }
+                    }
+                    None => None,
+                };
+                match resolved_hit {
+                    Some(hit) => {
                         // Fast path matched
+                        if let Some(stats) = stats.as_deref_mut() {
+                            Self::record_distance(
+                                &mut stats.distance_counts,
+                                pattern_len,
+                                pattern_len.saturating_sub(hit.distance as usize),
+                            );
+                        }
+                        let pattern = &self.patterns.patterns()[hit.pattern_idx];
+                        let pattern_value = self.patterns.pattern_name().map(|name| {
+                            let bytes = match pattern {
+                                Pattern::Literal { bytes, .. } => Data::from_bytes(bytes),
+                                Pattern::Expr { .. } => {
+                                    unreachable!("lookup contains literals only")
+                                }
+                            };
+                            (name, bytes)
+                        });
                         let mapping = read
                             .mapping_mut(self.label.str_type, self.label.label)
                             .unwrap();
 
-                        // Set sub and ambig attributes
-                        let sub_bytes: Vec<u8> = sub_id.bytes().collect();
-                        *mapping.data_mut(InlineString::new(b"sub")) = Data::Bytes(sub_bytes);
-                        *mapping.data_mut(InlineString::new(b"ambig")) =
-                            Data::Bytes(b"false".to_vec());
+                        if let Some((pattern_name, value)) = pattern_value {
+                            *mapping.data_mut(pattern_name) = value;
+                        }
+                        if let Some(multimatch_name) = self.patterns.multimatch_name() {
+                            *mapping.data_mut(multimatch_name) = Data::from_bytes(b"false");
+                        }
+                        for (&attr, data) in self.patterns.attr_names().iter().zip(pattern.attrs())
+                        {
+                            *mapping.data_mut(attr) = data.clone();
+                        }
 
                         // For Hamming match, num_mappings() is 1
                         let start = mapping.start;
@@ -415,16 +922,25 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             .mapping_mut(self.label.str_type, self.label.label)
                             .unwrap();
 
-                        // Set empty/ambig attributes for no-match
-                        *mapping.data_mut(InlineString::new(b"sub")) = Data::Bytes(Vec::new());
-                        *mapping.data_mut(InlineString::new(b"ambig")) =
-                            Data::Bytes(b"true".to_vec());
+                        if let Some(pattern_name) = self.patterns.pattern_name() {
+                            *mapping.data_mut(pattern_name) = Data::from_bytes(b"");
+                        }
+                        if let Some(multimatch_name) = self.patterns.multimatch_name() {
+                            *mapping.data_mut(multimatch_name) = Data::from_bytes(b"true");
+                        }
+                        for &attr in self.patterns.attr_names() {
+                            *mapping.data_mut(attr) = Data::from_bytes(b"");
+                        }
                         continue; // Skip slow path
                     }
                 }
             }
 
-            let mut seed_hits = FxHashSet::default();
+            // Reuse the seed-hit table for every read processed by this worker.
+            // Clearing keeps its allocation/capacity while removing old hits.
+            let seed_hits_cell = self.seed_hits.get_or(|| RefCell::new(FxHashSet::default()));
+            let mut seed_hits = seed_hits_cell.borrow_mut();
+            seed_hits.clear();
 
             if let Some(seed_searcher) = &self.seed_searcher {
                 let (text_slice, text_offset, use_i) = match self.match_type {
@@ -518,14 +1034,10 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             }
 
             let mut max_matches = 0;
-            let mut max_pattern_len = 0;
-            let mut max_pattern = None;
             let mut max_pattern_idx = usize::MAX;
-            let mut max_cut_pos1 = 0;
-            let mut max_cut_pos2 = 0;
-            let mut multimatches = false;
+            let mut best_candidates: SmallVec<[(usize, usize, usize, usize); 4]> = SmallVec::new();
 
-            for (pattern_idx, text_i) in seed_hits {
+            for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
                 let pattern_str_cow = pattern.get(read).map_err(|e| Error::NameError {
                     source: e,
@@ -534,7 +1046,6 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-
                 if max_matches > pattern_len {
                     continue;
                 }
@@ -710,17 +1221,28 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             );
                             if text_end > text_start {
                                 let text_slice = &text[text_start..text_end];
-                                edit_search(text_slice, pattern_str, max_edits).map(
-                                    |(m, start_idx, end_idx)| {
-                                        (m, text_start + start_idx, text_start + end_idx)
-                                    },
+                                self.edit_search_dispatch(
+                                    pattern_idx,
+                                    matches!(pattern, Pattern::Literal { .. }),
+                                    text_slice,
+                                    pattern_str,
+                                    max_edits,
                                 )
+                                .map(|(m, start_idx, end_idx)| {
+                                    (m, text_start + start_idx, text_start + end_idx)
+                                })
                             } else {
                                 None
                             }
                         } else {
                             // No seed hit - full search
-                            edit_search(text, pattern_str, max_edits)
+                            self.edit_search_dispatch(
+                                pattern_idx,
+                                matches!(pattern, Pattern::Literal { .. }),
+                                text,
+                                pattern_str,
+                                max_edits,
+                            )
                         }
                     }
                     EditBoundedMatch {
@@ -731,44 +1253,89 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         let max_edits = t.get(pattern_len);
                         let to_exclusive = text.len().min(to + 1);
                         let text_around = &text[from..to_exclusive];
-                        edit_search(text_around, pattern_str, max_edits)
-                            .map(|(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx))
+                        self.edit_search_dispatch(
+                            pattern_idx,
+                            matches!(pattern, Pattern::Literal { .. }),
+                            text_around,
+                            pattern_str,
+                            max_edits,
+                        )
+                        .map(|(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx))
                     }
                 };
 
                 if let Some((matches, cut_pos1, cut_pos2)) = matches {
-                    if matches > max_matches {
+                    if max_pattern_idx == usize::MAX || matches > max_matches {
                         max_matches = matches;
-                        max_pattern_len = pattern_len;
-                        max_pattern = Some((pattern_str_cow, pattern.attrs()));
                         max_pattern_idx = pattern_idx;
-                        max_cut_pos1 = cut_pos1;
-                        max_cut_pos2 = cut_pos2;
-                        multimatches = false;
+                        best_candidates.clear();
+                        best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
                     } else if matches == max_matches && pattern_idx != max_pattern_idx {
-                        multimatches = true;
+                        if !best_candidates
+                            .iter()
+                            .any(|&(candidate_idx, _, _, _)| candidate_idx == pattern_idx)
+                        {
+                            best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
+                        }
                     }
                 }
             }
 
-            if let Some((pattern_str, pattern_attrs)) = max_pattern {
-                self.record_distance(max_pattern_len, max_matches);
-                let pattern_str = pattern_str.into_owned();
+            let selected_pattern_idx = if best_candidates.len() > 1 {
+                let quality = read
+                    .substring_qual(self.label.str_type, self.label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?;
+                let candidate_indices: SmallVec<[usize; 4]> = best_candidates
+                    .iter()
+                    .map(|&(pattern_idx, _, _, _)| pattern_idx)
+                    .collect();
+                self.resolve_ambiguity(
+                    read,
+                    text,
+                    quality,
+                    &candidate_indices,
+                    stats.as_deref_mut(),
+                )?
+            } else {
+                best_candidates.first().map(|candidate| candidate.0)
+            };
+
+            if let Some(selected_pattern_idx) = selected_pattern_idx {
+                let &(_, max_pattern_len, max_cut_pos1, max_cut_pos2) = best_candidates
+                    .iter()
+                    .find(|&&(pattern_idx, _, _, _)| pattern_idx == selected_pattern_idx)
+                    .expect("resolved candidate must be present in equal-best candidate set");
+                let selected_pattern = &self.patterns.patterns()[selected_pattern_idx];
+                let pattern_str =
+                    selected_pattern
+                        .get(read)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?;
+                let pattern_attrs = selected_pattern.attrs();
+                if let Some(stats) = stats.as_deref_mut() {
+                    Self::record_distance(&mut stats.distance_counts, max_pattern_len, max_matches);
+                }
+                let pattern_value = self
+                    .patterns
+                    .pattern_name()
+                    .map(|name| (name, Data::from_bytes(pattern_str.as_ref())));
                 let mapping = read
                     .mapping_mut(self.label.str_type, self.label.label)
                     .unwrap();
 
-                if let Some(pattern_name) = self.patterns.pattern_name() {
-                    *mapping.data_mut(pattern_name) = Data::Bytes(pattern_str);
+                if let Some((pattern_name, value)) = pattern_value {
+                    *mapping.data_mut(pattern_name) = value;
                 }
 
                 if let Some(multimatch_name) = self.patterns.multimatch_name() {
-                    let val = if multimatches {
-                        b"true".to_vec()
-                    } else {
-                        b"false".to_vec()
-                    };
-                    *mapping.data_mut(multimatch_name) = Data::Bytes(val);
+                    *mapping.data_mut(multimatch_name) = Data::from_bytes(b"false");
                 }
 
                 for (&attr, data) in self.patterns.attr_names().iter().zip(pattern_attrs) {
@@ -838,7 +1405,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
 
                 // Reset pattern name (unused by seqproc map) on no-match
                 if let Some(pattern_name) = self.patterns.pattern_name() {
-                    *mapping.data_mut(pattern_name) = Data::Bytes(Vec::new());
+                    *mapping.data_mut(pattern_name) = Data::from_bytes(b"");
                 }
 
                 // For seqproc's map(), `ambig` is used to derive the boolean `MAPPED = !ambig`.
@@ -848,24 +1415,34 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 // Since `expect_bool` treats non-empty, non-"false" bytes as true,
                 // we store "true" here so that `!ambig` evaluates to false.
                 if let Some(multimatch_name) = self.patterns.multimatch_name() {
-                    *mapping.data_mut(multimatch_name) = Data::Bytes(b"true".to_vec());
+                    *mapping.data_mut(multimatch_name) = Data::from_bytes(b"true");
                 }
 
                 // Initialize any pattern attributes; `sub` is left as empty bytes for no-match.
                 for &attr in self.patterns.attr_names() {
                     let name = attr.as_str().as_bytes();
                     if name == b"sub" {
-                        *mapping.data_mut(attr) = Data::Bytes(Vec::new());
+                        *mapping.data_mut(attr) = Data::from_bytes(b"");
                     } else if name == b"ambig" {
-                        *mapping.data_mut(attr) = Data::Bytes(b"true".to_vec());
+                        *mapping.data_mut(attr) = Data::from_bytes(b"true");
                     } else {
-                        *mapping.data_mut(attr) = Data::Bytes(Vec::new());
+                        *mapping.data_mut(attr) = Data::from_bytes(b"");
                     }
                 }
+            }
+        }
 
-                // Force-create defaults for `sub`/`ambig` if they were not in attr_names.
-                *mapping.data_mut(InlineString::new(b"sub")) = Data::Bytes(Vec::new());
-                *mapping.data_mut(InlineString::new(b"ambig")) = Data::Bytes(b"true".to_vec());
+        if let Some(retention) = &self.post_match_retention {
+            reads.retain(|read| match retention {
+                PostMatchRetention::LabelPresent(label) => {
+                    read.mapping(label.str_type, label.label).is_ok()
+                }
+                PostMatchRetention::AttributeAbsent(attr) => {
+                    read.data(attr.str_type, attr.label, attr.attr).is_err()
+                }
+            });
+            if reads.is_empty() {
+                return Ok((None, false));
             }
         }
 
@@ -880,15 +1457,31 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         Self::NAME
     }
 
-    fn match_distance_counts(&self) -> Option<MatchDistanceCounts> {
-        let mut totals: Vec<usize> = Vec::new();
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
+    }
 
-        for local in self.distance_counts.iter() {
-            let local = local.read().unwrap();
-            if local.len() > totals.len() {
-                totals.resize(local.len(), 0);
+    fn match_distance_counts(&self) -> Option<MatchDistanceCounts> {
+        if self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Detailed as u8 {
+            return None;
+        }
+        let mut totals: Vec<usize> = Vec::new();
+        let mut total_attempts = 0usize;
+        let mut ambiguity = AmbiguityCounts::default();
+
+        for local in self.local_stats.iter() {
+            let local = local.lock();
+            total_attempts += local.attempts;
+            ambiguity.total += local.ambiguity.total;
+            ambiguity.accepted += local.ambiguity.accepted;
+            ambiguity.dropped += local.ambiguity.dropped;
+            ambiguity.resolved_first += local.ambiguity.resolved_first;
+            ambiguity.resolved_random += local.ambiguity.resolved_random;
+            ambiguity.resolved_quality += local.ambiguity.resolved_quality;
+            if local.distance_counts.len() > totals.len() {
+                totals.resize(local.distance_counts.len(), 0);
             }
-            for (d, &count) in local.iter().enumerate() {
+            for (d, &count) in local.distance_counts.iter().enumerate() {
                 totals[d] += count;
             }
         }
@@ -901,7 +1494,8 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         Some(MatchDistanceCounts {
             label: self.stats_label(),
             counts: totals,
-            total: self.total_attempts.load(Ordering::Relaxed),
+            total: total_attempts,
+            ambiguity,
         })
     }
 }
@@ -1053,9 +1647,13 @@ fn edit_distance_myers(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<
             score -= 1;
         }
 
-        // Shift for next iteration
-        pv = (mh << 1) | !(xv | (ph << 1));
-        mv = (ph << 1) & xv;
+        // Shift for the next global-alignment row. The low boundary bit
+        // charges text-prefix insertions; omitting it turns this into a
+        // semi-global recurrence and undercounts some unequal-length inputs.
+        let ph_shifted = (ph << 1) | 1;
+        let mh_shifted = mh << 1;
+        pv = mh_shifted | !(xv | ph_shifted);
+        mv = ph_shifted & xv;
     }
 
     if score <= max_edits {
@@ -1122,6 +1720,23 @@ fn edit_search(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usize, 
     } else {
         edit_search_dp(text, pattern, max_edits)
     }
+}
+
+fn edit_search_long_myers(
+    searcher: &mut LongMyers<u64>,
+    text: &[u8],
+    pattern_len: usize,
+    max_edits: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut matches = searcher.find_all_lazy(text, max_edits);
+    let (best_end, best_distance) = matches.by_ref().min_by_key(|&(_, distance)| distance)?;
+    let (start, traced_distance) = matches.hit_at(best_end)?;
+    debug_assert_eq!(best_distance, traced_distance);
+    Some((
+        pattern_len.saturating_sub(best_distance),
+        start,
+        best_end + 1,
+    ))
 }
 
 /// Myers' bit-vector algorithm for semi-global edit distance search (patterns up to 64bp).
@@ -1703,6 +2318,262 @@ impl<const PREFIX: bool> Aligner for PrefixSuffixAligner<PREFIX> {
 mod edit_distance_tests {
     use super::*;
 
+    fn reference_levenshtein(text: &[u8], pattern: &[u8]) -> usize {
+        let mut prev = (0..=pattern.len()).collect::<Vec<_>>();
+        let mut curr = vec![0usize; pattern.len() + 1];
+        for (i, &text_base) in text.iter().enumerate() {
+            curr[0] = i + 1;
+            for (j, &pattern_base) in pattern.iter().enumerate() {
+                let substitution = prev[j] + usize::from(text_base != pattern_base);
+                curr[j + 1] = substitution.min(prev[j + 1] + 1).min(curr[j] + 1);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[pattern.len()]
+    }
+
+    /// Deliberately slow oracle for semi-global search. Match ordering mirrors
+    /// the public behavior: minimum distance, then earliest end, then earliest
+    /// start for that end.
+    fn reference_edit_search(
+        text: &[u8],
+        pattern: &[u8],
+        max_edits: usize,
+    ) -> Option<(usize, usize, usize)> {
+        if text.is_empty() || pattern.is_empty() {
+            return None;
+        }
+
+        let mut best = None::<(usize, usize, usize)>;
+        for end in 1..=text.len() {
+            let mut best_at_end = None::<(usize, usize)>;
+            for start in 0..=end {
+                let distance = reference_levenshtein(&text[start..end], pattern);
+                if best_at_end.is_none_or(|(best_distance, best_start)| {
+                    distance < best_distance || (distance == best_distance && start < best_start)
+                }) {
+                    best_at_end = Some((distance, start));
+                }
+            }
+
+            let (distance, start) = best_at_end.unwrap();
+            if distance <= max_edits
+                && best.is_none_or(|(best_distance, _, _)| distance < best_distance)
+            {
+                best = Some((distance, start, end));
+            }
+        }
+
+        best.map(|(distance, start, end)| (pattern.len() - distance, start, end))
+    }
+
+    #[test]
+    fn test_short_edit_distance_matches_levenshtein_oracle() {
+        let mut state = 0x1319_8a2e_0370_7344u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..5_000 {
+            let pattern_len = 1 + next() as usize % 64;
+            let max_edits = next() as usize % 5;
+            let min_text_len = pattern_len.saturating_sub(max_edits);
+            let text_len = min_text_len + next() as usize % (2 * max_edits + 1);
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let text = (0..text_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let distance = reference_levenshtein(&text, &pattern);
+            let expected = (distance <= max_edits).then_some(pattern_len.saturating_sub(distance));
+
+            assert_eq!(
+                edit_distance_myers(&text, &pattern, max_edits),
+                expected,
+                "distance differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_edit_search_matches_bruteforce_oracle() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..100_000 {
+            let pattern_len = 1 + next() as usize % 12;
+            let text_len = 1 + next() as usize % 20;
+            let max_edits = next() as usize % (pattern_len.saturating_sub(1).min(3) + 1);
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let text = (0..text_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                edit_search(&text, &pattern, max_edits),
+                reference_edit_search(&text, &pattern, max_edits),
+                "differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_precomputed_short_myers_matches_bruteforce_oracle() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..10_000 {
+            let pattern_len = 1 + next() as usize % 32;
+            let text_len = 1 + next() as usize % 64;
+            let max_edits = next() as usize % (pattern_len.saturating_sub(1).min(3) + 1);
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let text = (0..text_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let searcher = ShortEditSearcher::new(&pattern);
+
+            assert_eq!(
+                searcher.search(&text, max_edits),
+                reference_edit_search(&text, &pattern, max_edits),
+                "precomputed short Myers differential failure in case {case_idx}: text={:?}, pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_pigeonhole_short_myers_matches_full_search() {
+        let mut state = 0xa409_3822_299f_31d0u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..5_000 {
+            let pattern_len = 20 + next() as usize % 29;
+            let max_edits = 1 + next() as usize % 3;
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let mut text = (0..(256 + next() as usize % 257))
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+
+            if case_idx % 5 != 0 {
+                let mut placed = pattern.clone();
+                let edit_count = 1 + next() as usize % max_edits;
+                for _ in 0..edit_count {
+                    match next() % 3 {
+                        0 => {
+                            let idx = next() as usize % placed.len();
+                            placed[idx] = BASES[next() as usize % BASES.len()];
+                        }
+                        1 => {
+                            let idx = next() as usize % (placed.len() + 1);
+                            placed.insert(idx, BASES[next() as usize % BASES.len()]);
+                        }
+                        _ if placed.len() > 1 => {
+                            let idx = next() as usize % placed.len();
+                            placed.remove(idx);
+                        }
+                        _ => {}
+                    }
+                }
+                let start = next() as usize % (text.len() - placed.len() + 1);
+                text.splice(start..start + placed.len(), placed);
+            }
+
+            let searcher = ShortEditSearcher::new(&pattern);
+            assert_eq!(
+                searcher.search_pigeonhole(&text, &pattern, max_edits),
+                searcher.search(&text, max_edits),
+                "pigeonhole differential failure in case {case_idx}: pattern={:?}, max_edits={max_edits}",
+                String::from_utf8_lossy(&pattern),
+            );
+        }
+    }
+
+    #[test]
+    fn test_long_myers_matches_reference_dp() {
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = || {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state
+        };
+        const BASES: &[u8] = b"ACGT";
+
+        for case_idx in 0..2_000 {
+            let pattern_len = 65 + next() as usize % 76;
+            let max_edits = next() as usize % 4;
+            let pattern = (0..pattern_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            let mut placed = pattern.clone();
+            match case_idx % 5 {
+                0 => {}
+                1 => {
+                    let midpoint = placed.len() / 2;
+                    placed[midpoint] = b'N';
+                }
+                2 => {
+                    let midpoint = placed.len() / 2;
+                    placed.insert(midpoint, b'N');
+                }
+                3 => {
+                    let midpoint = placed.len() / 2;
+                    placed.remove(midpoint);
+                }
+                _ => placed.fill(b'N'),
+            }
+            let prefix_len = next() as usize % 11;
+            let suffix_len = next() as usize % 11;
+            let mut text = (0..prefix_len)
+                .map(|_| BASES[next() as usize % BASES.len()])
+                .collect::<Vec<_>>();
+            text.extend_from_slice(&placed);
+            text.extend((0..suffix_len).map(|_| BASES[next() as usize % BASES.len()]));
+
+            let expected = edit_search(&text, &pattern, max_edits);
+            let mut searcher = LongMyers::<u64>::new(&pattern);
+            let observed = edit_search_long_myers(&mut searcher, &text, pattern.len(), max_edits);
+            assert_eq!(
+                observed, expected,
+                "long Myers differential failure in case {case_idx}: pattern_len={pattern_len}, max_edits={max_edits}"
+            );
+        }
+    }
+
     // -- Bug 1: edit_search_myers estimates start position instead of computing it exactly --
     // Use 8bp patterns to avoid ambiguous partial matches with shorter patterns.
     #[test]
@@ -2050,5 +2921,27 @@ mod edit_distance_tests {
         // Sequences > 8 bytes must panic in debug builds (debug_assert guard)
         let seq = b"CATATTCCTGGTGG"; // 14 bytes
         let _ = HammingLookup::encode(seq);
+    }
+
+    #[test]
+    fn test_hamming_lookup_prefers_lower_distance_and_marks_ties() {
+        let lookup = HammingLookup::new(
+            [(0, b"AAAA".as_slice()), (1, b"AAAC".as_slice())].into_iter(),
+            4,
+            1,
+        );
+
+        assert_eq!(
+            lookup.lookup(b"AAAC"),
+            Some(HammingLookupEntry {
+                pattern_idx: 1,
+                distance: 0,
+                tie_index: 0,
+            })
+        );
+        let tied = lookup.lookup(b"AAAG").unwrap();
+        assert_eq!(tied.pattern_idx, 0);
+        assert_eq!(tied.distance, 1);
+        assert_eq!(lookup.tied_candidates(tied), Some(&[0, 1][..]));
     }
 }

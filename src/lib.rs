@@ -120,10 +120,12 @@ mod pipeline_tests {
     use crate::expr::*;
     use crate::graph::*;
     use crate::inline_string::InlineString;
-    use crate::patterns::Patterns;
+    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns};
     use crate::read::*;
     use crate::trace::NoTrace;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn fastq_bytes(records: &[(&str, &str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -329,11 +331,126 @@ mod pipeline_tests {
 
         let mut g = Graph::<NoTrace>::new();
         let input = g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.set_collect_statistics(true);
         g.run().unwrap();
 
         let stats = GraphNode::<NoTrace>::input_stats(input.as_ref()).unwrap();
         assert_eq!(stats.n_fastqs, 1);
         assert_eq!(stats.read_counts[0], 2);
+    }
+
+    #[test]
+    fn test_batched_statistics_are_exact_across_execution_backends() {
+        for pipeline in [false, true] {
+            let mut fq = Vec::new();
+            for index in 0..5_000 {
+                let (sequence, quality) = if index % 2 == 0 {
+                    (b"ACGT".as_slice(), b"IIII".as_slice())
+                } else {
+                    (b"ACGC".as_slice(), b"IIII".as_slice())
+                };
+                fq.extend_from_slice(b"@read\n");
+                fq.extend_from_slice(sequence);
+                fq.extend_from_slice(b"\n+\n");
+                fq.extend_from_slice(quality);
+                fq.push(b'\n');
+            }
+
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            graph.add(MatchAnyOp::new(
+                te("seq1.* -> seq1.*"),
+                Patterns::from_strs(["ACGT"]),
+                Hamming(Count(3)),
+            ));
+            graph.add(NullOutputOp::new());
+            graph.set_collect_statistics(true);
+
+            if pipeline {
+                let mut config = PipelineConfig::new(4);
+                config.batch_size = 257;
+                graph.try_run_pipeline(config).unwrap();
+            } else {
+                graph.try_run_with_threads(4).unwrap();
+            }
+
+            let stats = graph.input_stats().unwrap();
+            assert!(stats.lengths_collected);
+            assert_eq!(stats.read_counts, vec![5_000]);
+            assert_eq!(stats.read_length_min, vec![4]);
+            assert_eq!(stats.read_length_max, vec![4]);
+            assert_eq!(stats.read_length_sum, vec![20_000]);
+
+            let distances = graph.match_distance_counts();
+            assert_eq!(distances.len(), 1);
+            assert_eq!(distances[0].counts, vec![2_500, 2_500]);
+            assert_eq!(distances[0].total, 5_000);
+        }
+    }
+
+    #[test]
+    fn test_basic_statistics_omit_detailed_match_histograms() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "ACGC", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.set_statistics_level(StatisticsLevel::Basic);
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            Patterns::from_strs(["ACGT"]),
+            Hamming(Count(3)),
+        ));
+        graph.run().unwrap();
+
+        assert_eq!(graph.statistics_level(), StatisticsLevel::Basic);
+        let stats = graph.input_stats().unwrap();
+        assert_eq!(stats.read_counts, vec![2]);
+        assert!(!stats.lengths_collected);
+        assert!(graph.match_distance_counts().is_empty());
+    }
+
+    fn ambiguity_statistics(policy: AmbiguityPolicy, quality: &str) -> MatchDistanceCounts {
+        let fq = fastq_bytes(&[("read1", "AAAA", quality)]);
+        let patterns = Patterns::new(
+            [
+                Pattern::from_literal(b"CAAA", Vec::<Data>::new()),
+                Pattern::from_literal(b"AAAC", Vec::<Data>::new()),
+            ],
+            std::iter::empty::<&str>(),
+        )
+        .with_ambiguity_policy(policy);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(3)),
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        graph.match_distance_counts().remove(0)
+    }
+
+    #[test]
+    fn test_detailed_statistics_report_ambiguity_policy_outcomes() {
+        let first = ambiguity_statistics(AmbiguityPolicy::First, "IIII");
+        assert_eq!(first.ambiguity.total, 1);
+        assert_eq!(first.ambiguity.accepted, 1);
+        assert_eq!(first.ambiguity.resolved_first, 1);
+        assert_eq!(first.ambiguity.dropped, 0);
+
+        let random = ambiguity_statistics(AmbiguityPolicy::Random { seed: 7 }, "IIII");
+        assert_eq!(random.ambiguity.accepted, 1);
+        assert_eq!(random.ambiguity.resolved_random, 1);
+
+        let quality = ambiguity_statistics(AmbiguityPolicy::Quality { min_delta: 1 }, "!III");
+        assert_eq!(quality.ambiguity.accepted, 1);
+        assert_eq!(quality.ambiguity.resolved_quality, 1);
+
+        let dropped = ambiguity_statistics(AmbiguityPolicy::NoMatch, "IIII");
+        assert_eq!(dropped.ambiguity.total, 1);
+        assert_eq!(dropped.ambiguity.dropped, 1);
+        assert_eq!(dropped.ambiguity.accepted, 0);
     }
 
     #[test]
@@ -358,6 +475,19 @@ mod pipeline_tests {
         let output = std::fs::read_to_string(&tmp).unwrap();
         assert!(output.contains("AAAA"));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_graph_interleaved_reader_rejects_partial_fragment() {
+        let fq = fastq_bytes(&[
+            ("read1_R1", "AAAA", "IIII"),
+            ("read1_R2", "CCCC", "IIII"),
+            ("read2_R1", "GGGG", "IIII"),
+        ]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_interleaved_reader(Cursor::new(fq), 2).unwrap());
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error.to_string().contains("Unpaired read"));
     }
 
     #[test]
@@ -557,12 +687,438 @@ mod pipeline_tests {
             let mut g = Graph::<NoTrace>::new();
             g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
             g.add(OutputFastqFileOp::from_file(tmp_str.clone()));
+            g.set_collect_statistics(true);
             g.run_with_threads(2);
+            assert_eq!(g.final_output_reads(), Some(2));
         }
 
         let output = std::fs::read_to_string(&tmp).unwrap();
         assert!(output.contains("ACGT") || output.contains("TGCA"));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_prepared_pipeline_output_fastq_file_preserves_order() {
+        let tmp = std::env::temp_dir().join(format!(
+            "antiseq_test_prepared_file_{}.fastq",
+            std::process::id()
+        ));
+        let tmp_str = tmp.to_str().unwrap().to_owned();
+        let (report, emitted_reads) = {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1300))).unwrap());
+            graph.add(DelayFirstBatchOp);
+            graph.add(OutputFastqFileOp::from_file(tmp_str));
+            graph.set_collect_statistics(true);
+            let mut config = PipelineConfig::new(4);
+            config.batch_size = 512;
+            config.preserve_order = true;
+            let report = graph.try_run_pipeline(config).unwrap();
+            (report, graph.final_output_reads())
+        };
+
+        assert!(report.prepared_output);
+        assert_eq!(emitted_reads, Some(1300));
+        let output = std::fs::read_to_string(&tmp).unwrap();
+        let names = output.lines().step_by(4).collect::<Vec<_>>();
+        assert_eq!(names.len(), 1300);
+        for (index, name) in names.into_iter().enumerate() {
+            assert_eq!(name, format!("@read{index:04}"));
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_try_graph_with_threads_rejects_zero_threads() {
+        let g = Graph::<NoTrace>::new();
+        let error = g.try_run_with_threads(0).unwrap_err();
+        assert!(matches!(error, crate::errors::Error::InvalidThreadCount(0)));
+    }
+
+    #[test]
+    fn test_try_graph_with_threads_returns_fastq_parse_error() {
+        let malformed = b"@read1\nACGT\n+\nIII\n".to_vec();
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(malformed)).unwrap());
+
+        let error = g.try_run_with_threads(2).unwrap_err();
+        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(error.to_string().contains("parsing record"));
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("intentional write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_try_graph_with_threads_returns_output_error() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(OutputFastqOp::from_writer(FailingWriter));
+
+        let error = g.try_run_with_threads(2).unwrap_err();
+        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(error.to_string().contains("intentional write failure"));
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DelayFirstBatchOp;
+
+    impl<T: crate::trace::Trace> GraphNode<T> for DelayFirstBatchOp {
+        fn run_inner(&self, reads: Vec<Read>) -> crate::errors::Result<(Option<Vec<Read>>, bool)> {
+            if reads.first().is_some_and(|read| read.first_idx() == 0) {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &[]
+        }
+
+        fn name(&self) -> &'static str {
+            "DelayFirstBatchOp"
+        }
+    }
+
+    fn numbered_fastq(count: usize) -> Vec<u8> {
+        let mut fastq = Vec::with_capacity(count * 32);
+        for index in 0..count {
+            writeln!(&mut fastq, "@read{index:04}\nACGT\n+\nIIII").unwrap();
+        }
+        fastq
+    }
+
+    #[test]
+    fn test_bounded_pipeline_preserves_order_with_parallel_workers() {
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1300))).unwrap());
+        graph.add(DelayFirstBatchOp);
+        graph.add(OutputFastqOp::from_writer(output));
+
+        let report = graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 4,
+                queue_capacity: 2,
+                max_in_flight_batches: 3,
+                batch_size: 512,
+                preserve_order: true,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap();
+
+        assert_eq!(report.input_batches, 3);
+        assert_eq!(report.completed_batches, 3);
+        assert_eq!(report.written_batches, 3);
+        assert!(report.prepared_output);
+        assert!(report.prepare_output_worker_nanos > 0);
+        assert!(report.commit_output_writer_nanos > 0);
+        assert!(report.max_in_flight_batches_observed <= 3);
+        assert!(report.max_reorder_batches_observed <= 3);
+
+        let output = String::from_utf8(output_bytes.lock().unwrap().clone()).unwrap();
+        let names = output
+            .lines()
+            .step_by(4)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1300);
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(name, &format!("@read{index:04}"));
+        }
+    }
+
+    #[test]
+    fn test_parallel_gzip_members_preserve_order_and_decode_completely() {
+        let input = numbered_fastq(4097);
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+        graph.add(DelayFirstBatchOp);
+        graph.add(OutputFastqOp::from_parallel_gzip_writer(output, 3).unwrap());
+
+        let report = graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 4,
+                queue_capacity: 2,
+                max_in_flight_batches: 3,
+                batch_size: 257,
+                preserve_order: true,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap();
+        assert_eq!(report.input_batches, 16);
+        assert_eq!(report.written_batches, 16);
+
+        drop(graph);
+        let encoded = output_bytes.lock().unwrap().clone();
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(Cursor::new(encoded)),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_parallel_gzip_stream_preserves_order_and_decodes_completely() {
+        let input = numbered_fastq(4097);
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+        graph.add(DelayFirstBatchOp);
+        graph.add(
+            OutputFastqOp::from_parallel_gzip_stream_writer(output, 3, 4, 128 * 1024).unwrap(),
+        );
+
+        let report = graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 4,
+                queue_capacity: 2,
+                max_in_flight_batches: 3,
+                batch_size: 257,
+                preserve_order: true,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap();
+        assert_eq!(report.input_batches, 16);
+        assert_eq!(report.written_batches, 16);
+
+        drop(graph);
+        let encoded = output_bytes.lock().unwrap().clone();
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(Cursor::new(encoded)),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn test_parallel_gzip_members_work_with_whole_graph_workers() {
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(4097))).unwrap());
+        graph.add(OutputFastqOp::from_parallel_gzip_writer(output, 3).unwrap());
+        graph.try_run_with_threads(4).unwrap();
+        drop(graph);
+
+        let encoded = output_bytes.lock().unwrap().clone();
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::MultiGzDecoder::new(Cursor::new(encoded)),
+            &mut decoded,
+        )
+        .unwrap();
+        let mut names = decoded.lines().step_by(4).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names.len(), 4097);
+        for (index, name) in names.into_iter().enumerate() {
+            assert_eq!(name, format!("@read{index:04}"));
+        }
+    }
+
+    #[test]
+    fn test_dedicated_reader_pipeline_preserves_order_with_ring_wraparound() {
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(4097))).unwrap());
+        graph.add(DelayFirstBatchOp);
+        graph.add(OutputFastqOp::from_writer(output));
+
+        let report = graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 4,
+                queue_capacity: 2,
+                max_in_flight_batches: 3,
+                batch_size: 257,
+                preserve_order: true,
+                input_mode: PipelineInputMode::DedicatedReader,
+            })
+            .unwrap();
+        assert_eq!(report.input_batches, 16);
+        assert_eq!(report.written_batches, 16);
+        assert!(report.max_reorder_batches_observed <= 3);
+
+        let output = String::from_utf8(output_bytes.lock().unwrap().clone()).unwrap();
+        for (index, name) in output.lines().step_by(4).enumerate() {
+            assert_eq!(name, format!("@read{index:04}"));
+        }
+    }
+
+    #[test]
+    fn test_bounded_pipeline_rejects_invalid_configuration_and_layout() {
+        let empty = Graph::<NoTrace>::new();
+        let error = empty.try_run_pipeline(PipelineConfig::new(1)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::errors::Error::InvalidPipelineGraph(_)
+        ));
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1))).unwrap());
+        graph.add(NullOutputOp::new());
+        let error = graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 1,
+                queue_capacity: 0,
+                max_in_flight_batches: 1,
+                batch_size: 512,
+                preserve_order: false,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::errors::Error::InvalidPipelineConfig(_)
+        ));
+
+        let mut invalid = Graph::<NoTrace>::new();
+        invalid.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1))).unwrap());
+        invalid.add(NullOutputOp::new());
+        invalid.add(CountOp::new([true]));
+        let error = invalid
+            .try_run_pipeline(PipelineConfig::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::errors::Error::InvalidPipelineGraph(_)
+        ));
+    }
+
+    #[test]
+    fn test_bounded_ordered_pipeline_keeps_interleaved_outputs_in_lockstep() {
+        let output1 = SharedWriter::default();
+        let output2 = SharedWriter::default();
+        let bytes1 = Arc::clone(&output1.0);
+        let bytes2 = Arc::clone(&output2.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(
+            InputFastqOp::from_interleaved_reader(Cursor::new(numbered_fastq(2600)), 2).unwrap(),
+        );
+        graph.add(DelayFirstBatchOp);
+        graph.add(OutputFastqOp::from_writers([output1, output2]));
+
+        let mut config = PipelineConfig::new(4);
+        config.batch_size = 512;
+        config.preserve_order = true;
+        let report = graph.try_run_pipeline(config).unwrap();
+        assert!(report.prepared_output);
+        assert!(report.prepare_output_worker_nanos > 0);
+        assert!(report.commit_output_writer_nanos > 0);
+
+        for (lane, bytes) in [bytes1, bytes2].into_iter().enumerate() {
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            let names = output.lines().step_by(4).collect::<Vec<_>>();
+            assert_eq!(names.len(), 1300);
+            for (logical_index, name) in names.into_iter().enumerate() {
+                let record_index = logical_index * 2 + lane;
+                assert_eq!(name, format!("@read{record_index:04}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_prepared_pipeline_json_preserves_order() {
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1300))).unwrap());
+        graph.add(DelayFirstBatchOp);
+        graph.add(OutputJsonOp::from_writer(output));
+
+        let mut config = PipelineConfig::new(4);
+        config.batch_size = 512;
+        config.preserve_order = true;
+        let report = graph.try_run_pipeline(config).unwrap();
+        assert!(report.prepared_output);
+
+        let output = String::from_utf8(output_bytes.lock().unwrap().clone()).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1300);
+        for (index, line) in lines.into_iter().enumerate() {
+            assert!(line.contains(&format!("read{index:04}")));
+        }
+    }
+
+    #[test]
+    fn test_bounded_pipeline_returns_parse_and_output_errors() {
+        let mut malformed = Graph::<NoTrace>::new();
+        malformed.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read1\nACGT\n+\nIII\n".to_vec())).unwrap(),
+        );
+        malformed.add(NullOutputOp::new());
+        let error = malformed
+            .try_run_pipeline(PipelineConfig::new(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("parsing record"));
+
+        let mut failing_output = Graph::<NoTrace>::new();
+        failing_output.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1))).unwrap());
+        failing_output.add(OutputFastqOp::from_writer(FailingWriter));
+        let error = failing_output
+            .try_run_pipeline(PipelineConfig::new(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("intentional write failure"));
+    }
+
+    #[test]
+    fn test_try_op_reports_failed_reads_when_statistics_enabled() {
+        let fq = fastq_bytes(&[
+            ("accepted", "GGAAAACC", "IIIIIIII"),
+            ("rejected", "GGTTTTCC", "IIIIIIII"),
+        ]);
+        let mut try_graph = Graph::<NoTrace>::new();
+        try_graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.before, seq1.match, seq1.after"),
+            Patterns::from_strs(["AAAA"]),
+            ExactSearch,
+        ));
+        try_graph.add(CutOp::new(
+            te("seq1.match -> seq1.left, seq1.right"),
+            2isize,
+        ));
+        let mut catch_graph = Graph::<NoTrace>::new();
+        catch_graph.add(NullOutputOp::new());
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(TryOp::new(try_graph, catch_graph));
+        graph.set_collect_statistics(true);
+        graph.try_run_with_threads(2).unwrap();
+
+        assert_eq!(graph.failed_reads(), 1);
+        assert_eq!(graph.match_distance_counts().len(), 1);
     }
 
     #[test]
@@ -849,6 +1405,198 @@ mod pipeline_tests {
         assert_eq!(counter.counts()[0], 1);
     }
 
+    fn count_hamming_pattern_attribute_matches(
+        pattern: &str,
+        records: &[(&str, &str, &str)],
+    ) -> usize {
+        let fq = fastq_bytes(records);
+        let patterns = Patterns::from_strs([pattern]).with_pattern_name("filter");
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(pattern.len() - 1)),
+        ));
+        graph.add(RetainOp::new(!attr_exists("seq1.*.filter")));
+        let counter = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
+        counter.counts()[0]
+    }
+
+    #[test]
+    fn test_hamming_lookup_and_general_path_share_pattern_attribute_semantics() {
+        // Eight-base patterns use HammingLookup; nine-base patterns cross the
+        // optimization boundary and use the general Hamming implementation.
+        // Both must preserve the filter sentinel contract: same-label remapping
+        // clears temporary attributes on a hit, while a miss gets the sentinel
+        // after remapping. Retaining reads without the sentinel therefore keeps
+        // exact/one-mismatch hits and removes misses in both implementations.
+        assert_eq!(
+            count_hamming_pattern_attribute_matches(
+                "ACGTACGT",
+                &[
+                    ("exact", "ACGTACGT", "IIIIIIII"),
+                    ("mismatch", "ACGTACGA", "IIIIIIII"),
+                    ("miss", "TTTTTTTT", "IIIIIIII"),
+                ],
+            ),
+            2,
+        );
+        assert_eq!(
+            count_hamming_pattern_attribute_matches(
+                "ACGTACGTA",
+                &[
+                    ("exact", "ACGTACGTA", "IIIIIIIII"),
+                    ("mismatch", "ACGTACGTT", "IIIIIIIII"),
+                    ("miss", "TTTTTTTTT", "IIIIIIIII"),
+                ],
+            ),
+            2,
+        );
+    }
+
+    fn resolve_ambiguous_hamming(
+        name: &str,
+        query: &str,
+        quality: &str,
+        patterns: &[(&str, &str)],
+        policy: AmbiguityPolicy,
+    ) -> crate::errors::Result<Vec<u8>> {
+        let fq = fastq_bytes(&[(name, query, quality)]);
+        let patterns = Patterns::new(
+            patterns.iter().map(|(sequence, value)| {
+                Pattern::from_literal(
+                    sequence.as_bytes(),
+                    vec![Data::from_bytes(value.as_bytes())],
+                )
+            }),
+            ["choice"],
+        )
+        .with_multimatch_name("ambig")
+        .with_ambiguity_policy(policy);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.matched"),
+            patterns,
+            Hamming(Count(query.len() - 1)),
+        ));
+        let (output, _) = graph.run_one(None, &NoTrace)?;
+        let read = &output.unwrap()[0];
+        Ok(read
+            .data(
+                StrType::Seq(1),
+                InlineString::new(b"*"),
+                InlineString::new(b"choice"),
+            )
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .to_vec())
+    }
+
+    #[test]
+    fn ambiguity_first_is_input_ordered_on_fast_and_general_hamming_paths() {
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "IIII",
+                &[("CAAA", "first"), ("AAAC", "second")],
+                AmbiguityPolicy::First,
+            )
+            .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAAAAAAA",
+                "IIIIIIIII",
+                &[("CAAAAAAAA", "first"), ("AAAAAAAAC", "second")],
+                AmbiguityPolicy::First,
+            )
+            .unwrap(),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn ambiguity_no_match_and_error_policies_are_distinct() {
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "IIII",
+                &[("CAAA", "first"), ("AAAC", "second")],
+                AmbiguityPolicy::NoMatch,
+            )
+            .unwrap(),
+            b""
+        );
+        let error = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            &[("CAAA", "first"), ("AAAC", "second")],
+            AmbiguityPolicy::Error,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous equal-best match"));
+    }
+
+    #[test]
+    fn ambiguity_quality_uses_mismatch_position_phred_scores() {
+        let patterns = &[("CAAA", "left"), ("AAAC", "right")];
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "!III",
+                patterns,
+                AmbiguityPolicy::Quality { min_delta: 1 },
+            )
+            .unwrap(),
+            b"left"
+        );
+        assert_eq!(
+            resolve_ambiguous_hamming(
+                "read1",
+                "AAAA",
+                "III!",
+                patterns,
+                AmbiguityPolicy::Quality { min_delta: 1 },
+            )
+            .unwrap(),
+            b"right"
+        );
+    }
+
+    #[test]
+    fn ambiguity_random_is_reproducible_for_seed_and_read_identity() {
+        let patterns = &[("CAAA", "left"), ("AAAC", "right")];
+        let first = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            patterns,
+            AmbiguityPolicy::Random { seed: 1234 },
+        )
+        .unwrap();
+        let repeated = resolve_ambiguous_hamming(
+            "read1",
+            "AAAA",
+            "IIII",
+            patterns,
+            AmbiguityPolicy::Random { seed: 1234 },
+        )
+        .unwrap();
+        assert_eq!(first, repeated);
+    }
+
     #[test]
     fn test_graph_match_hamming_suffix() {
         let fq = fastq_bytes(&[("read1", "NNNNACGC", "IIIIIIII")]);
@@ -1043,11 +1791,56 @@ mod pipeline_tests {
             patterns,
             ExactPrefix,
         ));
+        g.set_collect_statistics(true);
         g.run().unwrap();
 
         let counts = g.match_distance_counts();
         // Should have match distance counts from the MatchAnyOp
         assert!(!counts.is_empty());
+    }
+
+    #[test]
+    fn test_graph_statistics_disabled_by_default() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let patterns = Patterns::from_strs(["ACGT"]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(3)),
+        ));
+        g.run().unwrap();
+
+        assert!(g.input_stats().is_none());
+        assert!(g.match_distance_counts().is_empty());
+    }
+
+    #[test]
+    fn test_fast_hamming_statistics_include_exact_distance() {
+        let fq = fastq_bytes(&[
+            ("exact", "ACGT", "IIII"),
+            ("one-mismatch", "ACGC", "IIII"),
+            ("unmatched", "TTTT", "IIII"),
+        ]);
+        let patterns = Patterns::from_strs(["ACGT"]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(3)),
+        ));
+        g.set_collect_statistics(true);
+        g.run().unwrap();
+
+        let counts = g.match_distance_counts();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].counts, vec![1, 1]);
+        assert_eq!(counts[0].total, 3);
+        assert_eq!(g.input_stats().unwrap().read_counts, vec![3]);
     }
 
     #[test]
@@ -1449,14 +2242,188 @@ mod pipeline_tests {
         {
             let mut g = Graph::<NoTrace>::new();
             g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
-            g.add(OutputFastqFileOp::from_file(tmp_str.clone()));
+            g.add(
+                OutputFastqFileOp::from_file(tmp_str.clone())
+                    .try_with_gzip_level(3)
+                    .unwrap(),
+            );
             g.run().unwrap();
         }
 
-        // Just check that the file exists and is non-empty
-        let metadata = std::fs::metadata(&tmp).unwrap();
-        assert!(metadata.len() > 0);
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&tmp).unwrap()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, "@read1\nACGT\n+\nIIII\n");
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_parallel_gzip_file_members_decode_completely() {
+        let input = numbered_fastq(1025);
+        let tmp = std::env::temp_dir().join(format!(
+            "antiseq_parallel_{}_{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+            graph.add(
+                OutputFastqFileOp::from_file(tmp_str)
+                    .try_with_gzip_level(3)
+                    .unwrap()
+                    .with_parallel_gzip_members(true),
+            );
+            let mut config = PipelineConfig::new(4);
+            config.batch_size = 257;
+            config.preserve_order = true;
+            graph.try_run_pipeline(config).unwrap();
+        }
+
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(&tmp).unwrap()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, input);
+
+        let mut reader_graph = Graph::<NoTrace>::new();
+        reader_graph.add(InputFastqOp::from_file(tmp.to_string_lossy()).unwrap());
+        let counter = reader_graph.add(CountOp::new([true]));
+        reader_graph.run().unwrap();
+        assert_eq!(counter.counts(), vec![1025]);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_parallel_gzip_file_stream_decodes_in_antisequence() {
+        let input = numbered_fastq(1025);
+        let tmp = std::env::temp_dir().join(format!(
+            "antiseq_parallel_stream_{}_{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+            graph.add(
+                OutputFastqFileOp::from_file(tmp_str)
+                    .try_with_gzip_level(3)
+                    .unwrap()
+                    .try_with_parallel_gzip_stream(4, 128 * 1024)
+                    .unwrap(),
+            );
+            let mut config = PipelineConfig::new(4);
+            config.batch_size = 257;
+            config.preserve_order = true;
+            graph.try_run_pipeline(config).unwrap();
+        }
+
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&tmp).unwrap()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, input);
+
+        let mut reader_graph = Graph::<NoTrace>::new();
+        reader_graph.add(InputFastqOp::from_file(tmp.to_string_lossy()).unwrap());
+        let counter = reader_graph.add(CountOp::new([true]));
+        reader_graph.run().unwrap();
+        assert_eq!(counter.counts(), vec![1025]);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_accelerated_gzip_input_matches_standard_reader() {
+        let input = numbered_fastq(1025);
+        let tmp = std::env::temp_dir().join(format!(
+            "antiseq_accelerated_input_{}_{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(
+                std::fs::File::create(&tmp).unwrap(),
+                flate2::Compression::new(3),
+            );
+            encoder.write_all(&input).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(
+            InputFastqOp::from_files_accelerated_gzip(
+                [tmp.to_string_lossy().into_owned()],
+                1,
+                4 * 1024 * 1024,
+            )
+            .unwrap(),
+        );
+        let counter = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
+        assert_eq!(counter.counts(), vec![1025]);
+
+        assert!(InputFastqOp::from_files(["this-file-does-not-exist.fastq"]).is_err());
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_accelerated_gzip_input_returns_decoder_errors() {
+        let input = numbered_fastq(32);
+        let tmp = std::env::temp_dir().join(format!(
+            "antiseq_truncated_accelerated_input_{}_{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let encoded = {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(3));
+            encoder.write_all(&input).unwrap();
+            encoder.finish().unwrap()
+        };
+        std::fs::write(&tmp, &encoded[..encoded.len() / 2]).unwrap();
+
+        let input = InputFastqOp::from_files_accelerated_gzip(
+            [tmp.to_string_lossy().into_owned()],
+            1,
+            4 * 1024 * 1024,
+        );
+        if let Ok(input) = input {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(input);
+            graph.add(CountOp::new([true]));
+            assert!(graph.run().is_err());
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_output_gzip_level_validation() {
+        let output = OutputFastqFileOp::from_file("unused.fastq.gz");
+        assert_eq!(output.gzip_level(), OutputFastqFileOp::DEFAULT_GZIP_LEVEL);
+        assert!(output.try_with_gzip_level(9).is_ok());
+        assert!(OutputFastqFileOp::from_file("unused.fastq.gz")
+            .try_with_gzip_level(10)
+            .is_err());
+        assert!(OutputJsonOp::from_file_with_gzip_level("unused.json.gz", 10).is_err());
+        assert!(OutputFastqOp::from_parallel_gzip_writer(std::io::sink(), 10).is_err());
+        assert!(
+            OutputFastqOp::from_parallel_gzip_stream_writer(std::io::sink(), 3, 0, 128 * 1024)
+                .is_err()
+        );
+        assert!(OutputFastqFileOp::from_file("unused.fastq.gz")
+            .try_with_parallel_gzip_stream(1, gzp::DICT_SIZE - 1)
+            .is_err());
     }
 
     #[test]

@@ -849,7 +849,7 @@ impl ExprNode for Attr {
     ) -> std::result::Result<EvalData<'a>, NameError> {
         let d = read.data(self.str_type, self.label, self.attr)?;
         if use_qual {
-            if let Data::Bytes(b) = d {
+            if let Some(b) = d.as_bytes() {
                 return Ok(EvalData::Bytes(Cow::Owned(vec![UNKNOWN_QUAL; b.len()])));
             }
         }
@@ -858,6 +858,7 @@ impl ExprNode for Attr {
             Data::Bool(b) => Ok(EvalData::Bool(*b)),
             Data::Int(i) => Ok(EvalData::Int(*i)),
             Data::Float(f) => Ok(EvalData::Float(*f)),
+            Data::InlineBytes(b) => Ok(EvalData::Bytes(Cow::Borrowed(b.as_bytes()))),
             Data::Bytes(b) => Ok(EvalData::Bytes(Cow::Borrowed(b))),
         }
     }
@@ -931,7 +932,7 @@ impl ExprNode for Data {
         use_qual: bool,
     ) -> std::result::Result<EvalData<'a>, NameError> {
         if use_qual {
-            if let Data::Bytes(b) = self {
+            if let Some(b) = self.as_bytes() {
                 return Ok(EvalData::Bytes(Cow::Owned(vec![UNKNOWN_QUAL; b.len()])));
             }
         }
@@ -940,6 +941,7 @@ impl ExprNode for Data {
             Data::Bool(b) => Ok(EvalData::Bool(*b)),
             Data::Int(i) => Ok(EvalData::Int(*i)),
             Data::Float(f) => Ok(EvalData::Float(*f)),
+            Data::InlineBytes(b) => Ok(EvalData::Bytes(Cow::Borrowed(b.as_bytes()))),
             Data::Bytes(b) => Ok(EvalData::Bytes(Cow::Borrowed(b))),
         }
     }

@@ -197,4 +197,12 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
     fn name(&self) -> &'static str {
         Self::NAME
     }
+
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.inner.set_statistics_level(level);
+    }
+
+    fn all_match_distance_counts(&self) -> Vec<MatchDistanceCounts> {
+        self.inner.match_distance_counts()
+    }
 }

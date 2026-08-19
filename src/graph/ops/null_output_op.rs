@@ -17,6 +17,36 @@ impl NullOutputOp {
 }
 
 impl<T: Trace> GraphNode<T> for NullOutputOp {
+    fn stage(&self) -> NodeStage {
+        NodeStage::Output
+    }
+
+    fn supports_prepared_output(&self) -> bool {
+        true
+    }
+
+    fn produces_prepared_output(&self) -> bool {
+        false
+    }
+
+    fn prepare_output(
+        &self,
+        _reads: &[Read],
+        _recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        Ok(PreparedOutput::Passthrough)
+    }
+
+    fn commit_output(&self, prepared: &mut PreparedOutput) -> Result<()> {
+        if matches!(prepared, PreparedOutput::Passthrough) {
+            Ok(())
+        } else {
+            Err(Error::InvalidPipelineGraph(
+                "NullOutputOp received an incompatible prepared payload".to_owned(),
+            ))
+        }
+    }
+
     fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         Ok((Some(reads), false))
     }

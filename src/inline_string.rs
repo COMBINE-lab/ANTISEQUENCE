@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::{Serialize, Serializer};
+
 const LEN: usize = 24usize;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -23,7 +25,11 @@ impl InlineString {
     }
 
     pub fn bytes<'a>(&'a self) -> impl Iterator<Item = u8> + 'a {
-        self.data[..self.len()].iter().cloned()
+        self.as_bytes().iter().copied()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len()]
     }
 
     pub fn as_str(&self) -> &str {
@@ -36,6 +42,15 @@ impl InlineString {
             len += 1;
         }
         len
+    }
+}
+
+impl Serialize for InlineString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(self.as_bytes())
     }
 }
 
