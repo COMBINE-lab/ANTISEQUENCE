@@ -2,7 +2,7 @@
 name = "antisequence"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "A high-performance graph execution backend for sequencing-read preprocessing"
 license = "MIT"
 repository = "https://github.com/COMBINE-lab/ANTISEQUENCE"

@@ -19,6 +19,9 @@ ANTISEQUENCE dependency closure used for releases and paper benchmarks.
   latest stable releases.
 - Compatible patch/minor releases are accepted by the existing caret
   requirements and are exercised by lockfile-free library CI.
+- The declared Rust floor is 1.88, matching the highest minimum in the fresh
+  resolved graph (`psm`/`ar_archive_writer`) rather than only ANTISEQUENCE's
+  direct dependencies.
 
 ## Complete direct-dependency disposition
 
