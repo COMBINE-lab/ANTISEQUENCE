@@ -57,15 +57,26 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
         // Record stable input positions before any arm can destructively
         // rewrite mappings or attributes. Input record indices survive all
         // current transformation and projection operations.
-        let mut positions = FxHashMap::default();
-        for (position, read) in reads.iter().enumerate() {
-            let idx = read.first_idx();
-            if positions.insert(idx, position).is_some() {
-                return Err(Error::InvalidPipelineConfig(format!(
-                    "SwitchOp requires unique record indices within a batch; index {idx} was repeated"
-                )));
+        let total = reads.len();
+        let first_idx = reads.first().map(Read::first_idx).unwrap_or_default();
+        let contiguous_indices = reads
+            .iter()
+            .enumerate()
+            .all(|(position, read)| read.first_idx().checked_sub(first_idx) == Some(position));
+        let positions = if contiguous_indices {
+            None
+        } else {
+            let mut positions = FxHashMap::default();
+            for (position, read) in reads.iter().enumerate() {
+                let idx = read.first_idx();
+                if positions.insert(idx, position).is_some() {
+                    return Err(Error::InvalidPipelineConfig(format!(
+                        "SwitchOp requires unique record indices within a batch; index {idx} was repeated"
+                    )));
+                }
             }
-        }
+            Some(positions)
+        };
 
         let mut arm_reads = (0..self.arms.len())
             .map(|_| Vec::new())
@@ -116,11 +127,19 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
         // order. Recover the incoming order from stable record indices, while
         // naturally omitting reads dropped by an arm.
         let mut ordered = std::iter::repeat_with(|| None)
-            .take(positions.len())
+            .take(total)
             .collect::<Vec<Option<Read>>>();
         for read in output {
             let idx = read.first_idx();
-            let Some(position) = positions.get(&idx).copied() else {
+            let position = if contiguous_indices {
+                idx.checked_sub(first_idx)
+                    .filter(|position| *position < total)
+            } else {
+                positions
+                    .as_ref()
+                    .and_then(|positions| positions.get(&idx).copied())
+            };
+            let Some(position) = position else {
                 return Err(Error::InvalidPipelineConfig(format!(
                     "SwitchOp arm produced unknown record index {idx}"
                 )));
