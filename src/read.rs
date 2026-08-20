@@ -21,6 +21,13 @@ pub enum End {
     Right,
 }
 
+/// One source in a terminal read projection.
+#[derive(Clone, Copy, Debug)]
+pub enum ReadProjectionPart<'a> {
+    Mapping(InlineString),
+    Literal(&'a [u8]),
+}
+
 /// Valid types of strings.
 ///
 /// `Name` or `Seq` refer to the corresponding line in a fastq record.
@@ -483,55 +490,133 @@ impl StrMappings {
     /// allocation without a temporary concatenation buffer. Reordered or
     /// overlapping projections use an owned fallback to preserve semantics.
     pub fn project_whole(&mut self, labels: &[InlineString]) -> Result<(), NameError> {
-        let mut intervals: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+        let parts = labels
+            .iter()
+            .copied()
+            .map(ReadProjectionPart::Mapping)
+            .collect::<SmallVec<[_; 8]>>();
+        self.project_whole_with_literals(&parts)
+    }
+
+    /// Replace the whole string with mapped intervals and fixed byte strings.
+    ///
+    /// Fixed sequence bases receive the conventional unknown quality `I`.
+    /// Ordered sources are compacted in the existing allocation whenever the
+    /// inserted literals cannot overwrite an interval that has yet to be read.
+    pub fn project_whole_with_literals(
+        &mut self,
+        parts: &[ReadProjectionPart<'_>],
+    ) -> Result<(), NameError> {
+        enum ResolvedPart<'a> {
+            Mapping(usize, usize),
+            Literal(&'a [u8]),
+        }
+
+        let mut resolved: SmallVec<[ResolvedPart<'_>; 8]> = SmallVec::new();
         let mut total_len = 0usize;
         let mut in_place = true;
-        for &label in labels {
-            let mapping = self
-                .mapping(label)
-                .ok_or(NameError::NotInRead(Name::Label(label)))?;
-            in_place &= total_len <= mapping.start;
-            total_len = total_len
-                .checked_add(mapping.len)
-                .ok_or(NameError::Other("projected read length overflow"))?;
-            intervals.push((mapping.start, mapping.len));
+        for part in parts {
+            match *part {
+                ReadProjectionPart::Mapping(label) => {
+                    let mapping = self
+                        .mapping(label)
+                        .ok_or(NameError::NotInRead(Name::Label(label)))?;
+                    in_place &= total_len <= mapping.start;
+                    total_len = total_len
+                        .checked_add(mapping.len)
+                        .ok_or(NameError::Other("projected read length overflow"))?;
+                    resolved.push(ResolvedPart::Mapping(mapping.start, mapping.len));
+                }
+                ReadProjectionPart::Literal(bytes) => {
+                    total_len = total_len
+                        .checked_add(bytes.len())
+                        .ok_or(NameError::Other("projected read length overflow"))?;
+                    resolved.push(ResolvedPart::Literal(bytes));
+                }
+            }
         }
 
         if in_place {
+            if total_len > self.string.len() {
+                self.string.reserve(total_len - self.string.len());
+            }
+            if let Some(qual) = &mut self.qual {
+                if total_len > qual.len() {
+                    qual.reserve(total_len - qual.len());
+                }
+            }
             let string_ptr = self.string.as_mut_ptr();
             let qual_ptr = self.qual.as_mut().map(Vec::as_mut_ptr);
             let mut destination = 0usize;
-            for &(source, len) in &intervals {
-                if len != 0 && source != destination {
-                    // SAFETY: every interval was obtained from a live mapping
-                    // into this allocation. `copy` explicitly permits overlap.
-                    unsafe {
-                        std::ptr::copy(string_ptr.add(source), string_ptr.add(destination), len);
-                        if let Some(ptr) = qual_ptr {
-                            std::ptr::copy(ptr.add(source), ptr.add(destination), len);
+            for part in &resolved {
+                match part {
+                    &ResolvedPart::Mapping(source, len) => {
+                        if len != 0 && source != destination {
+                            // SAFETY: every interval was obtained from a live
+                            // mapping into this allocation. `copy` permits
+                            // overlap, and capacity was reserved above.
+                            unsafe {
+                                std::ptr::copy(
+                                    string_ptr.add(source),
+                                    string_ptr.add(destination),
+                                    len,
+                                );
+                                if let Some(ptr) = qual_ptr {
+                                    std::ptr::copy(ptr.add(source), ptr.add(destination), len);
+                                }
+                            }
                         }
+                        destination += len;
+                    }
+                    ResolvedPart::Literal(bytes) => {
+                        let len = bytes.len();
+                        if len != 0 {
+                            // SAFETY: destination..destination+len lies within
+                            // the reserved allocation and literals never alias it.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    string_ptr.add(destination),
+                                    len,
+                                );
+                                if let Some(ptr) = qual_ptr {
+                                    std::ptr::write_bytes(ptr.add(destination), b'I', len);
+                                }
+                            }
+                        }
+                        destination += len;
                     }
                 }
-                destination += len;
             }
-            self.string.truncate(total_len);
-            if let Some(qual) = &mut self.qual {
-                qual.truncate(total_len);
+            // SAFETY: all bytes up to total_len were initialized above, or
+            // were part of the original live vectors.
+            unsafe {
+                self.string.set_len(total_len);
+                if let Some(qual) = &mut self.qual {
+                    qual.set_len(total_len);
+                }
             }
         } else {
             let mut projected = Vec::with_capacity(total_len);
-            for &(start, len) in &intervals {
-                projected.extend_from_slice(&self.string[start..start + len]);
+            let mut projected_qual = self.qual.as_ref().map(|_| Vec::with_capacity(total_len));
+            for part in &resolved {
+                match part {
+                    &ResolvedPart::Mapping(start, len) => {
+                        projected.extend_from_slice(&self.string[start..start + len]);
+                        if let (Some(qual), Some(output)) = (&self.qual, &mut projected_qual) {
+                            output.extend_from_slice(&qual[start..start + len]);
+                        }
+                    }
+                    ResolvedPart::Literal(bytes) => {
+                        projected.extend_from_slice(bytes);
+                        if let Some(output) = &mut projected_qual {
+                            output.extend(std::iter::repeat_n(b'I', bytes.len()));
+                        }
+                    }
+                }
             }
             self.string = projected;
-
-            if let Some(qual) = &self.qual {
-                let mut projected_qual = Vec::with_capacity(total_len);
-                for &(start, len) in &intervals {
-                    projected_qual.extend_from_slice(&qual[start..start + len]);
-                }
-                self.qual = Some(projected_qual);
-            }
+            self.qual = projected_qual;
         }
 
         self.reset_default_mapping(total_len);
@@ -1209,6 +1294,18 @@ impl Read {
         self.str_mappings_mut(str_type)
             .ok_or(NameError::NotInRead(Name::StrType(str_type)))?
             .project_whole(labels)
+    }
+
+    /// Replace one FASTQ lane with a terminal projection containing mapped
+    /// intervals and fixed byte strings.
+    pub fn project_whole_with_literals(
+        &mut self,
+        str_type: StrType,
+        parts: &[ReadProjectionPart<'_>],
+    ) -> Result<(), NameError> {
+        self.str_mappings_mut(str_type)
+            .ok_or(NameError::NotInRead(Name::StrType(str_type)))?
+            .project_whole_with_literals(parts)
     }
 
     pub fn intersect(
@@ -2207,6 +2304,55 @@ mod read_tests {
         let (_, seq, qual) = read.to_fastq(1).unwrap();
         assert_eq!(seq, b"GGAA");
         assert_eq!(qual, b"5612");
+    }
+
+    #[test]
+    fn test_project_whole_inserts_literals_with_unknown_quality() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"AACCGGTT", b"12345678", origin, 0);
+        let sm = read.str_mappings_mut(StrType::Seq(1)).unwrap();
+        sm.add_mapping(Some(InlineString::new(b"a")), 0, 2);
+        sm.add_mapping(Some(InlineString::new(b"b")), 4, 2);
+
+        read.project_whole_with_literals(
+            StrType::Seq(1),
+            &[
+                ReadProjectionPart::Mapping(InlineString::new(b"a")),
+                ReadProjectionPart::Literal(b"TT"),
+                ReadProjectionPart::Mapping(InlineString::new(b"b")),
+                ReadProjectionPart::Literal(b"A"),
+            ],
+        )
+        .unwrap();
+
+        let (_, seq, qual) = read.to_fastq(1).unwrap();
+        assert_eq!(seq, b"AATTGGA");
+        assert_eq!(qual, b"12II56I");
+    }
+
+    #[test]
+    fn test_project_whole_literals_preserve_reordered_sources() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"AACCGGTT", b"12345678", origin, 0);
+        let sm = read.str_mappings_mut(StrType::Seq(1)).unwrap();
+        sm.add_mapping(Some(InlineString::new(b"a")), 0, 2);
+        sm.add_mapping(Some(InlineString::new(b"b")), 4, 2);
+
+        read.project_whole_with_literals(
+            StrType::Seq(1),
+            &[
+                ReadProjectionPart::Mapping(InlineString::new(b"b")),
+                ReadProjectionPart::Literal(b"N"),
+                ReadProjectionPart::Mapping(InlineString::new(b"a")),
+            ],
+        )
+        .unwrap();
+
+        let (_, seq, qual) = read.to_fastq(1).unwrap();
+        assert_eq!(seq, b"GGNAA");
+        assert_eq!(qual, b"56I12");
     }
 
     #[test]
