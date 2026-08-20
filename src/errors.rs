@@ -24,6 +24,12 @@ pub enum Error {
     #[error("Graph node {0} requires an input batch")]
     MissingNodeInput(&'static str),
 
+    #[error("Graph node {node} is missing required inputs: {missing:?}")]
+    MissingRequiredInputs {
+        node: &'static str,
+        missing: Vec<crate::expr::LabelOrAttr>,
+    },
+
     #[error("Error reading or writing \"{file}\": {source}")]
     FileIo {
         file: String,

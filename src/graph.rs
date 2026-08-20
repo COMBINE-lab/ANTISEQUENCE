@@ -20,6 +20,7 @@ pub use ops::*;
 pub struct Graph<T: Trace = NoTrace> {
     nodes: Vec<Arc<dyn GraphNode<T>>>,
     statistics_level: AtomicU8,
+    missing_input_policy: AtomicU8,
 }
 
 /// Controls the amount of runtime instrumentation collected by graph nodes.
@@ -91,6 +92,77 @@ pub enum NodeStage {
     Input,
     Transform,
     Output,
+}
+
+/// Behavior when an operation's declared labels or attributes are unavailable.
+///
+/// `Skip` preserves ANTISEQUENCE's historical behavior. New applications
+/// should generally select `Error` for strict pipelines or `Reject` when an
+/// absent value is an expected filtering outcome.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MissingInputPolicy {
+    Error = 0,
+    Reject = 1,
+    #[default]
+    Skip = 2,
+}
+
+impl MissingInputPolicy {
+    #[inline(always)]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Error,
+            1 => Self::Reject,
+            _ => Self::Skip,
+        }
+    }
+}
+
+/// Coarse operation cost used by graph planners without tying the public API
+/// to a particular implementation or hardware model.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CostClass {
+    Constant,
+    #[default]
+    Linear,
+    Search,
+    Alignment,
+    Io,
+}
+
+/// The strongest class of mutation an operation may apply to a read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    #[default]
+    None,
+    Metadata,
+    Sequence,
+    Record,
+}
+
+/// Whether an operation can remove records from the stream.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionBehavior {
+    #[default]
+    Never,
+    MayReject,
+}
+
+/// Static, allocation-free description of a graph operation.
+///
+/// Descriptors are intentionally conservative: custom operations inherit
+/// their declared requirements and execution stage, and may override the
+/// remaining effects as the optimizer-facing API evolves.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationDescriptor<'a> {
+    pub name: &'static str,
+    pub requirements: &'a [LabelOrAttr],
+    pub produced: &'a [LabelOrAttr],
+    pub mutation: MutationKind,
+    pub rejection: RejectionBehavior,
+    pub cost: CostClass,
+    pub stage: NodeStage,
 }
 
 /// Owned output payload prepared by transform workers and committed by the
@@ -339,6 +411,44 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     fn required_names(&self) -> &[LabelOrAttr];
     fn name(&self) -> &'static str;
 
+    /// Labels and attributes this operation may create.
+    #[inline]
+    fn produced_names(&self) -> &[LabelOrAttr] {
+        &[]
+    }
+
+    /// Strongest mutation this operation may perform.
+    #[inline]
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
+    /// Whether this operation may reject records.
+    #[inline]
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    /// Coarse cost class for graph planning.
+    #[inline]
+    fn cost_class(&self) -> CostClass {
+        CostClass::Linear
+    }
+
+    /// Return the optimizer-facing operation descriptor without allocation.
+    #[inline]
+    fn descriptor(&self) -> OperationDescriptor<'_> {
+        OperationDescriptor {
+            name: self.name(),
+            requirements: self.required_names(),
+            produced: self.produced_names(),
+            mutation: self.mutation_kind(),
+            rejection: self.rejection_behavior(),
+            cost: self.cost_class(),
+            stage: self.stage(),
+        }
+    }
+
     /// Identify where this node may execute in a staged pipeline.
     #[inline]
     fn stage(&self) -> NodeStage {
@@ -466,12 +576,20 @@ impl<T: Trace> Default for Graph<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequirementAction {
+    Run,
+    Skip,
+    RejectedAll,
+}
+
 impl<T: Trace> Graph<T> {
     /// Create a new empty graph.
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            missing_input_policy: AtomicU8::new(MissingInputPolicy::Skip as u8),
         }
     }
 
@@ -503,6 +621,81 @@ impl<T: Trace> Graph<T> {
 
     pub fn statistics_level(&self) -> StatisticsLevel {
         StatisticsLevel::from_u8(self.statistics_level.load(Ordering::Relaxed))
+    }
+
+    /// Select how missing declared inputs are handled during execution.
+    pub fn set_missing_input_policy(&self, policy: MissingInputPolicy) {
+        self.missing_input_policy
+            .store(policy as u8, Ordering::Relaxed);
+    }
+
+    pub fn missing_input_policy(&self) -> MissingInputPolicy {
+        MissingInputPolicy::from_u8(self.missing_input_policy.load(Ordering::Relaxed))
+    }
+
+    /// Inspect operation effects without exposing the graph's mutable storage.
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.nodes.iter().map(|node| node.descriptor())
+    }
+
+    #[inline]
+    fn resolve_missing_inputs(
+        &self,
+        node: &dyn GraphNode<T>,
+        curr: &mut Option<Vec<Read>>,
+    ) -> Result<RequirementAction> {
+        let requirements = node.required_names();
+        if requirements.is_empty() {
+            return Ok(RequirementAction::Run);
+        }
+
+        let policy = self.missing_input_policy();
+        if policy == MissingInputPolicy::Skip && trust_required_checks() {
+            return Ok(RequirementAction::Run);
+        }
+
+        let Some(reads) = curr.as_mut() else {
+            return Ok(RequirementAction::Run);
+        };
+
+        match policy {
+            MissingInputPolicy::Skip => {
+                // Compatibility mode deliberately retains the historical
+                // representative-read check.
+                if reads
+                    .first()
+                    .is_some_and(|read| !read.has_names(requirements))
+                {
+                    Ok(RequirementAction::Skip)
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+            MissingInputPolicy::Error => {
+                if let Some(read) = reads.iter().find(|read| !read.has_names(requirements)) {
+                    let missing = requirements
+                        .iter()
+                        .filter(|required| !read.has_names(std::slice::from_ref(*required)))
+                        .cloned()
+                        .collect();
+                    Err(Error::MissingRequiredInputs {
+                        node: node.name(),
+                        missing,
+                    })
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+            MissingInputPolicy::Reject => {
+                reads.retain(|read| read.has_names(requirements));
+                if reads.is_empty() {
+                    *curr = None;
+                    Ok(RequirementAction::RejectedAll)
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+        }
     }
 
     /// Run a graph until all reads processed.
@@ -1510,18 +1703,14 @@ impl<T: Trace> Graph<T> {
         end: usize,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool)> {
-        let trust = trust_required_checks();
         for node in &self.nodes[start..end] {
-            let Some(reads) = &curr else {
+            if curr.is_none() {
                 break;
-            };
-            if !trust
-                && !node.required_names().is_empty()
-                && reads
-                    .first()
-                    .is_some_and(|first| !first.has_names(node.required_names()))
-            {
-                continue;
+            }
+            match self.resolve_missing_inputs(node.as_ref(), &mut curr)? {
+                RequirementAction::Run => {}
+                RequirementAction::Skip => continue,
+                RequirementAction::RejectedAll => return Ok((None, false)),
             }
             let (next, done) = node.run(curr, trace)?;
             curr = next;
@@ -1585,7 +1774,6 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool)> {
-        let trust = trust_required_checks();
         for node in &self.nodes {
             // If there is no current read, only the input node can produce one.
             if curr.is_none() {
@@ -1600,15 +1788,11 @@ impl<T: Trace> Graph<T> {
                 continue;
             }
 
-            // Skip nodes whose requirements are not satisfied, unless trusted.
-            // Heuristic: Check the first read as a representative.
-            if !trust && !node.required_names().is_empty() {
-                if let Some(reads) = &curr {
-                    if let Some(first) = reads.first() {
-                        if !first.has_names(node.required_names()) {
-                            continue;
-                        }
-                    }
+            match self.resolve_missing_inputs(node.as_ref(), &mut curr)? {
+                RequirementAction::Run => {}
+                RequirementAction::Skip => continue,
+                RequirementAction::RejectedAll => {
+                    return Ok((None, false));
                 }
             }
 
@@ -1993,5 +2177,104 @@ mod reorder_ring_tests {
         pending.sort_unstable();
         assert_eq!(pending, vec![1, 3]);
         assert_eq!(ring.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod graph_api_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct DeclaredOp {
+        required: Vec<LabelOrAttr>,
+        produced: Vec<LabelOrAttr>,
+    }
+
+    impl DeclaredOp {
+        fn new() -> Self {
+            Self {
+                required: vec![Label::new(b"seq1.*").unwrap().into()],
+                produced: vec![Label::new(b"seq1.result").unwrap().into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for DeclaredOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> &[LabelOrAttr] {
+            &self.produced
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::Metadata
+        }
+
+        fn cost_class(&self) -> CostClass {
+            CostClass::Constant
+        }
+
+        fn name(&self) -> &'static str {
+            "DeclaredOp"
+        }
+    }
+
+    fn valid_read(idx: usize) -> Read {
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", b"A", b"I", Arc::new(Origin::Bytes), idx);
+        read
+    }
+
+    #[test]
+    fn descriptor_exposes_static_operation_effects() {
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(DeclaredOp::new());
+
+        let descriptor = graph.descriptors().next().unwrap();
+        assert_eq!(descriptor.name, "DeclaredOp");
+        assert_eq!(descriptor.requirements.len(), 1);
+        assert_eq!(descriptor.produced.len(), 1);
+        assert_eq!(descriptor.mutation, MutationKind::Metadata);
+        assert_eq!(descriptor.rejection, RejectionBehavior::Never);
+        assert_eq!(descriptor.cost, CostClass::Constant);
+        assert_eq!(descriptor.stage, NodeStage::Transform);
+    }
+
+    #[test]
+    fn missing_input_policies_are_explicit_and_per_read_when_strict() {
+        let trace = NoTrace;
+
+        let mut skip = Graph::<NoTrace>::new();
+        skip.add(DeclaredOp::new());
+        let (reads, _) = skip.run_one(Some(vec![Read::new()]), &trace).unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+
+        let mut reject = Graph::<NoTrace>::new();
+        reject.add(DeclaredOp::new());
+        reject.set_missing_input_policy(MissingInputPolicy::Reject);
+        let (reads, _) = reject
+            .run_one(Some(vec![Read::new(), valid_read(1)]), &trace)
+            .unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+
+        let mut strict = Graph::<NoTrace>::new();
+        strict.add(DeclaredOp::new());
+        strict.set_missing_input_policy(MissingInputPolicy::Error);
+        let error = strict
+            .run_one(Some(vec![valid_read(0), Read::new()]), &trace)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::MissingRequiredInputs {
+                node: "DeclaredOp",
+                ..
+            }
+        ));
     }
 }
