@@ -19,6 +19,14 @@ impl RetainOp {
 }
 
 impl<T: Trace> GraphNode<T> for RetainOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let mut error = None;
         reads.retain(|read| {

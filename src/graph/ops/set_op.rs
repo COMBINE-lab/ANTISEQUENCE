@@ -43,6 +43,21 @@ impl SetOp {
 }
 
 impl<T: Trace> GraphNode<T> for SetOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(std::slice::from_ref(&self.label_or_attr))
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        match &self.label_or_attr {
+            LabelOrAttr::Label(_) => MutationKind::Sequence,
+            LabelOrAttr::Attr(_) => MutationKind::Metadata,
+        }
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             match &self.label_or_attr {
@@ -97,12 +112,19 @@ impl<T: Trace> GraphNode<T> for SetOp {
                         read: read.clone(),
                         context: Self::NAME,
                     })?;
+                    let new_val: Data = new_val.into();
 
-                    // panic to make borrow checker happy
-                    *read
-                        .data_mut(attr.str_type, attr.label, attr.attr)
-                        .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) =
-                        new_val.into();
+                    let target = match read.data_mut(attr.str_type, attr.label, attr.attr) {
+                        Ok(target) => target,
+                        Err(source) => {
+                            return Err(Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            });
+                        }
+                    };
+                    *target = new_val;
                 }
             }
         }

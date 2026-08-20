@@ -18,6 +18,12 @@ pub enum Error {
     #[error("Invalid graph: {0}")]
     InvalidGraph(String),
 
+    #[error("Invalid configuration for graph operation {operation}: {reason}")]
+    InvalidOperation {
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Invalid pipeline configuration: {0}")]
     InvalidPipelineConfig(String),
 

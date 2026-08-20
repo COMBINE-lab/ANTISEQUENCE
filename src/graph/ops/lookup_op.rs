@@ -16,6 +16,7 @@ use crate::read::Data;
 /// in a sample mapping table to determine which sample the read belongs to.
 pub struct LookupOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     /// The label to read the input sequence from (e.g., seq2.bc1)
     input_label: Label,
     /// The attribute name to set with the lookup result (e.g., "sample")
@@ -44,11 +45,18 @@ impl LookupOp {
     ) -> Self {
         let input_label = input_label.into();
         let required_names = vec![LabelOrAttr::Label(input_label.clone())];
+        let output_attr = InlineString::new(output_attr.as_bytes());
+        let produced_names = vec![LabelOrAttr::Attr(Attr {
+            str_type: input_label.str_type,
+            label: input_label.label,
+            attr: output_attr,
+        })];
 
         Self {
             required_names,
+            produced_names,
             input_label,
-            output_attr: InlineString::new(output_attr.as_bytes()),
+            output_attr,
             lookup_table,
             default_value: default_value.into(),
         }
@@ -106,6 +114,22 @@ impl LookupOp {
 }
 
 impl<T: Trace> GraphNode<T> for LookupOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn cost_class(&self) -> CostClass {
+        CostClass::Constant
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             // Get the input sequence bytes and clone to avoid borrow issues

@@ -2,6 +2,7 @@ use crate::graph::*;
 
 pub struct IntersectOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     label1: Label,
     label2: Label,
     new_label: Option<Label>,
@@ -19,19 +20,34 @@ impl IntersectOp {
         transform_expr.check_size(2, 1, Self::NAME);
         transform_expr.check_same_str_type(Self::NAME);
 
+        let new_label = transform_expr.after_label(0, Self::NAME);
+        let produced_names = new_label.iter().cloned().map(LabelOrAttr::Label).collect();
         Self {
             required_names: vec![
                 transform_expr.before(0).into(),
                 transform_expr.before(1).into(),
             ],
+            produced_names,
             label1: transform_expr.before(0),
             label2: transform_expr.before(1),
-            new_label: transform_expr.after_label(0, Self::NAME),
+            new_label,
         }
     }
 }
 
 impl<T: Trace> GraphNode<T> for IntersectOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             read.intersect(
@@ -61,6 +77,7 @@ impl<T: Trace> GraphNode<T> for IntersectOp {
 
 pub struct UnionOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     label1: Label,
     label2: Label,
     new_label: Option<Label>,
@@ -81,19 +98,34 @@ impl UnionOp {
         transform_expr.check_size(2, 1, Self::NAME);
         transform_expr.check_same_str_type(Self::NAME);
 
+        let new_label = transform_expr.after_label(0, Self::NAME);
+        let produced_names = new_label.iter().cloned().map(LabelOrAttr::Label).collect();
         Self {
             required_names: vec![
                 transform_expr.before(0).into(),
                 transform_expr.before(1).into(),
             ],
+            produced_names,
             label1: transform_expr.before(0),
             label2: transform_expr.before(1),
-            new_label: transform_expr.after_label(0, Self::NAME),
+            new_label,
         }
     }
 }
 
 impl<T: Trace> GraphNode<T> for UnionOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             read.union(

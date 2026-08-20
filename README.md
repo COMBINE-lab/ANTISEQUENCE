@@ -48,6 +48,10 @@ Missing inputs no longer need to rely on an implicit convention:
 - `Skip` preserves the historical representative-record behavior and remains
   the legacy `Graph` default.
 
+Fallible constructors are available for user-facing primitives including
+terminal projection, regular-expression matching, and Bernoulli annotation;
+invalid operation configuration returns a structured `InvalidOperation` error.
+
 See the [validated graph API guide](docs/graph-api.md) for migration and custom
 operation details.
 

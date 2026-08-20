@@ -184,7 +184,9 @@ pub enum RejectionBehavior {
 pub struct OperationDescriptor<'a> {
     pub name: &'static str,
     pub requirements: &'a [LabelOrAttr],
-    pub produced: &'a [LabelOrAttr],
+    /// Known produced names, or `None` when a custom operation has not
+    /// declared this effect. `Some(&[])` explicitly means no names are added.
+    pub produced: Option<&'a [LabelOrAttr]>,
     pub mutation: MutationKind,
     pub rejection: RejectionBehavior,
     pub cost: CostClass,
@@ -439,20 +441,20 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
 
     /// Labels and attributes this operation may create.
     #[inline]
-    fn produced_names(&self) -> &[LabelOrAttr] {
-        &[]
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        None
     }
 
     /// Strongest mutation this operation may perform.
     #[inline]
     fn mutation_kind(&self) -> MutationKind {
-        MutationKind::None
+        MutationKind::Record
     }
 
     /// Whether this operation may reject records.
     #[inline]
     fn rejection_behavior(&self) -> RejectionBehavior {
-        RejectionBehavior::Never
+        RejectionBehavior::MayReject
     }
 
     /// Coarse cost class for graph planning.
@@ -2301,6 +2303,7 @@ mod reorder_ring_tests {
 #[cfg(test)]
 mod graph_api_tests {
     use super::*;
+    use crate::patterns::Patterns;
     use std::sync::Arc;
 
     struct DeclaredOp {
@@ -2346,12 +2349,16 @@ mod graph_api_tests {
             &self.required
         }
 
-        fn produced_names(&self) -> &[LabelOrAttr] {
-            &self.produced
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&self.produced)
         }
 
         fn mutation_kind(&self) -> MutationKind {
             MutationKind::Metadata
+        }
+
+        fn rejection_behavior(&self) -> RejectionBehavior {
+            RejectionBehavior::Never
         }
 
         fn cost_class(&self) -> CostClass {
@@ -2377,7 +2384,7 @@ mod graph_api_tests {
         let descriptor = graph.descriptors().next().unwrap();
         assert_eq!(descriptor.name, "DeclaredOp");
         assert_eq!(descriptor.requirements.len(), 1);
-        assert_eq!(descriptor.produced.len(), 1);
+        assert_eq!(descriptor.produced.unwrap().len(), 1);
         assert_eq!(descriptor.mutation, MutationKind::Metadata);
         assert_eq!(descriptor.rejection, RejectionBehavior::Never);
         assert_eq!(descriptor.cost, CostClass::Constant);
@@ -2448,5 +2455,56 @@ mod graph_api_tests {
             duplicate_input.compile().err().unwrap(),
             Error::InvalidGraph(_)
         ));
+    }
+
+    #[test]
+    fn built_in_descriptors_report_optimizer_relevant_effects() {
+        let cut = CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            4isize,
+        );
+        let cut = GraphNode::<NoTrace>::descriptor(&cut);
+        assert_eq!(cut.produced.unwrap().len(), 2);
+        assert_eq!(cut.mutation, MutationKind::Metadata);
+        assert_eq!(cut.rejection, RejectionBehavior::Never);
+
+        let patterns = Patterns::from_strs([b"ACGT"]).with_pattern_name(b"which");
+        let matcher = MatchAnyOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.hit").unwrap(),
+            patterns,
+            MatchType::Exact,
+        );
+        let matcher = GraphNode::<NoTrace>::descriptor(&matcher);
+        assert_eq!(matcher.produced.unwrap().len(), 2);
+        assert_eq!(matcher.mutation, MutationKind::Metadata);
+        assert_eq!(matcher.rejection, RejectionBehavior::Never);
+
+        let retain = RetainOp::new(false);
+        let retain = GraphNode::<NoTrace>::descriptor(&retain);
+        assert_eq!(retain.produced.unwrap().len(), 0);
+        assert_eq!(retain.mutation, MutationKind::None);
+        assert_eq!(retain.rejection, RejectionBehavior::MayReject);
+    }
+
+    #[test]
+    fn fallible_primitive_constructors_return_structured_errors() {
+        assert!(matches!(
+            ProjectOp::try_new(std::iter::empty::<Label>()),
+            Err(Error::InvalidOperation {
+                operation: "ProjectOp",
+                ..
+            })
+        ));
+        assert!(ProjectOp::try_with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(Label::new(b"seq2.*").unwrap())],
+        )
+        .is_err());
+        assert!(BernoulliOp::try_new(Attr::new(b"seq1.*.coin").unwrap(), 2.0, 7).is_err());
+        assert!(MatchRegexOp::try_new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.*.matched").unwrap(),
+            "[",
+        )
+        .is_err());
     }
 }

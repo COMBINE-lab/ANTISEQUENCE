@@ -43,6 +43,18 @@ impl CountOp {
 }
 
 impl<T: Trace> GraphNode<T> for CountOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let counts = self
             .counts

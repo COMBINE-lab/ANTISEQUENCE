@@ -265,6 +265,14 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
         NodeStage::Input
     }
 
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn cost_class(&self) -> CostClass {
+        CostClass::Io
+    }
+
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let cs = self.batch_size.load(Ordering::Relaxed);

@@ -100,6 +100,22 @@ impl<'writer, T: Trace> GraphNode<T> for OutputJsonOp<'writer> {
         NodeStage::Output
     }
 
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn cost_class(&self) -> CostClass {
+        CostClass::Io
+    }
+
     fn supports_prepared_output(&self) -> bool {
         true
     }

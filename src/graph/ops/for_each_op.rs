@@ -14,6 +14,10 @@ impl<F: Fn(&mut Read) + Send + Sync> ForEachOp<F> {
 }
 
 impl<F: Fn(&mut Read) + Send + Sync, T: Trace> GraphNode<T> for ForEachOp<F> {
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             (self.func)(read);

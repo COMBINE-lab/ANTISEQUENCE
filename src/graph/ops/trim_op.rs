@@ -23,6 +23,18 @@ impl TrimOp {
 }
 
 impl<T: Trace> GraphNode<T> for TrimOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Sequence
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             self.labels

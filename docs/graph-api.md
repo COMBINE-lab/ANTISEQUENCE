@@ -49,6 +49,20 @@ before compilation:
 The `ANTISEQ_TRUST_NAMES` check-elision setting applies only to `Skip`.
 Selecting `Error` or `Reject` always enforces the requested semantics.
 
+## Fallible construction
+
+New or user-facing code should prefer fallible primitive constructors where
+available. `ProjectOp::try_new`, `ProjectOp::try_with_parts`,
+`BernoulliOp::try_new`, and `MatchRegexOp::try_new` return
+`Error::InvalidOperation` for invalid shapes, lanes, probabilities, or regular
+expressions. Their original constructors remain compatibility wrappers that
+panic on the same invalid programmer input.
+
+`TransformExpr` likewise exposes `try_check_size`,
+`try_check_same_str_type`, `try_after_label`, and `try_after_attr` so operation
+constructors can validate without unwinding. Additional built-in constructors
+will migrate to these methods before the next breaking release.
+
 ## Operation descriptors and extensions
 
 `GraphNode::descriptor()` returns an allocation-free `OperationDescriptor`
@@ -60,12 +74,18 @@ with:
 - a coarse `CostClass`; and
 - `NodeStage`.
 
-The default descriptor is conservative and uses the existing
+The default descriptor is conservative: produced names are unknown, mutation
+may replace a record, and rejection is allowed. It also uses the existing
 `required_names()`, `name()`, and `stage()` declarations. A custom statically
 linked operation should additionally override `produced_names()`,
 `mutation_kind()`, `rejection_behavior()`, and `cost_class()` when applicable.
 No dynamic plugin ABI is required: applications such as seqproc can keep a
 compile-time registry of constructors for custom operation types.
+
+Built-in input, output, matching, interval, projection, lookup, filtering, and
+arbitrary-function operations declare their known effects. An omitted custom
+declaration remains conservative and therefore cannot be reordered or fused
+by a future optimizer.
 
 These descriptors are the stable seam for later constant folding, dead-label
 elimination, safe fusion, filter hoisting, and terminal rendering. Detailed

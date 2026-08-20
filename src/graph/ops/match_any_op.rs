@@ -172,6 +172,7 @@ impl HammingLookup {
 
 pub struct MatchAnyOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     label: Label,
     new_labels: [Option<Label>; 3],
     patterns: Patterns,
@@ -425,6 +426,27 @@ impl MatchAnyOp {
             *label = transform_expr.after_label(i, Self::NAME);
         }
         transform_expr.check_same_str_type(Self::NAME);
+        let label = transform_expr.before(0);
+        let mut produced_names = new_labels
+            .iter()
+            .flatten()
+            .cloned()
+            .map(LabelOrAttr::Label)
+            .collect::<Vec<_>>();
+        produced_names.extend(
+            patterns
+                .pattern_name()
+                .into_iter()
+                .chain(patterns.multimatch_name())
+                .chain(patterns.attr_names().iter().copied())
+                .map(|attr| {
+                    LabelOrAttr::Attr(Attr {
+                        str_type: label.str_type,
+                        label: label.label,
+                        attr,
+                    })
+                }),
+        );
 
         let seed_searcher = Self::get_searcher(&patterns, &match_type);
         let max_literal_len = patterns
@@ -448,7 +470,7 @@ impl MatchAnyOp {
                 _ => None,
             })
             .collect();
-        let mut required_names = vec![transform_expr.before(0).into()];
+        let mut required_names = vec![label.clone().into()];
         required_names.extend(
             patterns
                 .iter_exprs()
@@ -485,7 +507,8 @@ impl MatchAnyOp {
 
         Self {
             required_names,
-            label: transform_expr.before(0),
+            produced_names,
+            label,
             new_labels,
             patterns,
             max_literal_len,
@@ -777,6 +800,42 @@ impl MatchAnyOp {
 }
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        if self.post_match_retention.is_some() {
+            RejectionBehavior::MayReject
+        } else {
+            RejectionBehavior::Never
+        }
+    }
+
+    fn cost_class(&self) -> CostClass {
+        use MatchType::*;
+        match self.match_type {
+            GlobalAln(_)
+            | LocalAln { .. }
+            | PrefixAln { .. }
+            | SuffixAln { .. }
+            | Edit(_)
+            | EditPrefix(_)
+            | EditSuffix(_)
+            | EditSearch(_)
+            | EditBoundedMatch { .. } => CostClass::Alignment,
+            ExactSearch
+            | HammingSearch(_)
+            | ExactBoundedMatch { .. }
+            | HammingBoundedMatch { .. } => CostClass::Search,
+            _ => CostClass::Linear,
+        }
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let collect_stats =
             self.statistics_level.load(Ordering::Relaxed) == StatisticsLevel::Detailed as u8;

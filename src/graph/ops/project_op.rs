@@ -35,22 +35,47 @@ impl ProjectOp {
     const NAME: &'static str = "ProjectOp";
 
     pub fn new(labels: impl IntoIterator<Item = Label>) -> Self {
+        Self::try_new(labels).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_new(labels: impl IntoIterator<Item = Label>) -> Result<Self> {
         let labels = labels.into_iter().collect::<Vec<_>>();
-        assert!(!labels.is_empty(), "ProjectOp requires at least one label");
-        let str_type = labels[0].str_type;
-        Self::with_parts(str_type, labels.into_iter().map(ProjectPart::Label))
+        let Some(first) = labels.first() else {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "at least one source label is required".to_owned(),
+            });
+        };
+        let str_type = first.str_type;
+        Self::try_with_parts(str_type, labels.into_iter().map(ProjectPart::Label))
     }
 
     /// Create a projection that may interleave source labels and fixed bytes.
     pub fn with_parts(str_type: StrType, parts: impl IntoIterator<Item = ProjectPart>) -> Self {
+        Self::try_with_parts(str_type, parts).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible projection constructor with literal support.
+    pub fn try_with_parts(
+        str_type: StrType,
+        parts: impl IntoIterator<Item = ProjectPart>,
+    ) -> Result<Self> {
         let parts = parts.into_iter().collect::<Vec<_>>();
-        assert!(!parts.is_empty(), "ProjectOp requires at least one part");
-        assert!(
-            parts.iter().all(
-                |part| !matches!(part, ProjectPart::Label(label) if label.str_type != str_type)
-            ),
-            "ProjectOp source labels must belong to one FASTQ lane"
-        );
+        if parts.is_empty() {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "at least one projection part is required".to_owned(),
+            });
+        }
+        if parts
+            .iter()
+            .any(|part| matches!(part, ProjectPart::Label(label) if label.str_type != str_type))
+        {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "all source labels must belong to the projected FASTQ lane".to_owned(),
+            });
+        }
         let required_names = parts
             .iter()
             .filter_map(|part| match part {
@@ -58,15 +83,27 @@ impl ProjectOp {
                 ProjectPart::Literal(_) => None,
             })
             .collect();
-        Self {
+        Ok(Self {
             required_names,
             str_type,
             parts,
-        }
+        })
     }
 }
 
 impl<T: Trace> GraphNode<T> for ProjectOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Record
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let parts = self
             .parts

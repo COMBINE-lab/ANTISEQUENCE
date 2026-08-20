@@ -2,6 +2,7 @@ use crate::graph::*;
 
 pub struct CutOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     cut_label: Label,
     new_label1: Option<Label>,
     new_label2: Option<Label>,
@@ -22,18 +23,39 @@ impl CutOp {
         transform_expr.check_same_str_type(Self::NAME);
         let mut required_names = cut_idx.required_names();
         required_names.push(transform_expr.before(0).into());
+        let new_label1 = transform_expr.after_label(0, Self::NAME);
+        let new_label2 = transform_expr.after_label(1, Self::NAME);
+        let produced_names = new_label1
+            .iter()
+            .chain(new_label2.iter())
+            .cloned()
+            .map(LabelOrAttr::Label)
+            .collect();
 
         Self {
             required_names,
+            produced_names,
             cut_label: transform_expr.before(0),
-            new_label1: transform_expr.after_label(0, Self::NAME),
-            new_label2: transform_expr.after_label(1, Self::NAME),
+            new_label1,
+            new_label2,
             cut_idx,
         }
     }
 }
 
 impl<T: Trace> GraphNode<T> for CutOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             let cut_idx = self.cut_idx.eval_int(read).map_err(|e| Error::NameError {
