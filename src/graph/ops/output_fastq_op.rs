@@ -48,6 +48,74 @@ fn gzip_member(input: &[u8], mut output: Vec<u8>, level: u32) -> Result<Vec<u8>>
         .map_err(|error| Error::BytesIo(Box::new(error)))
 }
 
+fn append_projected_fastq(
+    buffer: &mut Vec<u8>,
+    read: &Read,
+    output_index: u8,
+    projection: DirectReadProjection<'_>,
+    context: &'static str,
+) -> Result<()> {
+    if projection.str_type != StrType::Seq(output_index) {
+        return Err(Error::InvalidPipelineGraph(format!(
+            "direct projection for output {output_index} targets {:?}",
+            projection.str_type
+        )));
+    }
+    let (name, original_seq, _) =
+        read.to_fastq(output_index)
+            .map_err(|source| Error::NameError {
+                source,
+                read: read.clone(),
+                context,
+            })?;
+    buffer.reserve(1 + name.len() + 1 + original_seq.len() * 2 + 4);
+    buffer.push(b'@');
+    buffer.extend_from_slice(name);
+    buffer.push(b'\n');
+    for part in projection.parts {
+        match part {
+            ProjectPart::Label(label) => {
+                let bytes = read
+                    .substring(label.str_type, label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context,
+                    })?;
+                buffer.extend_from_slice(bytes);
+            }
+            ProjectPart::Literal(bytes) => buffer.extend_from_slice(bytes),
+        }
+    }
+    buffer.extend_from_slice(b"\n+\n");
+    for part in projection.parts {
+        match part {
+            ProjectPart::Label(label) => {
+                let quality = read
+                    .substring_qual(label.str_type, label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context,
+                    })?
+                    .ok_or_else(|| Error::NameError {
+                        source: NameError::Other(
+                            "direct FASTQ projection source has no quality scores",
+                        ),
+                        read: read.clone(),
+                        context,
+                    })?;
+                buffer.extend_from_slice(quality);
+            }
+            ProjectPart::Literal(bytes) => {
+                buffer.resize(buffer.len() + bytes.len(), b'I');
+            }
+        }
+    }
+    buffer.push(b'\n');
+    Ok(())
+}
+
 pub struct OutputFastqFileOp {
     required_names: Vec<LabelOrAttr>,
     file_exprs: Vec<Expr>,
@@ -263,8 +331,33 @@ impl OutputFastqFileOp {
         reads: &[Read],
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
+        self.prepare_fastq_files_inner(reads, None, recycled)
+    }
+
+    fn prepare_projected_fastq_files(
+        &self,
+        reads: &[Read],
+        projections: &[DirectReadProjection<'_>],
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        if projections.len() != self.file_exprs.len() {
+            return Err(Error::InvalidPipelineGraph(format!(
+                "direct projection count {} does not match FASTQ output count {}",
+                projections.len(),
+                self.file_exprs.len()
+            )));
+        }
+        self.prepare_fastq_files_inner(reads, Some(projections), recycled)
+    }
+
+    fn prepare_fastq_files_inner(
+        &self,
+        reads: &[Read],
+        projections: Option<&[DirectReadProjection<'_>]>,
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
         if self.parallel_gzip_members {
-            return self.prepare_parallel_gzip_fastq_files(reads, recycled);
+            return self.prepare_parallel_gzip_fastq_files(reads, projections, recycled);
         }
         let mut buffers = match recycled {
             Some(PreparedOutput::FastqFiles(mut buffers)) => {
@@ -293,22 +386,32 @@ impl OutputFastqFileOp {
                                 context: Self::NAME,
                             })?
                     };
-                let (name, seq, qual) =
-                    read.to_fastq((i + 1) as _)
-                        .map_err(|source| Error::NameError {
-                            source,
-                            read: read.clone(),
-                            context: Self::NAME,
-                        })?;
                 let buffer = buffers.entry(file_name.into_owned()).or_default();
-                buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
-                buffer.push(b'@');
-                buffer.extend_from_slice(name);
-                buffer.push(b'\n');
-                buffer.extend_from_slice(seq);
-                buffer.extend_from_slice(b"\n+\n");
-                buffer.extend_from_slice(qual);
-                buffer.push(b'\n');
+                if let Some(projections) = projections {
+                    append_projected_fastq(
+                        buffer,
+                        read,
+                        (i + 1) as u8,
+                        projections[i],
+                        Self::NAME,
+                    )?;
+                } else {
+                    let (name, seq, qual) =
+                        read.to_fastq((i + 1) as _)
+                            .map_err(|source| Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            })?;
+                    buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
+                    buffer.push(b'@');
+                    buffer.extend_from_slice(name);
+                    buffer.push(b'\n');
+                    buffer.extend_from_slice(seq);
+                    buffer.extend_from_slice(b"\n+\n");
+                    buffer.extend_from_slice(qual);
+                    buffer.push(b'\n');
+                }
             }
         }
         Ok(PreparedOutput::FastqFiles(buffers))
@@ -317,6 +420,7 @@ impl OutputFastqFileOp {
     fn prepare_parallel_gzip_fastq_files(
         &self,
         reads: &[Read],
+        projections: Option<&[DirectReadProjection<'_>]>,
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         let (mut raw, mut encoded) = match recycled {
@@ -352,22 +456,32 @@ impl OutputFastqFileOp {
                                 context: Self::NAME,
                             })?
                     };
-                let (name, seq, qual) =
-                    read.to_fastq((i + 1) as _)
-                        .map_err(|source| Error::NameError {
-                            source,
-                            read: read.clone(),
-                            context: Self::NAME,
-                        })?;
                 let buffer = raw.entry(file_name.into_owned()).or_default();
-                buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
-                buffer.push(b'@');
-                buffer.extend_from_slice(name);
-                buffer.push(b'\n');
-                buffer.extend_from_slice(seq);
-                buffer.extend_from_slice(b"\n+\n");
-                buffer.extend_from_slice(qual);
-                buffer.push(b'\n');
+                if let Some(projections) = projections {
+                    append_projected_fastq(
+                        buffer,
+                        read,
+                        (i + 1) as u8,
+                        projections[i],
+                        Self::NAME,
+                    )?;
+                } else {
+                    let (name, seq, qual) =
+                        read.to_fastq((i + 1) as _)
+                            .map_err(|source| Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            })?;
+                    buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
+                    buffer.push(b'@');
+                    buffer.extend_from_slice(name);
+                    buffer.push(b'\n');
+                    buffer.extend_from_slice(seq);
+                    buffer.extend_from_slice(b"\n+\n");
+                    buffer.extend_from_slice(qual);
+                    buffer.push(b'\n');
+                }
             }
         }
 
@@ -500,12 +614,27 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
         true
     }
 
+    fn supports_direct_projection(&self) -> bool {
+        true
+    }
+
     fn prepare_output(
         &self,
         reads: &[Read],
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         let prepared = self.prepare_fastq_files(reads, recycled)?;
+        self.record_emitted(reads.len());
+        Ok(prepared)
+    }
+
+    fn prepare_output_projected(
+        &self,
+        reads: &[Read],
+        projections: &[DirectReadProjection<'_>],
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        let prepared = self.prepare_projected_fastq_files(reads, projections, recycled)?;
         self.record_emitted(reads.len());
         Ok(prepared)
     }
@@ -729,24 +858,39 @@ impl<'writer> OutputFastqOp<'writer> {
         Ok(Self::from_writer(stream))
     }
 
-    fn append_fastq(&self, reads: &[Read], buffers: &mut [Vec<u8>]) -> Result<()> {
+    fn append_fastq(
+        &self,
+        reads: &[Read],
+        buffers: &mut [Vec<u8>],
+        projections: Option<&[DirectReadProjection<'_>]>,
+    ) -> Result<()> {
         for read in reads {
             for (i, buffer) in buffers.iter_mut().enumerate() {
-                let (name, seq, qual) =
-                    read.to_fastq((i + 1) as _)
-                        .map_err(|source| Error::NameError {
-                            source,
-                            read: read.clone(),
-                            context: Self::NAME,
-                        })?;
-                buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
-                buffer.push(b'@');
-                buffer.extend_from_slice(name);
-                buffer.push(b'\n');
-                buffer.extend_from_slice(seq);
-                buffer.extend_from_slice(b"\n+\n");
-                buffer.extend_from_slice(qual);
-                buffer.push(b'\n');
+                if let Some(projections) = projections {
+                    append_projected_fastq(
+                        buffer,
+                        read,
+                        (i + 1) as u8,
+                        projections[i],
+                        Self::NAME,
+                    )?;
+                } else {
+                    let (name, seq, qual) =
+                        read.to_fastq((i + 1) as _)
+                            .map_err(|source| Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            })?;
+                    buffer.reserve(1 + name.len() + 1 + seq.len() + 3 + qual.len() + 1);
+                    buffer.push(b'@');
+                    buffer.extend_from_slice(name);
+                    buffer.push(b'\n');
+                    buffer.extend_from_slice(seq);
+                    buffer.extend_from_slice(b"\n+\n");
+                    buffer.extend_from_slice(qual);
+                    buffer.push(b'\n');
+                }
             }
         }
         Ok(())
@@ -755,6 +899,31 @@ impl<'writer> OutputFastqOp<'writer> {
     fn prepare_fastq(
         &self,
         reads: &[Read],
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        self.prepare_fastq_inner(reads, None, recycled)
+    }
+
+    fn prepare_projected_fastq(
+        &self,
+        reads: &[Read],
+        projections: &[DirectReadProjection<'_>],
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        if projections.len() != self.writers.len() {
+            return Err(Error::InvalidPipelineGraph(format!(
+                "direct projection count {} does not match FASTQ writer count {}",
+                projections.len(),
+                self.writers.len()
+            )));
+        }
+        self.prepare_fastq_inner(reads, Some(projections), recycled)
+    }
+
+    fn prepare_fastq_inner(
+        &self,
+        reads: &[Read],
+        projections: Option<&[DirectReadProjection<'_>]>,
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         if let Some(level) = self.parallel_gzip_level {
@@ -777,7 +946,7 @@ impl<'writer> OutputFastqOp<'writer> {
                 ),
             };
             if !stub_output() {
-                self.append_fastq(reads, &mut raw)?;
+                self.append_fastq(reads, &mut raw, projections)?;
                 for (input, output) in raw.iter().zip(encoded.iter_mut()) {
                     *output = gzip_member(input, std::mem::take(output), level)?;
                 }
@@ -798,7 +967,7 @@ impl<'writer> OutputFastqOp<'writer> {
             return Ok(PreparedOutput::Fastq(buffers));
         }
 
-        self.append_fastq(reads, &mut buffers)?;
+        self.append_fastq(reads, &mut buffers, projections)?;
         Ok(PreparedOutput::Fastq(buffers))
     }
 
@@ -872,12 +1041,25 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
         true
     }
 
+    fn supports_direct_projection(&self) -> bool {
+        true
+    }
+
     fn prepare_output(
         &self,
         reads: &[Read],
         recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         self.prepare_fastq(reads, recycled)
+    }
+
+    fn prepare_output_projected(
+        &self,
+        reads: &[Read],
+        projections: &[DirectReadProjection<'_>],
+        recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        self.prepare_projected_fastq(reads, projections, recycled)
     }
 
     fn commit_output(&self, prepared: &mut PreparedOutput) -> Result<()> {
@@ -896,7 +1078,7 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
         for buffer in buffers.iter_mut() {
             buffer.clear();
         }
-        self.append_fastq(&reads, &mut buffers)?;
+        self.append_fastq(&reads, &mut buffers, None)?;
 
         let mut compressed_buffers = self
             .compressed_buffers

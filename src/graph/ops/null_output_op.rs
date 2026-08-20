@@ -41,6 +41,10 @@ impl<T: Trace> GraphNode<T> for NullOutputOp {
         true
     }
 
+    fn supports_direct_projection(&self) -> bool {
+        true
+    }
+
     fn produces_prepared_output(&self) -> bool {
         false
     }
@@ -48,6 +52,15 @@ impl<T: Trace> GraphNode<T> for NullOutputOp {
     fn prepare_output(
         &self,
         _reads: &[Read],
+        _recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        Ok(PreparedOutput::Passthrough)
+    }
+
+    fn prepare_output_projected(
+        &self,
+        _reads: &[Read],
+        _projections: &[DirectReadProjection<'_>],
         _recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         Ok(PreparedOutput::Passthrough)

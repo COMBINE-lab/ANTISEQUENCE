@@ -92,3 +92,27 @@ elimination, safe fusion, filter hoisting, and terminal rendering. Detailed
 record/lane/interval metadata preservation and nested-graph liveness remain a
 separate redesign, documented in
 [`metadata-liveness-redesign.md`](metadata-liveness-redesign.md).
+
+## Direct terminal rendering
+
+Prepared worker-local pipelines detect a contiguous top-level suffix of
+`ProjectOp` nodes followed by one compatible FASTQ output node. The worker then
+renders mapped intervals, fixed sequence, quality scores, and the current
+header directly into recycled output buffers, avoiding an intermediate
+materialized `Read` transformation.
+
+The optimization is enabled by default and can be disabled with
+`PipelineConfig::direct_output_rendering = false` for differential testing.
+`PipelineReport::direct_output_rendering` records whether it was actually
+selected. Unsupported layouts—including nested or conditional projections,
+non-FASTQ output, non-contiguous projections, and mismatched output lanes—use
+the materializing path without changing semantics.
+
+The initial cost model selects this pass only for one-worker pipelines. At four
+workers the measured default-batch workload regressed by 2.5%, while a
+1024-read batch was effectively tied (+0.24%). Multi-worker execution therefore
+retains materialization until a later planner can demonstrate a robust gain.
+
+The first release gate uses byte-identical output and a five-million-read
+single-thread workload. Direct rendering reduced mean runtime from 0.69290 to
+0.58071 seconds (16.2%) for a fixed-prefix plus mapped-sequence projection.

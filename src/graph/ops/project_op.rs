@@ -92,6 +92,13 @@ impl ProjectOp {
 }
 
 impl<T: Trace> GraphNode<T> for ProjectOp {
+    fn direct_read_projection(&self) -> Option<DirectReadProjection<'_>> {
+        Some(DirectReadProjection {
+            str_type: self.str_type,
+            parts: &self.parts,
+        })
+    }
+
     fn produced_names(&self) -> Option<&[LabelOrAttr]> {
         Some(&[])
     }

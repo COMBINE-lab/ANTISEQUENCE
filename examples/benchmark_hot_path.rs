@@ -4,6 +4,7 @@
 //! keeps FASTQ generation and input cloning outside the measured interval, and
 //! emits machine-readable JSON for the reproducible benchmark harness.
 
+use antisequence::expr::label;
 use antisequence::graph::*;
 use antisequence::*;
 use flate2::{write::GzEncoder, Compression};
@@ -46,6 +47,8 @@ struct Args {
     gzip_level: u32,
     gzip_threads: usize,
     gzip_block_size: usize,
+    terminal_projection: bool,
+    direct_output_rendering: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +127,8 @@ fn parse_args() -> Args {
         gzip_level: 6,
         gzip_threads: 4,
         gzip_block_size: 128 * 1024,
+        terminal_projection: false,
+        direct_output_rendering: true,
     };
     let mut cli = std::env::args().skip(1);
     while let Some(flag) = cli.next() {
@@ -296,6 +301,8 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("gzip block size")
             }
+            "--terminal-projection" => args.terminal_projection = true,
+            "--no-direct-output-rendering" => args.direct_output_rendering = false,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
                     "passthrough" => Mode::Passthrough,
@@ -324,7 +331,8 @@ fn parse_args() -> Args {
                      [--seed-patterns N] [--seed-pattern-length N] \
                      [--seed-text-length N] [--seed-scenario exact|no-match|repetitive] \
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
-                     [--gzip-level 0..9]"
+                     [--gzip-level 0..9] [--terminal-projection] \
+                     [--no-direct-output-rendering]"
                 );
                 std::process::exit(0);
             }
@@ -493,6 +501,15 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
             ));
         }
     }
+    if args.terminal_projection {
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"ACGTACGTACGTACGT".to_vec()),
+                ProjectPart::Label(label("seq1.*")),
+            ],
+        ));
+    }
     graph.set_statistics_level(args.statistics_level);
     match args.output {
         OutputMode::Null => {
@@ -555,6 +572,7 @@ fn main() {
             Execution::PipelineUnordered | Execution::PipelineOrdered => {
                 let mut config = PipelineConfig::new(args.threads);
                 config.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
+                config.direct_output_rendering = args.direct_output_rendering;
                 if let Some(queue_capacity) = args.queue_capacity {
                     config.queue_capacity = queue_capacity;
                 }
@@ -653,6 +671,8 @@ fn main() {
             "gzip_level": args.gzip_level,
             "gzip_threads": args.gzip_threads,
             "gzip_block_size": args.gzip_block_size,
+            "terminal_projection": args.terminal_projection,
+            "direct_output_rendering": args.direct_output_rendering,
             "reads": args.reads,
             "threads": args.threads,
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),

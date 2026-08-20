@@ -193,6 +193,13 @@ pub struct OperationDescriptor<'a> {
     pub stage: NodeStage,
 }
 
+/// Borrowed terminal projection that an output node may render directly.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectReadProjection<'a> {
+    pub str_type: StrType,
+    pub parts: &'a [ProjectPart],
+}
+
 /// Owned output payload prepared by transform workers and committed by the
 /// ordered writer. Variants retain their allocations when recycled.
 #[derive(Debug)]
@@ -232,6 +239,8 @@ pub struct PipelineConfig {
     pub batch_size: usize,
     /// Write completed batches in input order.
     pub preserve_order: bool,
+    /// Fuse a terminal top-level projection suffix into prepared FASTQ output.
+    pub direct_output_rendering: bool,
     pub input_mode: PipelineInputMode,
 }
 
@@ -251,6 +260,7 @@ impl PipelineConfig {
             // is still configurable for unusually long or cheap records.
             batch_size: 256,
             preserve_order: false,
+            direct_output_rendering: true,
             input_mode: PipelineInputMode::WorkerLocal,
         }
     }
@@ -265,6 +275,7 @@ pub struct PipelineReport {
     pub max_in_flight_batches_observed: usize,
     pub max_reorder_batches_observed: usize,
     pub prepared_output: bool,
+    pub direct_output_rendering: bool,
     pub transform_worker_nanos: u64,
     pub prepare_output_worker_nanos: u64,
     pub commit_output_writer_nanos: u64,
@@ -498,6 +509,19 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         true
     }
 
+    /// Expose a terminal projection to a prepared-output planner.
+    #[inline]
+    fn direct_read_projection(&self) -> Option<DirectReadProjection<'_>> {
+        None
+    }
+
+    /// Whether this output node can serialize terminal projections without
+    /// first materializing them into `Read`.
+    #[inline]
+    fn supports_direct_projection(&self) -> bool {
+        false
+    }
+
     /// Serialize one batch without performing output I/O. `recycled` is a
     /// previously committed payload from this same node when available.
     fn prepare_output(
@@ -507,6 +531,18 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     ) -> Result<PreparedOutput> {
         Err(Error::InvalidPipelineGraph(format!(
             "output node {} does not support prepared output",
+            self.name()
+        )))
+    }
+
+    fn prepare_output_projected(
+        &self,
+        _reads: &[Read],
+        _projections: &[DirectReadProjection<'_>],
+        _recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        Err(Error::InvalidPipelineGraph(format!(
+            "output node {} does not support direct projection rendering",
             self.name()
         )))
     }
@@ -1144,6 +1180,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: false,
+            direct_output_rendering: false,
             transform_worker_nanos: 0,
             prepare_output_worker_nanos: 0,
             commit_output_writer_nanos: 0,
@@ -1176,6 +1213,13 @@ impl<T: Trace> Graph<T> {
         trace: &T,
         output_start: usize,
     ) -> Result<PipelineReport> {
+        let (transform_end, direct_projections) =
+            if config.direct_output_rendering && config.workers == 1 {
+                self.direct_projection_suffix(output_start)
+            } else {
+                (output_start, Vec::new())
+            };
+        let direct_output_rendering = !direct_projections.is_empty();
         self.nodes[0].set_batch_size(config.batch_size);
         let cancelled = AtomicBool::new(false);
         let failures = Mutex::new(Vec::<String>::new());
@@ -1201,6 +1245,7 @@ impl<T: Trace> Graph<T> {
                 let worker_completed_batches = &completed_batches;
                 let worker_transform_nanos = &transform_nanos;
                 let worker_prepare_output_nanos = &prepare_output_nanos;
+                let worker_direct_projections = &direct_projections;
                 worker_handles.push(scope.spawn(move || {
                     let (output_recycle_sender, output_recycle_receiver) = unbounded();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1236,7 +1281,7 @@ impl<T: Trace> Graph<T> {
 
                             let transform_start = Instant::now();
                             let (reads, _) =
-                                match self.run_node_range(Some(reads), 1, output_start, trace) {
+                                match self.run_node_range(Some(reads), 1, transform_end, trace) {
                                     Ok(result) => result,
                                     Err(error) => {
                                         worker_window.release();
@@ -1251,6 +1296,7 @@ impl<T: Trace> Graph<T> {
                             let outputs = match self.prepare_output_range(
                                 output_start,
                                 &reads,
+                                worker_direct_projections,
                                 recycled_outputs,
                                 trace,
                             ) {
@@ -1403,6 +1449,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: true,
+            direct_output_rendering,
             transform_worker_nanos: transform_nanos.load(Ordering::Relaxed),
             prepare_output_worker_nanos: prepare_output_nanos.load(Ordering::Relaxed),
             commit_output_writer_nanos: commit_output_nanos.load(Ordering::Relaxed),
@@ -1620,6 +1667,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: false,
+            direct_output_rendering: false,
             transform_worker_nanos: 0,
             prepare_output_worker_nanos: 0,
             commit_output_writer_nanos: 0,
@@ -1690,6 +1738,38 @@ impl<T: Trace> Graph<T> {
             )));
         }
         Ok(output_start)
+    }
+
+    fn direct_projection_suffix(
+        &self,
+        output_start: usize,
+    ) -> (usize, Vec<DirectReadProjection<'_>>) {
+        let output_nodes = &self.nodes[output_start..];
+        if output_nodes.len() != 1 || !output_nodes[0].supports_direct_projection() {
+            return (output_start, Vec::new());
+        }
+
+        let mut projection_start = output_start;
+        while projection_start > 1
+            && self.nodes[projection_start - 1]
+                .direct_read_projection()
+                .is_some()
+        {
+            projection_start -= 1;
+        }
+        let projections = self.nodes[projection_start..output_start]
+            .iter()
+            .filter_map(|node| node.direct_read_projection())
+            .collect::<Vec<_>>();
+        if projections.is_empty()
+            || projections
+                .iter()
+                .enumerate()
+                .any(|(index, projection)| projection.str_type != StrType::Seq((index + 1) as u8))
+        {
+            return (output_start, Vec::new());
+        }
+        (projection_start, projections)
     }
 
     fn pipeline_read(
@@ -1781,6 +1861,7 @@ impl<T: Trace> Graph<T> {
         &self,
         output_start: usize,
         reads: &Option<Vec<Read>>,
+        direct_projections: &[DirectReadProjection<'_>],
         recycled: Option<Vec<PreparedOutput>>,
         trace: &T,
     ) -> Result<Vec<PreparedOutput>> {
@@ -1790,7 +1871,11 @@ impl<T: Trace> Graph<T> {
         let mut outputs = Vec::with_capacity(self.nodes.len() - output_start);
         for node in &self.nodes[output_start..] {
             let trace_start = trace.start(reads);
-            let prepared = node.prepare_output(read_slice, recycled.next())?;
+            let prepared = if direct_projections.is_empty() {
+                node.prepare_output(read_slice, recycled.next())?
+            } else {
+                node.prepare_output_projected(read_slice, direct_projections, recycled.next())?
+            };
             trace.add(node.name(), trace_start, reads);
             outputs.push(prepared);
         }

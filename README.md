@@ -86,6 +86,10 @@ Projection is deliberately a terminal operation: it replaces the selected
 FASTQ lane and discards its non-default interval mappings. Place it after all
 operations that consume those mappings or their attributes. Use `SetOp` when a
 constructed sequence must remain available to subsequent graph operations.
+Prepared pipelines directly render a contiguous top-level suffix of
+`ProjectOp` nodes into FASTQ output buffers, bypassing intermediate
+materialization. This optimization is reported in `PipelineReport` and can be
+disabled through `PipelineConfig` for differential testing.
 `SwitchOp` evaluates all routing predicates before running any arm, so each
 mutually exclusive arm may safely end in a terminal projection. The broader
 [metadata and graph-liveness redesign](docs/metadata-liveness-redesign.md) is

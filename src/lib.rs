@@ -734,6 +734,110 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn direct_terminal_projection_matches_materialized_fastq_bytes() {
+        let input = fastq_bytes(&[("read1", "ACGT", "1234"), ("read2", "TGCA", "5678")]);
+
+        let materialized = SharedWriter::default();
+        let materialized_bytes = Arc::clone(&materialized.0);
+        let mut materialized_graph = Graph::<NoTrace>::new();
+        materialized_graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+        materialized_graph.add(CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            2isize,
+        ));
+        materialized_graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"TT".to_vec()),
+                ProjectPart::Label(label("seq1.right")),
+                ProjectPart::Label(label("seq1.left")),
+            ],
+        ));
+        materialized_graph.add(OutputFastqOp::from_writer(materialized));
+        materialized_graph.try_run_with_threads(1).unwrap();
+
+        let direct = SharedWriter::default();
+        let direct_bytes = Arc::clone(&direct.0);
+        let mut direct_graph = Graph::<NoTrace>::new();
+        direct_graph.add(InputFastqOp::from_reader(Cursor::new(input)).unwrap());
+        direct_graph.add(CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            2isize,
+        ));
+        direct_graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"TT".to_vec()),
+                ProjectPart::Label(label("seq1.right")),
+                ProjectPart::Label(label("seq1.left")),
+            ],
+        ));
+        direct_graph.add(OutputFastqOp::from_writer(direct));
+        let report = direct_graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 1,
+                queue_capacity: 2,
+                max_in_flight_batches: 1,
+                batch_size: 1,
+                preserve_order: true,
+                direct_output_rendering: true,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap();
+
+        assert!(report.prepared_output);
+        assert!(report.direct_output_rendering);
+        assert_eq!(
+            *direct_bytes.lock().unwrap(),
+            *materialized_bytes.lock().unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(direct_bytes.lock().unwrap().clone()).unwrap(),
+            "@read1\nTTGTAC\n+\nII3412\n@read2\nTTCATG\n+\nII7856\n"
+        );
+    }
+
+    #[test]
+    fn direct_terminal_projection_supports_file_outputs() {
+        let output_path = std::env::temp_dir().join(format!(
+            "antiseq_direct_projection_{}.fastq",
+            std::process::id()
+        ));
+        let report = {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(
+                InputFastqOp::from_reader(Cursor::new(fastq_bytes(&[("read", "ACGT", "1234")])))
+                    .unwrap(),
+            );
+            graph.add(CutOp::new(
+                TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+                2isize,
+            ));
+            graph.add(ProjectOp::with_parts(
+                StrType::Seq(1),
+                [
+                    ProjectPart::literal(b"TT".to_vec()),
+                    ProjectPart::Label(label("seq1.right")),
+                    ProjectPart::Label(label("seq1.left")),
+                ],
+            ));
+            graph.add(OutputFastqFileOp::from_file(
+                output_path.to_string_lossy().into_owned(),
+            ));
+            let report = graph.try_run_pipeline(PipelineConfig::new(1)).unwrap();
+            drop(graph);
+            report
+        };
+
+        assert!(report.direct_output_rendering);
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "@read\nTTGTAC\n+\nII3412\n"
+        );
+        std::fs::remove_file(output_path).ok();
+    }
+
+    #[test]
     fn test_try_graph_with_threads_rejects_zero_threads() {
         let g = Graph::<NoTrace>::new();
         let error = g.try_run_with_threads(0).unwrap_err();
@@ -832,6 +936,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 512,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -874,6 +979,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -910,6 +1016,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -968,6 +1075,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::DedicatedReader,
             })
             .unwrap();
@@ -1000,6 +1108,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 1,
                 batch_size: 512,
                 preserve_order: false,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap_err();
