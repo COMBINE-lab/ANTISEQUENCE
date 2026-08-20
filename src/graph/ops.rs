@@ -60,6 +60,9 @@ pub use output_json_op::*;
 mod select_op;
 pub use select_op::*;
 
+mod switch_op;
+pub use switch_op::*;
+
 mod try_op;
 pub use try_op::*;
 

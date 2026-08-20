@@ -41,6 +41,10 @@ Projection is deliberately a terminal operation: it replaces the selected
 FASTQ lane and discards its non-default interval mappings. Place it after all
 operations that consume those mappings or their attributes. Use `SetOp` when a
 constructed sequence must remain available to subsequent graph operations.
+`SwitchOp` evaluates all routing predicates before running any arm, so each
+mutually exclusive arm may safely end in a terminal projection. The broader
+[metadata and graph-liveness redesign](docs/metadata-liveness-redesign.md) is
+documented as deferred work for arbitrary nested graphs.
 
 ## Name
 The name of this library is inspired by a K-pop [song](https://youtu.be/pyf8cbqyfPs).
