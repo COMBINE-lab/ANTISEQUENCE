@@ -1,5 +1,5 @@
 use std::marker::{Send, Sync};
-use std::ops::RangeBounds;
+use std::ops::{Deref, RangeBounds};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -21,6 +21,21 @@ pub struct Graph<T: Trace = NoTrace> {
     nodes: Vec<Arc<dyn GraphNode<T>>>,
     statistics_level: AtomicU8,
     missing_input_policy: AtomicU8,
+}
+
+/// Mutable graph construction API.
+///
+/// Calling [`GraphBuilder::compile`] validates stage ordering and transfers
+/// the nodes into a structurally immutable [`CompiledGraph`]. Runtime
+/// instrumentation remains configurable through atomics and does not mutate
+/// graph structure.
+pub struct GraphBuilder<T: Trace = NoTrace> {
+    graph: Graph<T>,
+}
+
+/// Validated graph whose operation sequence can no longer be changed.
+pub struct CompiledGraph<T: Trace = NoTrace> {
+    graph: Graph<T>,
 }
 
 /// Controls the amount of runtime instrumentation collected by graph nodes.
@@ -92,6 +107,17 @@ pub enum NodeStage {
     Input,
     Transform,
     Output,
+}
+
+impl NodeStage {
+    #[inline(always)]
+    const fn order(self) -> u8 {
+        match self {
+            Self::Input => 0,
+            Self::Transform => 1,
+            Self::Output => 2,
+        }
+    }
 }
 
 /// Behavior when an operation's declared labels or attributes are unavailable.
@@ -576,6 +602,62 @@ impl<T: Trace> Default for Graph<T> {
     }
 }
 
+impl<T: Trace> Default for GraphBuilder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Trace> GraphBuilder<T> {
+    pub fn new() -> Self {
+        Self {
+            graph: Graph::new(),
+        }
+    }
+
+    /// Add an operation while the graph is under construction.
+    pub fn add<G: GraphNode<T> + 'static>(&mut self, node: G) -> Arc<G> {
+        self.graph.add(node)
+    }
+
+    pub fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.graph.set_statistics_level(level);
+    }
+
+    pub fn set_missing_input_policy(&self, policy: MissingInputPolicy) {
+        self.graph.set_missing_input_policy(policy);
+    }
+
+    pub fn with_missing_input_policy(self, policy: MissingInputPolicy) -> Self {
+        self.set_missing_input_policy(policy);
+        self
+    }
+
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.graph.descriptors()
+    }
+
+    /// Validate and freeze graph structure for execution.
+    pub fn compile(self) -> Result<CompiledGraph<T>> {
+        self.graph.validate_for_compilation()?;
+        Ok(CompiledGraph { graph: self.graph })
+    }
+}
+
+impl<T: Trace> Deref for CompiledGraph<T> {
+    type Target = Graph<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.graph
+    }
+}
+
+impl<T: Trace> CompiledGraph<T> {
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.graph.descriptors()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequirementAction {
     Run,
@@ -591,6 +673,42 @@ impl<T: Trace> Graph<T> {
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             missing_input_policy: AtomicU8::new(MissingInputPolicy::Skip as u8),
         }
+    }
+
+    /// Validate and freeze a graph built through the legacy mutable API.
+    ///
+    /// New code should prefer [`GraphBuilder`] so construction and execution
+    /// are separate in the type system.
+    pub fn compile(self) -> Result<CompiledGraph<T>> {
+        self.validate_for_compilation()?;
+        Ok(CompiledGraph { graph: self })
+    }
+
+    fn validate_for_compilation(&self) -> Result<()> {
+        let mut previous_stage = NodeStage::Input;
+        let mut input_count = 0usize;
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let descriptor = node.descriptor();
+            if descriptor.stage.order() < previous_stage.order() {
+                return Err(Error::InvalidGraph(format!(
+                    "operation {} ({}) is in the {:?} stage after the {:?} stage",
+                    index, descriptor.name, descriptor.stage, previous_stage
+                )));
+            }
+            if descriptor.stage == NodeStage::Input {
+                input_count += 1;
+                if index != 0 || input_count > 1 {
+                    return Err(Error::InvalidGraph(format!(
+                        "input operation {} ({}) must be the graph's only input-stage node and appear first",
+                        index, descriptor.name
+                    )));
+                }
+            }
+            previous_stage = descriptor.stage;
+        }
+
+        Ok(())
     }
 
     /// Add a read operation node to the graph and return the node.
@@ -2190,6 +2308,26 @@ mod graph_api_tests {
         produced: Vec<LabelOrAttr>,
     }
 
+    struct StagedOp(NodeStage);
+
+    impl GraphNode<NoTrace> for StagedOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &[]
+        }
+
+        fn stage(&self) -> NodeStage {
+            self.0
+        }
+
+        fn name(&self) -> &'static str {
+            "StagedOp"
+        }
+    }
+
     impl DeclaredOp {
         fn new() -> Self {
             Self {
@@ -2275,6 +2413,40 @@ mod graph_api_tests {
                 node: "DeclaredOp",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn builder_compiles_to_a_validated_immutable_graph() {
+        let mut builder =
+            GraphBuilder::<NoTrace>::new().with_missing_input_policy(MissingInputPolicy::Error);
+        builder.add(DeclaredOp::new());
+        let compiled = builder.compile().unwrap();
+
+        assert_eq!(compiled.missing_input_policy(), MissingInputPolicy::Error);
+        assert_eq!(compiled.descriptors().len(), 1);
+        let (reads, _) = compiled
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compilation_rejects_invalid_stage_ordering() {
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(StagedOp(NodeStage::Output));
+        builder.add(StagedOp(NodeStage::Transform));
+        assert!(matches!(
+            builder.compile().err().unwrap(),
+            Error::InvalidGraph(_)
+        ));
+
+        let mut duplicate_input = GraphBuilder::<NoTrace>::new();
+        duplicate_input.add(StagedOp(NodeStage::Input));
+        duplicate_input.add(StagedOp(NodeStage::Input));
+        assert!(matches!(
+            duplicate_input.compile().err().unwrap(),
+            Error::InvalidGraph(_)
         ));
     }
 }

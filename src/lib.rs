@@ -10,15 +10,20 @@
 //! * Debugging sequencing pipelines
 //!
 //! ## Computation graph API
-//! To use ANTISEQUENCE, you first specify *operations* (read from fastq, trim reads, output to fastq, etc.)
-//! and add them to a [`Graph`]. Then, you run the graph, which executes all the operations on each
-//! read.
+//! To use ANTISEQUENCE, first add *operations* (read from FASTQ, transform,
+//! filter, output, and so on) to a [`GraphBuilder`](crate::graph::GraphBuilder).
+//! Compiling it produces a structurally immutable
+//! [`CompiledGraph`](crate::graph::CompiledGraph) for execution.
+//! [`Graph`](crate::graph::Graph) is retained as the legacy mutable
+//! construction API.
 //!
 //! See [`graph`] for all supported operations.
 //!
-//! Each operation in a graph contains a set of dependencies, which are labels and attributes
-//! that the operation requires to be present in the read. If the dependencies are not present,
-//! then the operation will be skipped.
+//! Each operation declares its requirements and effects through an
+//! allocation-free [`OperationDescriptor`](crate::graph::OperationDescriptor).
+//! Missing requirements use an explicit
+//! [`MissingInputPolicy`](crate::graph::MissingInputPolicy): strict error,
+//! per-read rejection, or compatibility skip.
 //!
 //! ## Reads
 //! Here's an example fastq record:

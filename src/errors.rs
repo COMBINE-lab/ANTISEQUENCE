@@ -15,6 +15,9 @@ pub enum Error {
     #[error("Graph execution failed in a worker: {0}")]
     GraphExecution(String),
 
+    #[error("Invalid graph: {0}")]
+    InvalidGraph(String),
+
     #[error("Invalid pipeline configuration: {0}")]
     InvalidPipelineConfig(String),
 

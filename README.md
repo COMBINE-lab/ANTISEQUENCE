@@ -10,6 +10,47 @@ Rust stream processing library for sequencing reads.
 
 ANTISEQUENCE should enable you to build robust, efficient, and production-ready pipelines for your raw sequencing data.
 
+## Validated graph API
+
+New applications should construct a graph with `GraphBuilder` and execute the
+resulting `CompiledGraph`:
+
+```rust
+use antisequence::graph::{
+    GraphBuilder, InputFastqOp, MissingInputPolicy, NullOutputOp,
+};
+use antisequence::trace::NoTrace;
+use std::io::Cursor;
+
+let mut builder = GraphBuilder::<NoTrace>::new()
+    .with_missing_input_policy(MissingInputPolicy::Error);
+builder.add(InputFastqOp::from_reader(Cursor::new(
+    b"@read\nACGT\n+\nIIII\n".as_slice(),
+))?);
+// builder.add(... transformations ...);
+builder.add(NullOutputOp::new());
+
+let graph = builder.compile()?;
+graph.run()?;
+# Ok::<(), antisequence::errors::Error>(())
+```
+
+Compilation checks input/transform/output stage ordering and freezes the node
+sequence. Every operation exposes an allocation-free descriptor containing
+its requirements, produced names, mutation and rejection behavior, cost
+class, and pipeline stage. Custom operations implement the same `GraphNode`
+interface and can refine those effects for future graph-planning passes.
+
+Missing inputs no longer need to rely on an implicit convention:
+
+- `Error` validates every record and returns a structured error.
+- `Reject` removes only records lacking an operation's requirements.
+- `Skip` preserves the historical representative-record behavior and remains
+  the legacy `Graph` default.
+
+See the [validated graph API guide](docs/graph-api.md) for migration and custom
+operation details.
+
 ## Terminal read projection
 
 `ProjectOp` efficiently constructs a final FASTQ sequence from labeled
