@@ -35,6 +35,10 @@ impl<T: Trace> GraphNode<T> for TrimOp {
         RejectionBehavior::Never
     }
 
+    fn is_semantic_noop(&self) -> bool {
+        self.labels.is_empty()
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             self.labels

@@ -36,6 +36,11 @@ arbitrary dead-label elimination or nested-graph reordering remains governed
 by `metadata-liveness-redesign.md`; an optimizer must not guess across those
 boundaries.
 
+The first implementation now provides the optimization configuration/report,
+sound expression read-dependence tracking, semantic no-op removal, terminal
+projection candidate reporting, and conservative opaque barriers. Further
+adjacent-operation fusion remains subject to the same proof requirements.
+
 ### Execution planning
 
 Execution selection must become an explicit, inspectable plan rather than a
@@ -51,6 +56,12 @@ collection of call-site conditionals. A plan records:
 Callers may request automatic planning or force a backend for controlled
 benchmarking. The planner must preserve current behavior until representative
 measurements justify changing a default.
+
+The first implementation now exposes deterministic `ExecutionRequest`,
+`ExecutionPlan`, and `PlannedExecutionReport` APIs with stable reason codes.
+Automatic mode preserves the whole-graph default except when ordering requires
+the bounded pipeline. The remaining work is seqproc integration and the
+representative crossover matrix.
 
 ## Acceptance gates
 

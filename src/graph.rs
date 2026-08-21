@@ -36,6 +36,39 @@ pub struct GraphBuilder<T: Trace = NoTrace> {
 /// Validated graph whose operation sequence can no longer be changed.
 pub struct CompiledGraph<T: Trace = NoTrace> {
     graph: Graph<T>,
+    optimization_report: GraphOptimizationReport,
+}
+
+/// Compile-time graph optimization settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphOptimizationConfig {
+    /// Apply transformations whose semantic preconditions are proven by the
+    /// operation descriptors and optimization hooks.
+    pub enabled: bool,
+}
+
+impl Default for GraphOptimizationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Stable names and node counts for one compile-time optimization pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphOptimizationPassReport {
+    pub pass: &'static str,
+    pub changed_nodes: usize,
+}
+
+/// Observable result of validating and optimizing a graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphOptimizationReport {
+    pub enabled: bool,
+    pub original_operations: usize,
+    pub optimized_operations: usize,
+    pub opaque_barriers: usize,
+    pub terminal_projection_candidates: usize,
+    pub passes: Vec<GraphOptimizationPassReport>,
 }
 
 /// Controls the amount of runtime instrumentation collected by graph nodes.
@@ -218,7 +251,8 @@ pub enum PreparedOutput {
     Json(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PipelineInputMode {
     /// Parse and transform each batch on the same worker for cache locality.
     WorkerLocal,
@@ -227,7 +261,7 @@ pub enum PipelineInputMode {
 }
 
 /// Configuration for bounded reader -> worker -> writer execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PipelineConfig {
     /// Number of parallel transform workers.
     pub workers: usize,
@@ -242,6 +276,73 @@ pub struct PipelineConfig {
     /// Fuse a terminal top-level projection suffix into prepared FASTQ output.
     pub direct_output_rendering: bool,
     pub input_mode: PipelineInputMode,
+}
+
+/// Requested execution policy for a compiled graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Select a backend from graph effects and runtime constraints.
+    #[default]
+    Auto,
+    /// Preserve the historical worker-per-whole-graph executor.
+    WholeGraph,
+    /// Use the bounded reader/worker/writer executor.
+    Pipeline,
+}
+
+/// Concrete backend selected by the execution planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionBackend {
+    WholeGraph,
+    WorkerLocalPipeline,
+    DedicatedReaderPipeline,
+}
+
+/// Runtime inputs to execution planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionRequest {
+    pub mode: ExecutionMode,
+    pub pipeline: PipelineConfig,
+}
+
+impl ExecutionRequest {
+    pub fn new(workers: usize) -> Self {
+        Self {
+            mode: ExecutionMode::Auto,
+            pipeline: PipelineConfig::new(workers),
+        }
+    }
+}
+
+/// Planner summary of the graph's declared operation costs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GraphCostSummary {
+    pub constant: usize,
+    pub linear: usize,
+    pub search: usize,
+    pub alignment: usize,
+    pub io: usize,
+    pub opaque: usize,
+}
+
+/// Deterministic, inspectable execution decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionPlan {
+    pub backend: ExecutionBackend,
+    pub pipeline: PipelineConfig,
+    pub costs: GraphCostSummary,
+    pub prepared_output: bool,
+    pub direct_output_rendering: bool,
+    pub reason_codes: Vec<&'static str>,
+}
+
+/// Result of executing one previously planned graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlannedExecutionReport {
+    pub plan: ExecutionPlan,
+    pub pipeline: Option<PipelineReport>,
 }
 
 impl PipelineConfig {
@@ -474,6 +575,16 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         CostClass::Linear
     }
 
+    /// Whether removing this node is provably equivalent for read contents,
+    /// filtering, termination, and externally visible statistics.
+    ///
+    /// The default is deliberately conservative. Implementations should
+    /// return true only for a configuration-specific identity operation.
+    #[inline]
+    fn is_semantic_noop(&self) -> bool {
+        false
+    }
+
     /// Return the optimizer-facing operation descriptor without allocation.
     #[inline]
     fn descriptor(&self) -> OperationDescriptor<'_> {
@@ -677,8 +788,12 @@ impl<T: Trace> GraphBuilder<T> {
 
     /// Validate and freeze graph structure for execution.
     pub fn compile(self) -> Result<CompiledGraph<T>> {
-        self.graph.validate_for_compilation()?;
-        Ok(CompiledGraph { graph: self.graph })
+        self.compile_with(GraphOptimizationConfig::default())
+    }
+
+    /// Validate and freeze graph structure with explicit optimization policy.
+    pub fn compile_with(self, optimization: GraphOptimizationConfig) -> Result<CompiledGraph<T>> {
+        self.graph.compile_with(optimization)
     }
 }
 
@@ -693,6 +808,129 @@ impl<T: Trace> Deref for CompiledGraph<T> {
 impl<T: Trace> CompiledGraph<T> {
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
         self.graph.descriptors()
+    }
+
+    pub fn optimization_report(&self) -> &GraphOptimizationReport {
+        &self.optimization_report
+    }
+
+    /// Produce a deterministic execution plan without starting any workers.
+    pub fn plan_execution(&self, request: ExecutionRequest) -> Result<ExecutionPlan> {
+        if request.pipeline.workers == 0 {
+            return Err(Error::InvalidThreadCount(0));
+        }
+
+        let mut costs = GraphCostSummary::default();
+        for descriptor in self.descriptors() {
+            match descriptor.cost {
+                CostClass::Constant => costs.constant += 1,
+                CostClass::Linear => costs.linear += 1,
+                CostClass::Search => costs.search += 1,
+                CostClass::Alignment => costs.alignment += 1,
+                CostClass::Io => costs.io += 1,
+            }
+            if descriptor.stage == NodeStage::Transform && descriptor.produced.is_none() {
+                costs.opaque += 1;
+            }
+        }
+
+        let mut pipeline = request.pipeline;
+        let mut reason_codes = Vec::new();
+        let backend = match request.mode {
+            ExecutionMode::WholeGraph => {
+                reason_codes.push("forced_whole_graph");
+                ExecutionBackend::WholeGraph
+            }
+            ExecutionMode::Pipeline => {
+                reason_codes.push("forced_pipeline");
+                match pipeline.input_mode {
+                    PipelineInputMode::WorkerLocal => ExecutionBackend::WorkerLocalPipeline,
+                    PipelineInputMode::DedicatedReader => ExecutionBackend::DedicatedReaderPipeline,
+                }
+            }
+            ExecutionMode::Auto if pipeline.preserve_order => {
+                reason_codes.push("ordered_output_requires_pipeline");
+                match pipeline.input_mode {
+                    PipelineInputMode::WorkerLocal => ExecutionBackend::WorkerLocalPipeline,
+                    PipelineInputMode::DedicatedReader => ExecutionBackend::DedicatedReaderPipeline,
+                }
+            }
+            ExecutionMode::Auto => {
+                // Preserve the measured low-overhead default until the
+                // representative benchmark matrix establishes a stable
+                // crossover for descriptor-driven staged execution.
+                pipeline.input_mode = PipelineInputMode::WorkerLocal;
+                reason_codes.push("conservative_low_overhead_whole_graph");
+                ExecutionBackend::WholeGraph
+            }
+        };
+
+        if costs.opaque > 0 {
+            reason_codes.push("opaque_nodes_block_reordering");
+        }
+        if costs.alignment > 0 {
+            reason_codes.push("graph_contains_alignment");
+        } else if costs.search > 0 {
+            reason_codes.push("graph_contains_search");
+        }
+
+        let pipeline_backend = backend != ExecutionBackend::WholeGraph;
+        let output_start = self.graph.pipeline_output_start().ok();
+        if pipeline_backend && output_start.is_none() {
+            return Err(Error::InvalidPipelineGraph(
+                "planned pipeline requires one input stage followed by an output stage".to_owned(),
+            ));
+        }
+        if pipeline_backend {
+            self.graph.validate_pipeline_config(pipeline)?;
+        }
+        let prepared_output = output_start.is_some_and(|output_start| {
+            let outputs = &self.graph.nodes[output_start..];
+            outputs.iter().all(|node| node.supports_prepared_output())
+                && outputs.iter().any(|node| node.produces_prepared_output())
+        });
+        if prepared_output {
+            reason_codes.push("prepared_output_available");
+        }
+        let direct_output_rendering = pipeline_backend
+            && prepared_output
+            && pipeline.direct_output_rendering
+            && pipeline.workers == 1
+            && self.optimization_report.terminal_projection_candidates > 0;
+        if direct_output_rendering {
+            reason_codes.push("single_worker_direct_terminal_rendering");
+        }
+
+        Ok(ExecutionPlan {
+            backend,
+            pipeline,
+            costs,
+            prepared_output,
+            direct_output_rendering,
+            reason_codes,
+        })
+    }
+
+    /// Plan and execute the graph, returning the decision with runtime data.
+    pub fn try_run_planned(&self, request: ExecutionRequest) -> Result<PlannedExecutionReport> {
+        let plan = self.plan_execution(request)?;
+        let pipeline = match plan.backend {
+            ExecutionBackend::WholeGraph => {
+                self.graph.try_run_with_threads(plan.pipeline.workers)?;
+                None
+            }
+            ExecutionBackend::WorkerLocalPipeline => {
+                let mut config = plan.pipeline;
+                config.input_mode = PipelineInputMode::WorkerLocal;
+                Some(self.graph.try_run_pipeline(config)?)
+            }
+            ExecutionBackend::DedicatedReaderPipeline => {
+                let mut config = plan.pipeline;
+                config.input_mode = PipelineInputMode::DedicatedReader;
+                Some(self.graph.try_run_pipeline(config)?)
+            }
+        };
+        Ok(PlannedExecutionReport { plan, pipeline })
     }
 }
 
@@ -718,8 +956,62 @@ impl<T: Trace> Graph<T> {
     /// New code should prefer [`GraphBuilder`] so construction and execution
     /// are separate in the type system.
     pub fn compile(self) -> Result<CompiledGraph<T>> {
+        self.compile_with(GraphOptimizationConfig::default())
+    }
+
+    /// Validate and freeze a graph with explicit optimization policy.
+    pub fn compile_with(
+        mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> Result<CompiledGraph<T>> {
         self.validate_for_compilation()?;
-        Ok(CompiledGraph { graph: self })
+        let optimization_report = self.optimize_for_compilation(optimization);
+        self.validate_for_compilation()?;
+        Ok(CompiledGraph {
+            graph: self,
+            optimization_report,
+        })
+    }
+
+    fn optimize_for_compilation(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> GraphOptimizationReport {
+        let original_operations = self.nodes.len();
+        let opaque_barriers = self
+            .nodes
+            .iter()
+            .filter(|node| node.stage() == NodeStage::Transform && node.produced_names().is_none())
+            .count();
+        let mut passes = Vec::new();
+
+        if optimization.enabled {
+            let before = self.nodes.len();
+            self.nodes.retain(|node| !node.is_semantic_noop());
+            passes.push(GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: before - self.nodes.len(),
+            });
+        }
+
+        let terminal_projection_candidates = self
+            .pipeline_output_start()
+            .ok()
+            .map(|output_start| self.direct_projection_suffix(output_start).1.len())
+            .unwrap_or(0);
+        passes.push(GraphOptimizationPassReport {
+            pass: "terminal_projection_output_fusion",
+            changed_nodes: usize::from(terminal_projection_candidates > 0),
+        });
+
+        GraphOptimizationReport {
+            enabled: optimization.enabled,
+            original_operations,
+            optimized_operations: self.nodes.len(),
+            opaque_barriers,
+            terminal_projection_candidates,
+            passes,
+        }
     }
 
     fn validate_for_compilation(&self) -> Result<()> {
@@ -2521,6 +2813,136 @@ mod graph_api_tests {
             .run_one(Some(vec![valid_read(0)]), &NoTrace)
             .unwrap();
         assert_eq!(reads.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compilation_reports_and_removes_only_proven_noops() {
+        let mut optimized = GraphBuilder::<NoTrace>::new();
+        optimized.add(RetainOp::new(true));
+        optimized.add(TrimOp::new(std::iter::empty::<Label>()));
+        optimized.add(DeclaredOp::new());
+        let optimized = optimized.compile().unwrap();
+
+        assert_eq!(optimized.descriptors().len(), 1);
+        assert_eq!(optimized.optimization_report().original_operations, 3);
+        assert_eq!(optimized.optimization_report().optimized_operations, 1);
+        assert_eq!(
+            optimized.optimization_report().passes[0],
+            GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 2,
+            }
+        );
+
+        let mut unoptimized = GraphBuilder::<NoTrace>::new();
+        unoptimized.add(RetainOp::new(true));
+        unoptimized.add(TrimOp::new(std::iter::empty::<Label>()));
+        unoptimized.add(DeclaredOp::new());
+        let unoptimized = unoptimized
+            .compile_with(GraphOptimizationConfig { enabled: false })
+            .unwrap();
+        assert_eq!(unoptimized.descriptors().len(), 3);
+        assert_eq!(unoptimized.optimization_report().optimized_operations, 3);
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn compilation_reports_terminal_projection_candidates() {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(NullOutputOp::new());
+        let compiled = builder.compile().unwrap();
+
+        assert_eq!(
+            compiled
+                .optimization_report()
+                .terminal_projection_candidates,
+            1
+        );
+        assert_eq!(
+            compiled.optimization_report().passes[1],
+            GraphOptimizationPassReport {
+                pass: "terminal_projection_output_fusion",
+                changed_nodes: 1,
+            }
+        );
+    }
+
+    fn compiled_projected_fastq() -> CompiledGraph<NoTrace> {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        builder.compile().unwrap()
+    }
+
+    #[test]
+    fn execution_plans_are_deterministic_and_explain_decisions() {
+        let graph = compiled_projected_fastq();
+        let mut request = ExecutionRequest::new(1);
+        request.pipeline.preserve_order = true;
+
+        let first = graph.plan_execution(request).unwrap();
+        let second = graph.plan_execution(request).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.backend, ExecutionBackend::WorkerLocalPipeline);
+        assert!(first.prepared_output);
+        assert!(first.direct_output_rendering);
+        assert!(first
+            .reason_codes
+            .contains(&"ordered_output_requires_pipeline"));
+        assert!(first
+            .reason_codes
+            .contains(&"single_worker_direct_terminal_rendering"));
+
+        let report = graph.try_run_planned(request).unwrap();
+        assert_eq!(report.plan, first);
+        assert!(report.pipeline.unwrap().direct_output_rendering);
+    }
+
+    #[test]
+    fn execution_planner_preserves_conservative_default_and_forced_backends() {
+        let graph = compiled_projected_fastq();
+        let automatic = graph.plan_execution(ExecutionRequest::new(4)).unwrap();
+        assert_eq!(automatic.backend, ExecutionBackend::WholeGraph);
+        assert!(automatic
+            .reason_codes
+            .contains(&"conservative_low_overhead_whole_graph"));
+        assert!(!automatic.direct_output_rendering);
+
+        let mut dedicated = ExecutionRequest::new(4);
+        dedicated.mode = ExecutionMode::Pipeline;
+        dedicated.pipeline.input_mode = PipelineInputMode::DedicatedReader;
+        let dedicated = graph.plan_execution(dedicated).unwrap();
+        assert_eq!(dedicated.backend, ExecutionBackend::DedicatedReaderPipeline);
+        assert!(dedicated.reason_codes.contains(&"forced_pipeline"));
     }
 
     #[test]

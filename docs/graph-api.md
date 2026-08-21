@@ -33,6 +33,14 @@ The compiled graph does not expose structural mutation. Runtime statistics
 remain selectable because they are instrumentation state rather than graph
 structure.
 
+Compilation enables conservative graph optimization by default. Use
+`compile_with(GraphOptimizationConfig { enabled: false })` to construct a
+byte-level differential oracle. `CompiledGraph::optimization_report()` records
+the original and final operation counts, each pass, opaque barriers, and
+terminal projection candidates. The current structural pass removes only
+configuration-specific operations that declare themselves semantic no-ops;
+unknown and custom nodes remain barriers.
+
 ## Missing inputs
 
 Every `GraphNode` declares required labels and attributes. Select one policy
@@ -92,6 +100,25 @@ elimination, safe fusion, filter hoisting, and terminal rendering. Detailed
 record/lane/interval metadata preservation and nested-graph liveness remain a
 separate redesign, documented in
 [`metadata-liveness-redesign.md`](metadata-liveness-redesign.md).
+
+Expression constant folding uses an explicit read-dependence proof. An empty
+required-name list is not sufficient: label/attribute existence predicates
+have no required inputs but still inspect each read. Custom expression nodes
+are read-dependent unless they explicitly prove otherwise.
+
+## Execution planning
+
+`CompiledGraph::plan_execution(ExecutionRequest)` returns an `ExecutionPlan`
+without starting workers. The plan includes the selected backend, effective
+pipeline configuration, graph cost summary, prepared/direct-output decisions,
+opaque-node count, and stable reason codes. Repeated calls with the same graph
+and request are deterministic.
+
+`ExecutionMode::WholeGraph` and `ExecutionMode::Pipeline` are explicit
+benchmark controls. `ExecutionMode::Auto` requires a bounded pipeline for
+ordered output and otherwise retains the measured whole-graph default while
+the crossover matrix is collected. `try_run_planned` executes the returned
+decision and reports both the plan and any pipeline measurements.
 
 ## Direct terminal rendering
 

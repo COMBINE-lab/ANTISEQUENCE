@@ -3,6 +3,7 @@ use crate::graph::*;
 pub struct RetainOp {
     required_names: Vec<LabelOrAttr>,
     selector_expr: Expr,
+    constant_result: Option<bool>,
 }
 
 impl RetainOp {
@@ -10,10 +11,15 @@ impl RetainOp {
 
     /// Retain only the reads where the selector expression evaluates to true and discard the rest.
     pub fn new(selector_expr: impl Into<Expr>) -> Self {
-        let selector_expr = selector_expr.into();
+        let mut selector_expr = selector_expr.into();
+        let constant_result = selector_expr
+            .optimize()
+            .then(|| selector_expr.eval_bool(&Read::new()).ok())
+            .flatten();
         Self {
             required_names: selector_expr.required_names(),
             selector_expr,
+            constant_result,
         }
     }
 }
@@ -25,6 +31,10 @@ impl<T: Trace> GraphNode<T> for RetainOp {
 
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
+    }
+
+    fn is_semantic_noop(&self) -> bool {
+        self.constant_result == Some(true)
     }
 
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
