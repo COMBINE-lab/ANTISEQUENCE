@@ -148,6 +148,8 @@ pub struct InputStats {
     pub read_length_min: Vec<usize>,
     pub read_length_max: Vec<usize>,
     pub read_length_sum: Vec<usize>,
+    /// Per-lane, per-shard record counts when grouped input is used.
+    pub shard_read_counts: Vec<Vec<usize>>,
 }
 
 /// Execution stage occupied by a graph node in the bounded pipeline.

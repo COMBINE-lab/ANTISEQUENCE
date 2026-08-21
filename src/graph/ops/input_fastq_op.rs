@@ -483,6 +483,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             read_length_min,
             read_length_max,
             read_length_sum,
+            shard_read_counts: Vec::new(),
         })
     }
 }

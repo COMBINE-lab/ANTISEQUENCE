@@ -1828,6 +1828,11 @@ impl fmt::Display for StrType {
 #[derive(Debug, Clone)]
 pub enum Origin {
     File(String),
+    FastqShard {
+        file: String,
+        lane: usize,
+        shard: usize,
+    },
     Bytes,
 }
 
@@ -1835,6 +1840,14 @@ impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Origin::File(file) => write!(f, "file: \"{}\"", file),
+            Origin::FastqShard { file, lane, shard } => {
+                write!(
+                    f,
+                    "file: \"{file}\" (lane {}, shard {})",
+                    lane + 1,
+                    shard + 1
+                )
+            }
             Origin::Bytes => write!(f, "bytes"),
         }
     }

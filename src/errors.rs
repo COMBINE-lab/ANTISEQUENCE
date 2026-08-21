@@ -51,6 +51,22 @@ pub enum Error {
     #[error("Unpaired read in {0}")]
     UnpairedRead(String),
 
+    #[error("FASTQ lane {lane} has {observed} shards; expected {expected}")]
+    ShardCountMismatch {
+        lane: usize,
+        expected: usize,
+        observed: usize,
+    },
+
+    #[error(
+        "FASTQ shard {shard}, lane {lane} ended at fragment {fragment} before the other lanes"
+    )]
+    ShardRecordCountMismatch {
+        lane: usize,
+        shard: usize,
+        fragment: usize,
+    },
+
     #[error("Error parsing record {idx} in {origin}: {source}")]
     ParseRecord {
         origin: Origin,

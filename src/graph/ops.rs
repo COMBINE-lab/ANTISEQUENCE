@@ -48,6 +48,9 @@ pub use match_any_op::*;
 mod input_fastq_op;
 pub use input_fastq_op::*;
 
+mod grouped_input_fastq_op;
+pub use grouped_input_fastq_op::*;
+
 mod output_fastq_op;
 pub use output_fastq_op::*;
 
