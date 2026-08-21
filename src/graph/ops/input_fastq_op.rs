@@ -305,6 +305,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                     b.push(Read::new());
                 }
                 let curr_read = &mut b[i];
+                curr_read.reset_control_metadata();
                 let mut slot_idx = 0;
                 for j in 0..self.interleaved {
                     let Some(record) = locked_reader.next() else {
@@ -350,6 +351,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                     b.push(Read::new());
                 }
                 let curr_read = &mut b[i];
+                curr_read.reset_control_metadata();
                 let mut slot_idx = 0;
                 for (j, (locked_reader, origin)) in locked_readers.iter_mut().enumerate() {
                     let Some(record) = locked_reader.next() else {

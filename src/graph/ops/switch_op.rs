@@ -160,6 +160,25 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
         &self.required_names
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // Unmatched records pass through, while every selected arm must
+        // satisfy the same enclosing continuation.
+        let mut live = live_out.to_vec();
+        for arm in &self.arms {
+            for name in arm.graph.validate_liveness_from(live_out)? {
+                if !live.contains(&name) {
+                    live.push(name);
+                }
+            }
+        }
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        Ok(live)
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

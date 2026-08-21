@@ -2,11 +2,10 @@
 
 ## Status
 
-Deferred design work. `SwitchOp` solves the immediate need for terminal
-projection in mutually exclusive conditional-output arms by evaluating all
-routing predicates before any arm executes. This document describes the more
-general work required to make destructive operations safe in arbitrary nested
-graphs.
+Active implementation plan. `SwitchOp` remains the compatibility solution for
+conditional terminal output, but it is no longer the final liveness model.
+The implementation is staged so that every public representation introduced
+here remains valid for indexed captures and later optimizer passes.
 
 ## Current model and limitation
 
@@ -20,11 +19,12 @@ replaces all mappings for that FASTQ lane with a new wildcard mapping. Labels
 and their attributes are discarded. This is correct at the end of a graph, but
 a nested graph cannot know whether its caller still needs one of those names.
 
-Graph nodes currently declare `required_names`, but do not declare the names
-they produce, preserve, or invalidate. Availability is checked dynamically,
-and a node may be skipped when a representative read lacks a requirement.
-Consequently, graph composition cannot statically prove that a destructive
-operation is terminal relative to every enclosing continuation.
+Graph nodes declare `required_names` and, for built-in nodes, produced names,
+mutation class, rejection behavior, cost, stage, and preservation/invalidation
+effects. Recursive backward liveness validation now proves whether a
+destructive operation is terminal relative to every enclosing continuation.
+Data-dependent absence is still handled at execution time according to the
+graph's explicit missing-input policy.
 
 Control-flow attributes such as orientation are especially awkward: they
 describe the record's processing history but currently live on a sequence
@@ -41,12 +41,13 @@ not conceptually sequence-relative.
 - Produce deterministic errors at graph construction or validation rather than
   silently skipping an operation after an earlier node invalidates its input.
 
-## Proposed data model
+## Chosen data model
 
 Add optional, lazily allocated control metadata directly to `Read`, with a
-possible lane-scoped layer when metadata belongs to one FASTQ record but not an
+lane-scoped layer for metadata that belongs to one FASTQ record but not an
 interval. Keep match coordinates, substitutions, and other interval-relative
-data on mappings.
+data on mappings. `Read` pays one nullable pointer when the feature is unused;
+no metadata map or heap allocation is created on the ordinary path.
 
 Candidate ownership levels are:
 
@@ -54,22 +55,27 @@ Candidate ownership levels are:
 2. **lane metadata**: orientation or parsing state for `seq1`, `seq2`, etc.;
 3. **interval metadata**: match distance, ambiguity, and pattern-specific data.
 
-The common case must not allocate. Small metadata should continue to use inline
-storage before falling back to a hash table. The migration must define whether
-existing expressions such as `seq1.*.ori` alias lane metadata temporarily or
-require an explicit new namespace.
+Small record and lane maps use the same inline-first representation as mapping
+attributes before promoting to an `FxHashMap`. Orientation and internal batch
+identity move to lane and record metadata, respectively. During one compatibility
+cycle, an existing expression such as `seq1.*.ori` falls back to lane metadata
+when the wildcard mapping has no such interval attribute. New Rust APIs name
+record and lane metadata explicitly; EFGDL gains an explicit namespace only
+after the compatibility behavior has shipped and been measured.
 
-## Proposed graph contract
+## Chosen graph contract
 
-Extend `GraphNode` introspection beyond `required_names` with effects such as:
+`GraphNode` introspection now extends beyond `required_names` with:
 
 - `produced_names`;
-- `preserved_names` or a conservative preservation policy;
-- `invalidated_names` / invalidated lanes;
-- `is_terminal_for(lane)` for operations such as projection;
+- an allocation-free preservation/invalidation effect: preserve all, invalidate
+  explicit names, invalidate one lane, invalidate all interval state, or opaque;
+- explicit production of the replacement wildcard mapping by `ProjectOp`;
+- record and lane control metadata that are not invalidated by interval
+  projection;
 - cardinality and ordering effects where nested control flow needs them.
 
-A graph validator can then compute live names backwards through a graph and
+The graph validator computes live names backwards through a graph and
 through every nested arm. It should reject a node that invalidates something in
 its live-out set. A terminal projection becomes legal inside a nested branch
 when the branch and all enclosing continuations have no live dependency on the
@@ -79,6 +85,12 @@ This contract should also replace representative-first-read dependency checks
 where read-level availability may differ within one batch. Static validation
 handles configuration errors; genuinely data-dependent absence must be routed
 per read by an explicit conditional/try operation.
+
+Nested nodes participate through a virtual liveness-transfer hook rather than
+exposing their private graph representation. `TryOp`, `SwitchOp`, and
+`TryOrientationOp` validate every arm against the enclosing live-out set and
+return the union of their live-in sets. Unknown custom nodes remain optimizer
+barriers; they are not silently assumed to preserve or invalidate names.
 
 ## Delivery stages
 
@@ -107,13 +119,24 @@ per read by an explicit conditional/try operation.
 - Benchmarks showing no regression when metadata is unused and bounded overhead
   when small control metadata is present.
 
-## Decisions intentionally left open
+## Indexed captures
 
-- The public expression syntax for record and lane metadata.
-- Whether compatibility aliases are resolved at parse time or evaluation time.
-- Whether effect sets use concrete names, lane wildcards, or a compact bitset
-  assigned during graph construction.
-- How user-defined graph nodes declare effects without making the trait onerous.
+Statically bounded indexed captures do not need a temporary runtime collection
+representation. The seqproc compiler assigns every public `(capture, occurrence)`
+pair a short, unique physical interval label after bounded layout normalization.
+ANTISEQUENCE and the liveness analysis see ordinary physical labels, while
+output expressions resolve public one-based indexed references through the
+compiler registry. This lowering is unchanged by the control-metadata redesign.
 
-These decisions should be resolved with prototype measurements before changing
-the stable public API.
+The first implementation therefore supports fixed cardinality only. Every
+alternative must expose the same occurrence count, unindexed use of a repeated
+capture is an error, and dynamically sized collections remain future work.
+
+## Deferred surface decisions
+
+- The final EFGDL spelling for explicit record/lane metadata. The Rust API and
+  compatibility alias land first so syntax is not frozen before measurement.
+- Whether liveness sets should later be compiled to dense bitsets. The initial
+  concrete-name representation is easier to audit and is off the per-read path.
+- A derive/helper API for custom nodes. Until then, custom nodes default to an
+  opaque optimizer barrier and may opt into explicit effects manually.

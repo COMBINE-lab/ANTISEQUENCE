@@ -224,6 +224,20 @@ pub enum RejectionBehavior {
     MayReject,
 }
 
+/// Interval-name state invalidated by an operation.
+///
+/// Record and lane control metadata are intentionally outside this interval
+/// namespace and survive sequence projection. `Opaque` is an optimizer
+/// barrier but does not invent a destructive effect for legacy custom nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationEffect<'a> {
+    PreserveAll,
+    Names(&'a [LabelOrAttr]),
+    Lane(StrType),
+    AllIntervals,
+    Opaque,
+}
+
 /// Static, allocation-free description of a graph operation.
 ///
 /// Descriptors are intentionally conservative: custom operations inherit
@@ -236,6 +250,7 @@ pub struct OperationDescriptor<'a> {
     /// Known produced names, or `None` when a custom operation has not
     /// declared this effect. `Some(&[])` explicitly means no names are added.
     pub produced: Option<&'a [LabelOrAttr]>,
+    pub invalidation: InvalidationEffect<'a>,
     pub mutation: MutationKind,
     pub rejection: RejectionBehavior,
     pub cost: CostClass,
@@ -574,6 +589,25 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         None
     }
 
+    /// Interval names invalidated by this node. Built-in nodes that declare
+    /// their produced-name set preserve all other names by default. An
+    /// undeclared custom node remains an optimizer barrier.
+    #[inline]
+    fn invalidation_effect(&self) -> InvalidationEffect<'_> {
+        if self.produced_names().is_some() {
+            InvalidationEffect::PreserveAll
+        } else {
+            InvalidationEffect::Opaque
+        }
+    }
+
+    /// Backward liveness transfer for this node. Nested control-flow nodes
+    /// override this hook and recursively validate their private graphs.
+    #[inline]
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        transfer_liveness(self.descriptor(), live_out)
+    }
+
     /// Strongest mutation this operation may perform.
     #[inline]
     fn mutation_kind(&self) -> MutationKind {
@@ -617,6 +651,7 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
             name: self.name(),
             requirements: self.required_names(),
             produced: self.produced_names(),
+            invalidation: self.invalidation_effect(),
             mutation: self.mutation_kind(),
             rejection: self.rejection_behavior(),
             cost: self.cost_class(),
@@ -768,6 +803,50 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     fn failed_reads(&self) -> Option<usize> {
         None
     }
+}
+
+fn push_unique(names: &mut Vec<LabelOrAttr>, name: LabelOrAttr) {
+    if !names.contains(&name) {
+        names.push(name);
+    }
+}
+
+fn transfer_liveness(
+    descriptor: OperationDescriptor<'_>,
+    live_out: &[LabelOrAttr],
+) -> Result<Vec<LabelOrAttr>> {
+    let produced = descriptor.produced.unwrap_or(&[]);
+    let mut live_across = live_out
+        .iter()
+        .filter(|name| !produced.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let invalidated = match descriptor.invalidation {
+        InvalidationEffect::PreserveAll | InvalidationEffect::Opaque => Vec::new(),
+        InvalidationEffect::Names(names) => live_across
+            .iter()
+            .filter(|name| names.contains(name))
+            .cloned()
+            .collect(),
+        InvalidationEffect::Lane(lane) => live_across
+            .iter()
+            .filter(|name| name.str_type() == lane)
+            .cloned()
+            .collect(),
+        InvalidationEffect::AllIntervals => live_across.clone(),
+    };
+    if !invalidated.is_empty() {
+        return Err(Error::InvalidGraph(format!(
+            "operation {} invalidates names still required by its continuation: {:?}",
+            descriptor.name, invalidated
+        )));
+    }
+
+    for requirement in descriptor.requirements {
+        push_unique(&mut live_across, requirement.clone());
+    }
+    Ok(live_across)
 }
 
 impl<T: Trace> Default for Graph<T> {
@@ -1007,7 +1086,10 @@ impl<T: Trace> Graph<T> {
         let opaque_barriers = self
             .nodes
             .iter()
-            .filter(|node| node.stage() == NodeStage::Transform && node.produced_names().is_none())
+            .filter(|node| {
+                node.stage() == NodeStage::Transform
+                    && node.invalidation_effect() == InvalidationEffect::Opaque
+            })
             .count();
         let mut passes = Vec::new();
 
@@ -1084,7 +1166,19 @@ impl<T: Trace> Graph<T> {
             previous_stage = descriptor.stage;
         }
 
+        self.validate_liveness_from(&[])?;
+
         Ok(())
+    }
+
+    /// Validate backward name liveness against an enclosing continuation and
+    /// return the names required at this graph's entry.
+    pub fn validate_liveness_from(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        let mut live = live_out.to_vec();
+        for node in self.nodes.iter().rev() {
+            live = node.liveness_transfer(&live)?;
+        }
+        Ok(live)
     }
 
     /// Add a read operation node to the graph and return the node.
@@ -2807,10 +2901,73 @@ mod graph_api_tests {
         assert_eq!(descriptor.name, "DeclaredOp");
         assert_eq!(descriptor.requirements.len(), 1);
         assert_eq!(descriptor.produced.unwrap().len(), 1);
+        assert_eq!(descriptor.invalidation, InvalidationEffect::PreserveAll);
         assert_eq!(descriptor.mutation, MutationKind::Metadata);
         assert_eq!(descriptor.rejection, RejectionBehavior::Never);
         assert_eq!(descriptor.cost, CostClass::Constant);
         assert_eq!(descriptor.stage, NodeStage::Transform);
+    }
+
+    #[test]
+    fn liveness_allows_terminal_projection_but_rejects_live_invalidated_labels() {
+        let wildcard = Label::new(b"seq1.*").unwrap();
+        let old = Label::new(b"seq1.old").unwrap();
+
+        let mut safe = GraphBuilder::<NoTrace>::new();
+        safe.add(ProjectOp::new([old.clone()]));
+        safe.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        assert!(safe.compile().is_ok());
+
+        let mut unsafe_graph = GraphBuilder::<NoTrace>::new();
+        unsafe_graph.add(ProjectOp::new([old.clone()]));
+        unsafe_graph.add(SetOp::new(old.clone(), Expr::from(old.clone())));
+        let error = unsafe_graph.compile().err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("invalidates names still required"));
+        assert!(error.to_string().contains("old"));
+
+        let projection = ProjectOp::new([old]);
+        assert_eq!(
+            <ProjectOp as GraphNode<NoTrace>>::invalidation_effect(&projection),
+            InvalidationEffect::Lane(StrType::Seq(1))
+        );
+        assert_eq!(
+            <ProjectOp as GraphNode<NoTrace>>::produced_names(&projection).unwrap(),
+            &[LabelOrAttr::Label(wildcard)]
+        );
+    }
+
+    #[test]
+    fn recursive_liveness_rejects_unsafe_projection_in_try_and_loop_graphs() {
+        let old = Label::new(b"seq1.old").unwrap();
+
+        let mut try_arm = Graph::<NoTrace>::new();
+        try_arm.add(ProjectOp::new([old.clone()]));
+        let catch_arm = Graph::<NoTrace>::new();
+        let mut enclosing_try = GraphBuilder::<NoTrace>::new();
+        enclosing_try.add(TryOp::new(try_arm, catch_arm).return_catch_output());
+        enclosing_try.add(SetOp::new(old.clone(), Expr::from(old.clone())));
+        assert!(enclosing_try
+            .compile()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalidates names still required"));
+
+        let mut loop_body = Graph::<NoTrace>::new();
+        loop_body.add(ProjectOp::new([old.clone()]));
+        let mut enclosing_loop = GraphBuilder::<NoTrace>::new();
+        enclosing_loop.add(WhileOp::new(
+            Expr::from(old.clone()).len().gt(0isize),
+            loop_body,
+        ));
+        assert!(enclosing_loop
+            .compile()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalidates names still required"));
     }
 
     #[test]

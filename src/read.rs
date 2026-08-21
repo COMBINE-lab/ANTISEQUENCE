@@ -34,7 +34,7 @@ pub enum ReadProjectionPart<'a> {
 /// Each Read contains multiple different strings of different types.
 ///
 /// Uses 1-indexed conventions, like Name(1) and Seq(1), to follow fastq file naming conventions.
-#[derive(Debug, Clone, Copy, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrType {
     Name(u8),
     Seq(u8),
@@ -47,6 +47,43 @@ pub enum StrType {
 #[derive(Debug, Clone)]
 pub struct Read {
     str_mappings: Vec<(StrType, StrMappings)>,
+    /// Control state is separate from interval mappings so destructive
+    /// sequence projection cannot erase routing decisions. The box is absent
+    /// for ordinary reads and therefore performs no allocation unless control
+    /// metadata is used.
+    control: Option<Box<ControlMetadata>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ControlMetadata {
+    record: SmallAttrMap,
+    lanes: SmallVec<[(u8, SmallAttrMap); 2]>,
+}
+
+impl ControlMetadata {
+    fn clear(&mut self) {
+        self.record.clear();
+        for (_, metadata) in &mut self.lanes {
+            metadata.clear();
+        }
+        self.lanes.clear();
+    }
+
+    #[inline(always)]
+    fn lane(&self, lane: u8) -> Option<&SmallAttrMap> {
+        self.lanes
+            .iter()
+            .find_map(|(index, metadata)| (*index == lane).then_some(metadata))
+    }
+
+    #[inline(always)]
+    fn lane_mut(&mut self, lane: u8) -> &mut SmallAttrMap {
+        if let Some(index) = self.lanes.iter().position(|(index, _)| *index == lane) {
+            return &mut self.lanes[index].1;
+        }
+        self.lanes.push((lane, SmallAttrMap::default()));
+        &mut self.lanes.last_mut().expect("lane was inserted").1
+    }
 }
 
 /// A string and its correspondings mappings.
@@ -1024,12 +1061,86 @@ impl Read {
     pub fn new() -> Self {
         Self {
             str_mappings: Vec::with_capacity(4),
+            control: None,
         }
     }
 
     #[inline(always)]
     pub fn clear(&mut self) {
         self.str_mappings.clear();
+        self.control = None;
+    }
+
+    /// Whether this read has ever allocated record/lane control metadata.
+    #[inline(always)]
+    pub fn has_control_metadata(&self) -> bool {
+        self.control.is_some()
+    }
+
+    /// Read record-scoped control metadata.
+    #[inline(always)]
+    pub fn record_data(&self, attr: InlineString) -> Option<&Data> {
+        self.control
+            .as_deref()
+            .and_then(|metadata| metadata.record.get(&attr))
+    }
+
+    /// Create or update record-scoped control metadata lazily.
+    #[inline(always)]
+    pub fn record_data_mut(&mut self, attr: InlineString) -> &mut Data {
+        self.control
+            .get_or_insert_with(|| Box::new(ControlMetadata::default()))
+            .record
+            .get_or_insert_default(attr)
+    }
+
+    /// Remove one record-scoped control value.
+    pub fn remove_record_data(&mut self, attr: &InlineString) {
+        if let Some(metadata) = self.control.as_deref_mut() {
+            metadata.record.remove(attr);
+        }
+    }
+
+    /// Read metadata associated with one FASTQ lane, independent of its
+    /// current name/sequence mappings.
+    #[inline(always)]
+    pub fn lane_data(&self, lane: u8, attr: InlineString) -> Option<&Data> {
+        self.control
+            .as_deref()
+            .and_then(|metadata| metadata.lane(lane))
+            .and_then(|metadata| metadata.get(&attr))
+    }
+
+    /// Create or update one lane-scoped control value lazily.
+    #[inline(always)]
+    pub fn lane_data_mut(&mut self, lane: u8, attr: InlineString) -> &mut Data {
+        self.control
+            .get_or_insert_with(|| Box::new(ControlMetadata::default()))
+            .lane_mut(lane)
+            .get_or_insert_default(attr)
+    }
+
+    /// Remove one lane-scoped control value.
+    pub fn remove_lane_data(&mut self, lane: u8, attr: &InlineString) {
+        if let Some(metadata) = self.control.as_deref_mut() {
+            if let Some(lane) = metadata
+                .lanes
+                .iter_mut()
+                .find_map(|(index, metadata)| (*index == lane).then_some(metadata))
+            {
+                lane.remove(attr);
+            }
+        }
+    }
+
+    /// Reset control state when a recycled `Read` receives a new input
+    /// record. Retain an existing allocation for protocols that use metadata
+    /// on every record.
+    #[inline(always)]
+    pub(crate) fn reset_control_metadata(&mut self) {
+        if let Some(metadata) = self.control.as_deref_mut() {
+            metadata.clear();
+        }
     }
 
     #[inline(always)]
@@ -1047,6 +1158,14 @@ impl Read {
                 crate::expr::LabelOrAttr::Attr(a) => {
                     if let Some(s) = self.str_mappings(a.str_type) {
                         if s.data(a.label, a.attr).is_some() {
+                            continue;
+                        }
+                    }
+                    if a.label == InlineString::new(b"*") {
+                        let lane = match a.str_type {
+                            StrType::Name(index) | StrType::Seq(index) => index,
+                        };
+                        if self.lane_data(lane, a.attr).is_some() {
                             continue;
                         }
                     }
@@ -1307,12 +1426,22 @@ impl Read {
         label: InlineString,
         attr: InlineString,
     ) -> Result<&Data, NameError> {
-        self.str_mappings(str_type)
-            .ok_or(NameError::NotInRead(Name::StrType(str_type)))?
-            .mapping(label)
-            .ok_or(NameError::NotInRead(Name::Label(label)))?
-            .data(attr)
-            .ok_or(NameError::NotInRead(Name::Attr(attr)))
+        if let Some(value) = self
+            .str_mappings(str_type)
+            .and_then(|mappings| mappings.mapping(label))
+            .and_then(|mapping| mapping.data(attr))
+        {
+            return Ok(value);
+        }
+        if label == InlineString::new(b"*") {
+            let lane = match str_type {
+                StrType::Name(index) | StrType::Seq(index) => index,
+            };
+            if let Some(value) = self.lane_data(lane, attr) {
+                return Ok(value);
+            }
+        }
+        Err(NameError::NotInRead(Name::Attr(attr)))
     }
 
     pub fn data_mut(
@@ -1334,6 +1463,12 @@ impl Read {
             if let Some(m) = sm.mapping_mut(label) {
                 m.remove_data(attr);
             }
+        }
+        if label == InlineString::new(b"*") {
+            let lane = match str_type {
+                StrType::Name(index) | StrType::Seq(index) => index,
+            };
+            self.remove_lane_data(lane, attr);
         }
     }
 
@@ -1784,6 +1919,62 @@ mod read_tests {
 
     fn test_origin() -> Arc<Origin> {
         Arc::new(Origin::File("test.fastq".to_string()))
+    }
+
+    #[test]
+    fn control_metadata_is_lazy_and_scoped_independently() {
+        let mut read = Read::new();
+        assert!(!read.has_control_metadata());
+        *read.record_data_mut(InlineString::new(b"fragment")) = Data::Int(7);
+        *read.lane_data_mut(1, InlineString::new(b"ori")) =
+            Data::InlineBytes(InlineString::new(b"fw"));
+        assert!(read.has_control_metadata());
+        assert_eq!(
+            read.record_data(InlineString::new(b"fragment")),
+            Some(&Data::Int(7))
+        );
+        assert_eq!(
+            read.lane_data(1, InlineString::new(b"ori")),
+            Some(&Data::InlineBytes(InlineString::new(b"fw")))
+        );
+        assert!(read.lane_data(2, InlineString::new(b"ori")).is_none());
+    }
+
+    #[test]
+    fn lane_metadata_compatibility_alias_survives_projection() {
+        let mut read = Read::new();
+        read.add_fastq(1, b"read1", b"ACGT", b"IIII", test_origin(), 0);
+        let wildcard = InlineString::new(b"*");
+        let orientation = InlineString::new(b"ori");
+        *read.lane_data_mut(1, orientation) = Data::InlineBytes(InlineString::new(b"rc"));
+        read.project_whole(StrType::Seq(1), &[wildcard]).unwrap();
+
+        assert_eq!(
+            read.data(StrType::Seq(1), wildcard, orientation).unwrap(),
+            &Data::InlineBytes(InlineString::new(b"rc"))
+        );
+        assert!(
+            read.has_names(&[crate::expr::LabelOrAttr::Attr(crate::expr::Attr {
+                str_type: StrType::Seq(1),
+                label: wildcard,
+                attr: orientation,
+            })])
+        );
+    }
+
+    #[test]
+    fn recycled_input_reset_clears_control_values_without_allocating_a_new_box() {
+        let mut read = Read::new();
+        *read.record_data_mut(InlineString::new(b"batch")) = Data::Int(9);
+        *read.lane_data_mut(1, InlineString::new(b"ori")) = Data::Bool(true);
+        let allocation = read.control.as_deref().map(std::ptr::from_ref).unwrap();
+        read.reset_control_metadata();
+        assert!(read.record_data(InlineString::new(b"batch")).is_none());
+        assert!(read.lane_data(1, InlineString::new(b"ori")).is_none());
+        assert_eq!(
+            read.control.as_deref().map(std::ptr::from_ref).unwrap(),
+            allocation
+        );
     }
 
     #[test]

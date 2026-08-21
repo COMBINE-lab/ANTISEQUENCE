@@ -92,6 +92,23 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
         &self.required_names
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // Non-selected records pass through untouched; selected records must
+        // emerge with the enclosing live-out names available.
+        let mut live = live_out.to_vec();
+        for name in self.graph.validate_liveness_from(live_out)? {
+            if !live.contains(&name) {
+                live.push(name);
+            }
+        }
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        Ok(live)
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

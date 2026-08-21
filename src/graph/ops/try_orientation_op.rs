@@ -35,10 +35,11 @@ pub struct TryOrientationOp<T: Trace = NoTrace> {
     inner: Graph<T>,
     /// Which read's sequence to reverse-complement on retry (e.g., 1 for seq1).
     read_idx: u8,
-    /// Attribute name to store the orientation result (e.g., "ori").
+    /// Lane-metadata name to store the orientation result (e.g., "ori").
     attr_name: InlineString,
-    /// Temporary attribute name for batch-index tracking.
+    /// Temporary record-metadata name for batch-index tracking.
     batch_idx_attr: InlineString,
+    required_names: [LabelOrAttr; 1],
 }
 
 impl<T: Trace> TryOrientationOp<T> {
@@ -47,15 +48,19 @@ impl<T: Trace> TryOrientationOp<T> {
     /// Try running the inner graph on each read. If a read is dropped (match
     /// failure), reverse-complement `seq{read_idx}` and retry.
     ///
-    /// The orientation that succeeded is stored as `Data::Bytes` (`b"fw"` or
-    /// `b"rc"`) in the attribute `attr_name` on the wildcard mapping of
-    /// `seq{read_idx}`.
+    /// The orientation that succeeded is stored as lane metadata containing
+    /// `Data::Bytes` (`b"fw"` or `b"rc"`). During the compatibility cycle,
+    /// reads through `seq{read_idx}.*.{attr_name}` fall back to this value.
     pub fn new(inner: Graph<T>, read_idx: u8, attr_name: impl AsRef<[u8]>) -> Self {
         Self {
             inner,
             read_idx,
             attr_name: InlineString::new(attr_name.as_ref()),
             batch_idx_attr: InlineString::new(b"_batch_idx"),
+            required_names: [LabelOrAttr::Label(Label {
+                str_type: StrType::Seq(read_idx),
+                label: InlineString::new(b"*"),
+            })],
         }
     }
 }
@@ -68,15 +73,12 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         };
 
         let seq_type = StrType::Seq(self.read_idx);
-        let wildcard = InlineString::new(b"*");
         let n = reads.len();
 
         // Step 1: Tag each read with a batch index and clone the batch.
         let mut tagged = reads;
         for (i, read) in tagged.iter_mut().enumerate() {
-            *read
-                .data_mut(seq_type, wildcard, self.batch_idx_attr)
-                .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) = Data::Int(i as isize);
+            *read.record_data_mut(self.batch_idx_attr) = Data::Int(i as isize);
         }
         let mut clones = Vec::with_capacity(tagged.len());
         tagged = tagged
@@ -102,7 +104,7 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         // Collect surviving batch indices from forward pass.
         let mut fw_survived = vec![false; n];
         for read in &fw_survivors {
-            if let Ok(data) = read.data(seq_type, wildcard, self.batch_idx_attr) {
+            if let Some(data) = read.record_data(self.batch_idx_attr) {
                 if let Ok(idx) = data.as_int() {
                     let idx = idx as usize;
                     if idx < n {
@@ -150,28 +152,24 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
 
         for mut read in fw_survivors {
             let idx = read
-                .data(seq_type, wildcard, self.batch_idx_attr)
+                .record_data(self.batch_idx_attr)
                 .expect("_batch_idx must be set on all reads by Step 1")
                 .as_int()
                 .expect("_batch_idx must be an Int") as usize;
 
-            *read
-                .data_mut(seq_type, wildcard, self.attr_name)
-                .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) = fw_val.clone();
+            *read.lane_data_mut(self.read_idx, self.attr_name) = fw_val.clone();
 
             all_survivors.push((idx, read));
         }
 
         for mut read in rc_survivors {
             let idx = read
-                .data(seq_type, wildcard, self.batch_idx_attr)
+                .record_data(self.batch_idx_attr)
                 .expect("_batch_idx must be set on all reads by Step 1")
                 .as_int()
                 .expect("_batch_idx must be an Int") as usize;
 
-            *read
-                .data_mut(seq_type, wildcard, self.attr_name)
-                .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) = rc_val.clone();
+            *read.lane_data_mut(self.read_idx, self.attr_name) = rc_val.clone();
 
             all_survivors.push((idx, read));
         }
@@ -183,7 +181,7 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         let final_reads: Vec<Read> = all_survivors
             .into_iter()
             .map(|(_, mut r)| {
-                r.remove_data(seq_type, wildcard, &self.batch_idx_attr);
+                r.remove_record_data(&self.batch_idx_attr);
                 r
             })
             .collect();
@@ -199,7 +197,17 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
     }
 
     fn required_names(&self) -> &[LabelOrAttr] {
-        &[]
+        &self.required_names
+    }
+
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        let mut live = self.inner.validate_liveness_from(live_out)?;
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        Ok(live)
     }
 
     fn name(&self) -> &'static str {

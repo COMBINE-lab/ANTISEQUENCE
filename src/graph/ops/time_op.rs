@@ -44,6 +44,10 @@ impl<T: Trace> GraphNode<T> for TimeOp<T> {
         &[]
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        self.graph.validate_liveness_from(live_out)
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

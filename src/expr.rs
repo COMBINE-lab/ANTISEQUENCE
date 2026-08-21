@@ -9,20 +9,20 @@ use crate::inline_string::*;
 use crate::parse_utils::*;
 use crate::read::*;
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Label {
     pub str_type: StrType,
     pub label: InlineString,
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Attr {
     pub str_type: StrType,
     pub label: InlineString,
     pub attr: InlineString,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LabelOrAttr {
     Label(Label),
     Attr(Attr),

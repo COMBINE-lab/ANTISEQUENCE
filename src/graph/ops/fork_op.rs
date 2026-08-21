@@ -37,6 +37,18 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
         &[]
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // The branch is side-effect-only and the original record continues.
+        // Its live-in requirements still apply to the cloned input.
+        let mut live = live_out.to_vec();
+        for name in self.graph.validate_liveness_from(&[])? {
+            if !live.contains(&name) {
+                live.push(name);
+            }
+        }
+        Ok(live)
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

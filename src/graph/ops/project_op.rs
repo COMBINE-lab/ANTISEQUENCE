@@ -27,6 +27,7 @@ impl ProjectPart {
 /// of a transform graph immediately before output.
 pub struct ProjectOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: [LabelOrAttr; 1],
     str_type: StrType,
     parts: Vec<ProjectPart>,
 }
@@ -85,6 +86,10 @@ impl ProjectOp {
             .collect();
         Ok(Self {
             required_names,
+            produced_names: [LabelOrAttr::Label(Label {
+                str_type,
+                label: crate::inline_string::InlineString::new(b"*"),
+            })],
             str_type,
             parts,
         })
@@ -100,7 +105,11 @@ impl<T: Trace> GraphNode<T> for ProjectOp {
     }
 
     fn produced_names(&self) -> Option<&[LabelOrAttr]> {
-        Some(&[])
+        Some(&self.produced_names)
+    }
+
+    fn invalidation_effect(&self) -> InvalidationEffect<'_> {
+        InvalidationEffect::Lane(self.str_type)
     }
 
     fn mutation_kind(&self) -> MutationKind {

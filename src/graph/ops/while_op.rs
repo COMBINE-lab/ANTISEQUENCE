@@ -85,6 +85,29 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
         &self.required_names
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // A loop body's output feeds both the next condition evaluation and
+        // the eventual continuation. Iterate to the finite name-set fixed
+        // point so nested loops are checked recursively.
+        let mut live = live_out.to_vec();
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        loop {
+            let before = live.len();
+            for name in self.graph.validate_liveness_from(&live)? {
+                if !live.contains(&name) {
+                    live.push(name);
+                }
+            }
+            if live.len() == before {
+                return Ok(live);
+            }
+        }
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

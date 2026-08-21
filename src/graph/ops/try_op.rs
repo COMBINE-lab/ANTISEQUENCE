@@ -93,6 +93,21 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
         &[]
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        let mut live = self.try_graph.validate_liveness_from(live_out)?;
+        let catch_live = if self.return_catch_output {
+            self.catch_graph.validate_liveness_from(live_out)?
+        } else {
+            self.catch_graph.validate_liveness_from(&[])?
+        };
+        for name in catch_live {
+            if !live.contains(&name) {
+                live.push(name);
+            }
+        }
+        Ok(live)
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }
