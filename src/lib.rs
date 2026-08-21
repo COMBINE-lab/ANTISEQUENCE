@@ -1054,7 +1054,7 @@ mod pipeline_tests {
         g.add(InputFastqOp::from_reader(Cursor::new(malformed)).unwrap());
 
         let error = g.try_run_with_threads(2).unwrap_err();
-        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("parsing record"));
     }
 
@@ -1093,7 +1093,7 @@ mod pipeline_tests {
         g.add(OutputFastqOp::from_writer(FailingWriter));
 
         let error = g.try_run_with_threads(2).unwrap_err();
-        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("intentional write failure"));
     }
 
@@ -1105,7 +1105,7 @@ mod pipeline_tests {
         graph.add(OutputFastqOp::from_writer(BrokenPipeWriter));
 
         let error = graph.try_run_with_threads(2).unwrap_err();
-        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("downstream reader closed"));
     }
 

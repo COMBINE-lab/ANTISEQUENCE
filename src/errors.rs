@@ -15,6 +15,9 @@ pub enum Error {
     #[error("Graph execution failed in a worker: {0}")]
     GraphExecution(String),
 
+    #[error("Graph execution failed in one or more worker threads: {summary}")]
+    WorkerFailures { summary: String, errors: Vec<Error> },
+
     #[error("Invalid graph: {0}")]
     InvalidGraph(String),
 

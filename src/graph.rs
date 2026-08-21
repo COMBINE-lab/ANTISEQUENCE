@@ -1427,7 +1427,7 @@ impl<T: Trace> Graph<T> {
         }
 
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         thread::scope(|s| {
             let mut handles = Vec::with_capacity(threads);
             for _ in 0..threads {
@@ -1436,7 +1436,7 @@ impl<T: Trace> Graph<T> {
                         self.run_trace_inner_until_cancelled(trace, Some(&cancelled))
                     {
                         cancelled.store(true, Ordering::Relaxed);
-                        failures.lock().unwrap().push(error.to_string());
+                        failures.lock().unwrap().push(error);
                     }
                 }));
             }
@@ -1449,7 +1449,10 @@ impl<T: Trace> Graph<T> {
                         .map(|value| (*value).to_owned())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "worker panicked with a non-string payload".to_owned());
-                    failures.lock().unwrap().push(message);
+                    failures
+                        .lock()
+                        .unwrap()
+                        .push(Error::GraphExecution(message));
                 }
             }
         });
@@ -1458,7 +1461,7 @@ impl<T: Trace> Graph<T> {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(Error::GraphExecution(failures.join("; ")))
+            Err(aggregate_failures(failures))
         }
     }
 
@@ -1498,7 +1501,7 @@ impl<T: Trace> Graph<T> {
         self.nodes[0].set_batch_size(config.batch_size);
 
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -1585,9 +1588,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -1598,12 +1601,7 @@ impl<T: Trace> Graph<T> {
                         if let Err(error) =
                             self.pipeline_write(output_start, trace, reads, &recycle_sender)
                         {
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         } else {
                             written_batches += 1;
                         }
@@ -1621,12 +1619,7 @@ impl<T: Trace> Graph<T> {
                     if let Err(error) =
                         self.pipeline_write(output_start, trace, completed.reads, &recycle_sender)
                     {
-                        push_failure(
-                            &failures,
-                            format!("writer failed: {error}"),
-                            &cancelled,
-                            &window,
-                        );
+                        push_failure(&failures, error, &cancelled, &window);
                     } else {
                         written_batches += 1;
                     }
@@ -1642,7 +1635,7 @@ impl<T: Trace> Graph<T> {
             if reader_handle.join().is_err() {
                 push_failure(
                     &failures,
-                    "reader panicked outside the pipeline guard".to_owned(),
+                    Error::GraphExecution("reader panicked outside the pipeline guard".to_owned()),
                     &cancelled,
                     &window,
                 );
@@ -1651,7 +1644,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -1663,7 +1658,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
 
         Ok(PipelineReport {
@@ -1715,7 +1710,7 @@ impl<T: Trace> Graph<T> {
         let direct_output_rendering = !direct_projections.is_empty();
         self.nodes[0].set_batch_size(config.batch_size);
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -1854,9 +1849,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -1873,12 +1868,7 @@ impl<T: Trace> Graph<T> {
                                 written_batches += 1;
                             }
                             Err(error) => {
-                                push_failure(
-                                    &failures,
-                                    format!("writer failed: {error}"),
-                                    &cancelled,
-                                    &window,
-                                );
+                                push_failure(&failures, error, &cancelled, &window);
                             }
                         }
                         window.release();
@@ -1901,12 +1891,7 @@ impl<T: Trace> Graph<T> {
                             written_batches += 1;
                         }
                         Err(error) => {
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         }
                     }
                     window.release();
@@ -1921,7 +1906,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -1933,7 +1920,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
         Ok(PipelineReport {
             input_batches: input_batches.load(Ordering::Relaxed),
@@ -1957,7 +1944,7 @@ impl<T: Trace> Graph<T> {
         let output_start = self.pipeline_output_start()?;
         self.nodes[0].set_batch_size(config.batch_size);
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -2066,9 +2053,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -2088,12 +2075,7 @@ impl<T: Trace> Graph<T> {
                             }
                             Err(error) => {
                                 let _ = completed.recycle_sender.send(None);
-                                push_failure(
-                                    &failures,
-                                    format!("writer failed: {error}"),
-                                    &cancelled,
-                                    &window,
-                                );
+                                push_failure(&failures, error, &cancelled, &window);
                             }
                         }
                         window.release();
@@ -2118,12 +2100,7 @@ impl<T: Trace> Graph<T> {
                         }
                         Err(error) => {
                             let _ = completed.recycle_sender.send(None);
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         }
                     }
                     window.release();
@@ -2138,7 +2115,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -2150,7 +2129,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
         Ok(PipelineReport {
             input_batches: input_batches.load(Ordering::Relaxed),
@@ -2543,9 +2522,18 @@ impl<T: Trace> Graph<T> {
     }
 }
 
+fn aggregate_failures(errors: Vec<Error>) -> Error {
+    let summary = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::WorkerFailures { summary, errors }
+}
+
 fn push_failure(
-    failures: &Mutex<Vec<String>>,
-    message: String,
+    failures: &Mutex<Vec<Error>>,
+    error: Error,
     cancelled: &AtomicBool,
     window: &InFlightWindow,
 ) {
@@ -2554,24 +2542,19 @@ fn push_failure(
     failures
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .push(message);
+        .push(error);
 }
 
 fn record_thread_result(
     result: std::thread::Result<Result<()>>,
     cancelled: &AtomicBool,
     window: &InFlightWindow,
-    failures: &Mutex<Vec<String>>,
+    failures: &Mutex<Vec<Error>>,
     role: &str,
 ) {
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => push_failure(
-            failures,
-            format!("{role} failed: {error}"),
-            cancelled,
-            window,
-        ),
+        Ok(Err(error)) => push_failure(failures, error, cancelled, window),
         Err(payload) => {
             let message = payload
                 .downcast_ref::<&str>()
@@ -2580,7 +2563,7 @@ fn record_thread_result(
                 .unwrap_or_else(|| "non-string panic payload".to_owned());
             push_failure(
                 failures,
-                format!("{role} panicked: {message}"),
+                Error::GraphExecution(format!("{role} panicked: {message}")),
                 cancelled,
                 window,
             );
