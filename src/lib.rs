@@ -491,6 +491,81 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn position_quality_selects_the_low_quality_mismatch_window() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNACGA", "IIIIIIIIIII!")]);
+        let patterns = Patterns::from_strs(["ACGT"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(
+            MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                HammingSearch(Count(3)),
+            )
+            .retain_label_present("seq1.anchor"),
+        );
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(label("seq1.left"))],
+        ));
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        assert_eq!(
+            output_bytes.lock().unwrap().as_slice(),
+            b"@read1\nTCGTNNNN\n+\nIIIIIIII\n"
+        );
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.position_total, 1);
+        assert_eq!(report.ambiguity.position_resolved_quality, 1);
+        assert_eq!(report.ambiguity.position_dropped, 0);
+    }
+
+    #[test]
+    fn position_quality_drops_a_tie_without_a_sufficient_delta() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNACGA", "IIIIIIIIIIII")]);
+        let patterns = Patterns::from_strs(["ACGT"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            HammingSearch(Count(3)),
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.position_total, 1);
+        assert_eq!(report.ambiguity.position_resolved_quality, 0);
+        assert_eq!(report.ambiguity.position_dropped, 1);
+    }
+
+    #[test]
+    fn position_quality_rejects_edit_distance_until_gap_quality_is_defined() {
+        let fq = fastq_bytes(&[("read1", "AAATAAAT", "IIIIIIII")]);
+        let patterns = Patterns::from_strs(["AAAA"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            EditSearch(Count(1)),
+        ));
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires exact or Hamming search"));
+    }
+
+    #[test]
     fn heterogeneous_exact_patterns_tie_by_distance_not_raw_match_count() {
         let fq = fastq_bytes(&[("read1", "AAAA", "IIII")]);
         let patterns =

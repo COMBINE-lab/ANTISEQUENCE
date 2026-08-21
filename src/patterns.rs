@@ -34,6 +34,12 @@ pub enum PositionAmbiguityPolicy {
     Leftmost,
     /// Select the largest start coordinate.
     Rightmost,
+    /// Select the equal-distance placement whose mismatching observed bases
+    /// have the lowest summed Phred score. The winner must beat the runner-up
+    /// by at least `min_delta`; otherwise the match is dropped.
+    ///
+    /// This is defined for exact and Hamming search over equal-length windows.
+    Quality { min_delta: u8 },
     /// Treat multiple equal-best placements as no match.
     NoMatch,
     /// Return an execution error when multiple equal-best placements exist.

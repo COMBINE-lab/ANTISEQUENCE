@@ -129,6 +129,7 @@ pub struct AmbiguityCounts {
     pub position_dropped: usize,
     pub position_resolved_leftmost: usize,
     pub position_resolved_rightmost: usize,
+    pub position_resolved_quality: usize,
 }
 
 #[derive(Debug, Clone)]

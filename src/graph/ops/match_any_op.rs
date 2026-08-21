@@ -198,9 +198,26 @@ pub struct MatchAnyOp {
 }
 
 type SeedHitKey = (usize, Option<isize>);
-type CandidateState = (usize, usize, usize, usize, usize, bool);
+type CandidateState = (usize, usize, usize, usize, usize, PositionResolution);
 type MatchPlacement = (usize, usize, usize);
-type ReferencePositionResult = Option<(Option<MatchPlacement>, bool)>;
+type ReferencePositionResult = Result<Option<(Option<MatchPlacement>, PositionResolution)>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionResolution {
+    Unique,
+    Leftmost,
+    Rightmost,
+    Quality,
+    Dropped,
+    Error,
+}
+
+impl PositionResolution {
+    #[inline(always)]
+    fn is_ambiguous(self) -> bool {
+        self != Self::Unique
+    }
+}
 
 enum PostMatchRetention {
     LabelPresent(Label),
@@ -626,33 +643,113 @@ impl MatchAnyOp {
     fn reference_position_candidate(
         &self,
         text: &[u8],
+        quality: Option<&[u8]>,
         pattern: &[u8],
         collect_detailed_statistics: bool,
     ) -> ReferencePositionResult {
         let policy = self.patterns.position_ambiguity_policy();
         if !collect_detailed_statistics && policy == PositionAmbiguityPolicy::Leftmost {
-            return None;
+            return Ok(None);
         }
         if !matches!(
             self.matcher_plan.spec.scope,
             MatchScope::Search | MatchScope::Bounded { .. }
-        ) || matches!(self.matcher_plan.spec.metric, MatchMetric::Alignment { .. })
+        ) {
+            return Ok(None);
+        }
+        if matches!(policy, PositionAmbiguityPolicy::Quality { .. })
+            && !matches!(
+                self.matcher_plan.spec.metric,
+                MatchMetric::Exact | MatchMetric::Hamming { .. }
+            )
         {
-            return None;
+            return Err(Error::GraphExecution(
+                "position quality policy requires exact or Hamming search over equal-length windows"
+                    .to_string(),
+            ));
+        }
+        if matches!(self.matcher_plan.spec.metric, MatchMetric::Alignment { .. }) {
+            return Ok(None);
         }
 
         let patterns = [pattern];
         let mut candidates = reference_match(text, &patterns, self.matcher_plan.spec)
             .expect("compiled matcher bounds are valid");
         let position_ambiguous = candidates.len() > 1;
-        let selected = if policy == PositionAmbiguityPolicy::Rightmost {
-            candidates
-                .drain(..)
-                .max_by_key(|candidate| (candidate.start, candidate.end))
+        let (selected, resolution) = if !position_ambiguous {
+            (candidates.into_iter().next(), PositionResolution::Unique)
         } else {
-            candidates.into_iter().next()
+            match policy {
+                PositionAmbiguityPolicy::Leftmost => {
+                    (candidates.into_iter().next(), PositionResolution::Leftmost)
+                }
+                PositionAmbiguityPolicy::Rightmost => (
+                    candidates
+                        .drain(..)
+                        .max_by_key(|candidate| (candidate.start, candidate.end)),
+                    PositionResolution::Rightmost,
+                ),
+                PositionAmbiguityPolicy::NoMatch => {
+                    (candidates.into_iter().next(), PositionResolution::Dropped)
+                }
+                PositionAmbiguityPolicy::Error => {
+                    (candidates.into_iter().next(), PositionResolution::Error)
+                }
+                PositionAmbiguityPolicy::Quality { min_delta } => {
+                    let quality = quality.ok_or_else(|| {
+                        Error::GraphExecution(format!(
+                            "position quality policy requires quality scores for {}.{}",
+                            self.label.str_type, self.label.label
+                        ))
+                    })?;
+                    if quality.len() != text.len() {
+                        return Err(Error::GraphExecution(format!(
+                            "quality length {} does not match sequence length {} for {}.{}",
+                            quality.len(),
+                            text.len(),
+                            self.label.str_type,
+                            self.label.label
+                        )));
+                    }
+                    let mut scored = candidates
+                        .into_iter()
+                        .map(|candidate| {
+                            let observed = &text[candidate.start..candidate.end];
+                            if observed.len() != pattern.len() {
+                                return Err(Error::GraphExecution(
+                                    "position quality policy requires equal-length candidate windows"
+                                        .to_string(),
+                                ));
+                            }
+                            let score = pattern
+                                .iter()
+                                .zip(observed)
+                                .zip(&quality[candidate.start..candidate.end])
+                                .filter_map(|((&pattern_base, &query_base), &q)| {
+                                    (pattern_base != query_base)
+                                        .then_some(u64::from(q.saturating_sub(33)))
+                                })
+                                .sum::<u64>();
+                            Ok((score, candidate))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    scored.sort_unstable_by_key(|(score, candidate)| {
+                        (*score, candidate.start, candidate.end)
+                    });
+                    let resolved = scored[0].0 < scored[1].0
+                        && scored[1].0 - scored[0].0 >= u64::from(min_delta);
+                    (
+                        Some(scored.remove(0).1),
+                        if resolved {
+                            PositionResolution::Quality
+                        } else {
+                            PositionResolution::Dropped
+                        },
+                    )
+                }
+            }
         };
-        Some((
+        Ok(Some((
             selected.map(|candidate| {
                 (
                     pattern.len().saturating_sub(candidate.distance),
@@ -660,8 +757,8 @@ impl MatchAnyOp {
                     candidate.end,
                 )
             }),
-            position_ambiguous,
-        ))
+            resolution,
+        )))
     }
 
     #[inline]
@@ -1161,8 +1258,21 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             }
 
             let mut best_rank = None;
-            // pattern index, pattern length, matches, cut 1, cut 2, positional tie
+            // pattern index, pattern length, matches, cut 1, cut 2, positional resolution
             let mut best_candidates: SmallVec<[CandidateState; 4]> = SmallVec::new();
+            let position_quality = if matches!(
+                self.patterns.position_ambiguity_policy(),
+                PositionAmbiguityPolicy::Quality { .. }
+            ) {
+                read.substring_qual(self.label.str_type, self.label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?
+            } else {
+                None
+            };
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -1173,11 +1283,13 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-                let reference_position =
-                    self.reference_position_candidate(text, pattern_str, collect_stats);
-                let (matches, reference_position_ambiguous) = if let Some(reference) =
-                    reference_position
-                {
+                let reference_position = self.reference_position_candidate(
+                    text,
+                    position_quality,
+                    pattern_str,
+                    collect_stats,
+                )?;
+                let (matches, position_resolution) = if let Some(reference) = reference_position {
                     reference
                 } else {
                     (
@@ -1404,7 +1516,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                                 })
                             }
                         },
-                        false,
+                        PositionResolution::Unique,
                     )
                 };
 
@@ -1419,7 +1531,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             matches,
                             cut_pos1,
                             cut_pos2,
-                            reference_position_ambiguous,
+                            position_resolution,
                         ));
                     } else if best_rank == Some(rank) {
                         if let Some(candidate) = best_candidates
@@ -1427,12 +1539,26 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                             .find(|candidate| candidate.0 == pattern_idx)
                         {
                             if candidate.3 != cut_pos1 || candidate.4 != cut_pos2 {
-                                candidate.5 = true;
-                                let prefer_new = match self.patterns.position_ambiguity_policy() {
-                                    PositionAmbiguityPolicy::Rightmost => cut_pos1 > candidate.3,
-                                    PositionAmbiguityPolicy::Leftmost
-                                    | PositionAmbiguityPolicy::NoMatch
-                                    | PositionAmbiguityPolicy::Error => cut_pos1 < candidate.3,
+                                candidate.5 = match self.patterns.position_ambiguity_policy() {
+                                    PositionAmbiguityPolicy::Leftmost => {
+                                        PositionResolution::Leftmost
+                                    }
+                                    PositionAmbiguityPolicy::Rightmost => {
+                                        PositionResolution::Rightmost
+                                    }
+                                    PositionAmbiguityPolicy::Quality { .. } => {
+                                        PositionResolution::Dropped
+                                    }
+                                    PositionAmbiguityPolicy::NoMatch => PositionResolution::Dropped,
+                                    PositionAmbiguityPolicy::Error => PositionResolution::Error,
+                                };
+                                let prefer_new = match candidate.5 {
+                                    PositionResolution::Rightmost => cut_pos1 > candidate.3,
+                                    PositionResolution::Unique
+                                    | PositionResolution::Leftmost
+                                    | PositionResolution::Quality
+                                    | PositionResolution::Dropped
+                                    | PositionResolution::Error => cut_pos1 < candidate.3,
                                 };
                                 if prefer_new {
                                     candidate.2 = matches;
@@ -1447,7 +1573,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                                 matches,
                                 cut_pos1,
                                 cut_pos2,
-                                reference_position_ambiguous,
+                                position_resolution,
                             ));
                         }
                     }
@@ -1479,40 +1605,47 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
 
             let selected_pattern_idx = match selected_pattern_idx {
                 Some(pattern_idx) => {
-                    let position_ambiguous = best_candidates
+                    let position_resolution = best_candidates
                         .iter()
                         .find(|candidate| candidate.0 == pattern_idx)
-                        .is_some_and(|candidate| candidate.5);
-                    if position_ambiguous {
+                        .map_or(PositionResolution::Unique, |candidate| candidate.5);
+                    if position_resolution.is_ambiguous() {
                         if let Some(stats) = stats.as_deref_mut() {
                             stats.ambiguity.position_total += 1;
                         }
-                        match self.patterns.position_ambiguity_policy() {
-                            PositionAmbiguityPolicy::Leftmost => {
+                        match position_resolution {
+                            PositionResolution::Leftmost => {
                                 if let Some(stats) = stats.as_deref_mut() {
                                     stats.ambiguity.position_resolved_leftmost += 1;
                                 }
                                 Some(pattern_idx)
                             }
-                            PositionAmbiguityPolicy::Rightmost => {
+                            PositionResolution::Rightmost => {
                                 if let Some(stats) = stats.as_deref_mut() {
                                     stats.ambiguity.position_resolved_rightmost += 1;
                                 }
                                 Some(pattern_idx)
                             }
-                            PositionAmbiguityPolicy::NoMatch => {
+                            PositionResolution::Quality => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_quality += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionResolution::Dropped => {
                                 if let Some(stats) = stats.as_deref_mut() {
                                     stats.ambiguity.position_dropped += 1;
                                 }
                                 None
                             }
-                            PositionAmbiguityPolicy::Error => {
+                            PositionResolution::Error => {
                                 return Err(Error::GraphExecution(format!(
                                     "{} found multiple equal-best positions for pattern {}",
                                     Self::NAME,
                                     pattern_idx
                                 )));
                             }
+                            PositionResolution::Unique => Some(pattern_idx),
                         }
                     } else {
                         Some(pattern_idx)
@@ -1704,6 +1837,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             ambiguity.position_dropped += local.ambiguity.position_dropped;
             ambiguity.position_resolved_leftmost += local.ambiguity.position_resolved_leftmost;
             ambiguity.position_resolved_rightmost += local.ambiguity.position_resolved_rightmost;
+            ambiguity.position_resolved_quality += local.ambiguity.position_resolved_quality;
             if local.distance_counts.len() > totals.len() {
                 totals.resize(local.distance_counts.len(), 0);
             }
