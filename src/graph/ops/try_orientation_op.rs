@@ -78,7 +78,15 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
                 .data_mut(seq_type, wildcard, self.batch_idx_attr)
                 .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) = Data::Int(i as isize);
         }
-        let clones = tagged.clone();
+        let mut clones = Vec::with_capacity(tagged.len());
+        tagged = tagged
+            .into_iter()
+            .map(|read| {
+                let (forward, retry) = read.fork();
+                clones.push(retry);
+                forward
+            })
+            .collect();
 
         // Step 2: Forward pass.
         let (fw_result, done) = self.inner.run_one(Some(tagged), trace)?;

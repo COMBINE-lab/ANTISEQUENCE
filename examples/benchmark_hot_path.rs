@@ -49,6 +49,7 @@ struct Args {
     gzip_block_size: usize,
     terminal_projection: bool,
     direct_output_rendering: bool,
+    fork_reads: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +130,7 @@ fn parse_args() -> Args {
         gzip_block_size: 128 * 1024,
         terminal_projection: false,
         direct_output_rendering: true,
+        fork_reads: false,
     };
     let mut cli = std::env::args().skip(1);
     while let Some(flag) = cli.next() {
@@ -303,6 +305,7 @@ fn parse_args() -> Args {
             }
             "--terminal-projection" => args.terminal_projection = true,
             "--no-direct-output-rendering" => args.direct_output_rendering = false,
+            "--fork" => args.fork_reads = true,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
                     "passthrough" => Mode::Passthrough,
@@ -332,7 +335,7 @@ fn parse_args() -> Args {
                      [--seed-text-length N] [--seed-scenario exact|no-match|repetitive] \
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
                      [--gzip-level 0..9] [--terminal-projection] \
-                     [--no-direct-output-rendering]"
+                     [--no-direct-output-rendering] [--fork]"
                 );
                 std::process::exit(0);
             }
@@ -510,6 +513,11 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
             ],
         ));
     }
+    if args.fork_reads {
+        let mut branch = Graph::new();
+        branch.add(NullOutputOp::new());
+        graph.add(ForkOp::new(branch));
+    }
     graph.set_statistics_level(args.statistics_level);
     match args.output {
         OutputMode::Null => {
@@ -673,6 +681,7 @@ fn main() {
             "gzip_block_size": args.gzip_block_size,
             "terminal_projection": args.terminal_projection,
             "direct_output_rendering": args.direct_output_rendering,
+            "fork_reads": args.fork_reads,
             "reads": args.reads,
             "threads": args.threads,
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),

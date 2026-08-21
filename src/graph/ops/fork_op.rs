@@ -20,8 +20,15 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
         let Some(reads) = reads else {
             panic!("Expected some reads!")
         };
-        self.graph.run_one(Some(reads.clone()), trace)?;
-        let reads = Some(reads);
+        let mut originals = Vec::with_capacity(reads.len());
+        let mut branches = Vec::with_capacity(reads.len());
+        for read in reads {
+            let (original, branch) = read.fork();
+            originals.push(original);
+            branches.push(branch);
+        }
+        self.graph.run_one(Some(branches), trace)?;
+        let reads = Some(originals);
         trace.add(self.name(), start, &reads);
         Ok((reads, false))
     }

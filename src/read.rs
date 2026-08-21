@@ -57,10 +57,17 @@ pub struct StrMappings {
     mappings: SmallVec<[Mapping; 4]>,
     string: Vec<u8>,
     qual: Option<Vec<u8>>,
+    shared: Option<Arc<SharedFastqBytes>>,
 
     // tracks where this string came from
     origin: Arc<Origin>,
     idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SharedFastqBytes {
+    string: Vec<u8>,
+    qual: Option<Vec<u8>>,
 }
 
 impl StrMappings {
@@ -74,6 +81,7 @@ impl StrMappings {
             mappings,
             string,
             qual: None,
+            shared: None,
             origin,
             idx,
         }
@@ -87,6 +95,7 @@ impl StrMappings {
             mappings,
             string,
             qual: Some(qual),
+            shared: None,
             origin,
             idx,
         }
@@ -127,6 +136,7 @@ impl StrMappings {
         origin: Arc<Origin>,
         idx: usize,
     ) {
+        self.ensure_owned();
         Self::reset_buffer(&mut self.string, string);
         match qual {
             Some(bytes) => {
@@ -138,6 +148,44 @@ impl StrMappings {
         self.reset_default_mapping(string.len());
         self.origin = origin;
         self.idx = idx;
+    }
+
+    #[inline]
+    fn ensure_owned(&mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        match Arc::try_unwrap(shared) {
+            Ok(shared) => {
+                self.string = shared.string;
+                self.qual = shared.qual;
+            }
+            Err(shared) => {
+                self.string.clone_from(&shared.string);
+                self.qual.clone_from(&shared.qual);
+            }
+        }
+    }
+
+    #[inline]
+    fn share_in_place(&mut self) {
+        if self.shared.is_some() {
+            return;
+        }
+        self.shared = Some(Arc::new(SharedFastqBytes {
+            string: std::mem::take(&mut self.string),
+            qual: self.qual.take(),
+        }));
+    }
+
+    #[inline(always)]
+    fn stored_len(&self) -> usize {
+        self.string().len() + self.qual().map_or(0, <[u8]>::len)
+    }
+
+    #[inline(always)]
+    fn is_shared(&self) -> bool {
+        self.shared.is_some()
     }
 
     #[inline(always)]
@@ -179,33 +227,38 @@ impl StrMappings {
 
     #[inline(always)]
     pub fn string(&self) -> &[u8] {
-        &self.string
+        self.shared
+            .as_ref()
+            .map_or(self.string.as_slice(), |shared| shared.string.as_slice())
     }
 
     #[inline(always)]
     pub fn string_mut(&mut self) -> &mut Vec<u8> {
+        self.ensure_owned();
         &mut self.string
     }
 
     #[inline(always)]
     pub fn qual(&self) -> Option<&[u8]> {
-        self.qual.as_deref()
+        self.shared
+            .as_ref()
+            .map_or_else(|| self.qual.as_deref(), |shared| shared.qual.as_deref())
     }
 
     #[inline(always)]
     pub fn qual_mut(&mut self) -> Option<&mut Vec<u8>> {
+        self.ensure_owned();
         self.qual.as_mut()
     }
 
     #[inline(always)]
     pub fn substring(&self, mapping: &Mapping) -> &[u8] {
-        &self.string[mapping.start..mapping.start + mapping.len]
+        &self.string()[mapping.start..mapping.start + mapping.len]
     }
 
     #[inline(always)]
     pub fn substring_qual(&self, mapping: &Mapping) -> Option<&[u8]> {
-        self.qual
-            .as_ref()
+        self.qual()
             .map(|q| &q[mapping.start..mapping.start + mapping.len])
     }
 
@@ -345,7 +398,7 @@ impl StrMappings {
         let new_len = new_str.len();
         // If new_str may alias self.string's buffer, copy into an owned temporary first to avoid UB
         let src_bytes: std::borrow::Cow<[u8]> = {
-            let pr = self.string.as_ptr_range();
+            let pr = self.string().as_ptr_range();
             let p = new_str.as_ptr();
             if p >= pr.start && p < pr.end {
                 std::borrow::Cow::Owned(new_str.to_vec())
@@ -353,13 +406,15 @@ impl StrMappings {
                 std::borrow::Cow::Borrowed(new_str)
             }
         };
+        self.ensure_owned();
+        let string = &mut self.string;
 
         if new_len == old_len {
             if new_len != 0 {
                 unsafe {
                     std::ptr::copy(
                         src_bytes.as_ref().as_ptr(),
-                        self.string.as_mut_ptr().add(start),
+                        string.as_mut_ptr().add(start),
                         new_len,
                     );
                 }
@@ -370,33 +425,32 @@ impl StrMappings {
                 unsafe {
                     std::ptr::copy(
                         src_bytes.as_ref().as_ptr(),
-                        self.string.as_mut_ptr().add(start),
+                        string.as_mut_ptr().add(start),
                         new_len,
                     );
                 }
             }
             let tail_src = start + old_len;
             let tail_dst = start + new_len;
-            let tail_len = self.string.len() - tail_src;
+            let tail_len = string.len() - tail_src;
             if tail_len > 0 {
                 unsafe {
-                    let base = self.string.as_mut_ptr();
+                    let base = string.as_mut_ptr();
                     std::ptr::copy(base.add(tail_src), base.add(tail_dst), tail_len);
                 }
             }
-            self.string
-                .truncate(self.string.len() - (old_len - new_len));
+            string.truncate(string.len() - (old_len - new_len));
         } else {
             // grow: make room by moving tail right, then write new bytes
             let diff = new_len - old_len;
             let tail_src = start + old_len;
-            let tail_len = self.string.len() - tail_src;
-            let orig_len = self.string.len();
-            self.string.reserve(diff);
-            self.string.resize(orig_len + diff, 0);
+            let tail_len = string.len() - tail_src;
+            let orig_len = string.len();
+            string.reserve(diff);
+            string.resize(orig_len + diff, 0);
             if tail_len > 0 {
                 unsafe {
-                    let base = self.string.as_mut_ptr();
+                    let base = string.as_mut_ptr();
                     std::ptr::copy(base.add(tail_src), base.add(tail_src + diff), tail_len);
                 }
             }
@@ -404,7 +458,7 @@ impl StrMappings {
                 unsafe {
                     std::ptr::copy(
                         src_bytes.as_ref().as_ptr(),
-                        self.string.as_mut_ptr().add(start),
+                        string.as_mut_ptr().add(start),
                         new_len,
                     );
                 }
@@ -424,7 +478,6 @@ impl StrMappings {
                     std::borrow::Cow::Borrowed(qsrc)
                 }
             };
-
             if q_new_len == old_len {
                 if q_new_len != 0 {
                     unsafe {
@@ -537,16 +590,19 @@ impl StrMappings {
         }
 
         if in_place {
-            if total_len > self.string.len() {
-                self.string.reserve(total_len - self.string.len());
+            self.ensure_owned();
+            let string = &mut self.string;
+            if total_len > string.len() {
+                string.reserve(total_len - string.len());
             }
-            if let Some(qual) = &mut self.qual {
+            let mut qual = self.qual.as_mut();
+            if let Some(qual) = &mut qual {
                 if total_len > qual.len() {
                     qual.reserve(total_len - qual.len());
                 }
             }
-            let string_ptr = self.string.as_mut_ptr();
-            let qual_ptr = self.qual.as_mut().map(Vec::as_mut_ptr);
+            let string_ptr = string.as_mut_ptr();
+            let qual_ptr = qual.as_mut().map(|quality| quality.as_mut_ptr());
             let mut destination = 0usize;
             for part in &resolved {
                 match part {
@@ -591,19 +647,19 @@ impl StrMappings {
             // SAFETY: all bytes up to total_len were initialized above, or
             // were part of the original live vectors.
             unsafe {
-                self.string.set_len(total_len);
-                if let Some(qual) = &mut self.qual {
+                string.set_len(total_len);
+                if let Some(qual) = &mut qual {
                     qual.set_len(total_len);
                 }
             }
         } else {
             let mut projected = Vec::with_capacity(total_len);
-            let mut projected_qual = self.qual.as_ref().map(|_| Vec::with_capacity(total_len));
+            let mut projected_qual = self.qual().map(|_| Vec::with_capacity(total_len));
             for part in &resolved {
                 match part {
                     &ResolvedPart::Mapping(start, len) => {
-                        projected.extend_from_slice(&self.string[start..start + len]);
-                        if let (Some(qual), Some(output)) = (&self.qual, &mut projected_qual) {
+                        projected.extend_from_slice(&self.string()[start..start + len]);
+                        if let (Some(qual), Some(output)) = (self.qual(), &mut projected_qual) {
                             output.extend_from_slice(&qual[start..start + len]);
                         }
                     }
@@ -617,6 +673,7 @@ impl StrMappings {
             }
             self.string = projected;
             self.qual = projected_qual;
+            self.shared = None;
         }
 
         self.reset_default_mapping(total_len);
@@ -660,14 +717,16 @@ impl StrMappings {
         let start = trimmed.start;
         let len = trimmed.len;
         let tail_src = start + len;
-        let tail_len = self.string.len() - tail_src;
+        self.ensure_owned();
+        let string = &mut self.string;
+        let tail_len = string.len() - tail_src;
         if tail_len > 0 {
             unsafe {
-                let base = self.string.as_mut_ptr();
+                let base = string.as_mut_ptr();
                 std::ptr::copy(base.add(tail_src), base.add(start), tail_len);
             }
         }
-        self.string.truncate(self.string.len() - len);
+        string.truncate(string.len() - len);
 
         if let Some(qual_vec) = &mut self.qual {
             let tail_len_q = qual_vec.len() - tail_src;
@@ -693,6 +752,7 @@ impl StrMappings {
         self.mappings.push(Mapping::new_default(string.len()));
         self.string = string;
         self.qual = None;
+        self.shared = None;
         self.origin = origin;
         self.idx = idx;
     }
@@ -708,6 +768,7 @@ impl StrMappings {
         self.mappings.push(Mapping::new_default(string.len()));
         self.string = string;
         self.qual = Some(qual);
+        self.shared = None;
         self.origin = origin;
         self.idx = idx;
     }
@@ -954,6 +1015,11 @@ impl Default for Read {
 }
 
 impl Read {
+    /// Sharing wins reliably above this total name/sequence/quality byte
+    /// volume; shorter records are cheaper to copy into ordinary recycled
+    /// vectors. Dispatch is based on representation size, not protocol name.
+    const COW_FORK_MIN_BYTES: usize = 3_800;
+
     #[inline(always)]
     pub fn new() -> Self {
         Self {
@@ -1045,6 +1111,7 @@ impl Read {
         let mut seq_found = false;
 
         for (t, sm) in &mut self.str_mappings {
+            sm.ensure_owned();
             if *t == name_type {
                 let mut s = std::mem::take(&mut sm.string);
                 s.clear();
@@ -1091,6 +1158,7 @@ impl Read {
         let mut seq_found = false;
 
         for (t, sm) in &mut self.str_mappings {
+            sm.ensure_owned();
             if *t == name_type {
                 if let Some(n) = name {
                     let mut s = std::mem::take(&mut sm.string);
@@ -1152,6 +1220,30 @@ impl Read {
             };
             self.str_mappings.push((str_type, sm));
         }
+    }
+
+    /// Split one read into two copy-on-write branches.
+    ///
+    /// Owned FASTQ byte vectors are moved into immutable shared storage once;
+    /// mapping metadata is cloned, and either branch materializes only a field
+    /// it subsequently mutates. Ordinary reads that are never forked retain
+    /// their recycled owned buffers and pay no shared-ownership cost.
+    pub fn fork(mut self) -> (Self, Self) {
+        let mut stored_bytes = 0usize;
+        let mut already_shared = false;
+        for (_, mappings) in &self.str_mappings {
+            stored_bytes = stored_bytes.saturating_add(mappings.stored_len());
+            already_shared |= mappings.is_shared();
+        }
+        if !already_shared && stored_bytes < Self::COW_FORK_MIN_BYTES {
+            let branch = self.clone();
+            return (self, branch);
+        }
+        for (_, mappings) in &mut self.str_mappings {
+            mappings.share_in_place();
+        }
+        let branch = self.clone();
+        (self, branch)
     }
 
     #[inline(always)]
@@ -2612,5 +2704,91 @@ mod read_tests {
         sm.recycle_with_qual(b"TGCA".to_vec(), b"!!!!".to_vec(), origin2, 1);
         assert_eq!(sm.string(), b"TGCA");
         assert_eq!(sm.qual(), Some(b"!!!!".as_slice()));
+    }
+
+    #[test]
+    fn shared_fastq_storage_is_copy_on_write() {
+        let origin = test_origin();
+        let sequence = vec![b'A'; 2_000];
+        let quality = vec![b'I'; 2_000];
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", &sequence, &quality, origin, 0);
+        assert!(read.str_mappings[1].1.shared.is_none());
+        let (mut original, untouched) = read.fork();
+        assert!(original.str_mappings[1].1.shared.is_some());
+
+        original
+            .set(
+                StrType::Seq(1),
+                InlineString::new(b"*"),
+                b"TGCA",
+                Some(b"!!!!"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            original.to_fastq(1).unwrap(),
+            (&b"read"[..], &b"TGCA"[..], &b"!!!!"[..])
+        );
+        assert_eq!(
+            untouched.to_fastq(1).unwrap(),
+            (&b"read"[..], sequence.as_slice(), quality.as_slice())
+        );
+        assert!(original.str_mappings[1].1.shared.is_none());
+        assert!(untouched.str_mappings[1].1.shared.is_some());
+    }
+
+    #[test]
+    fn ordinary_reads_remain_owned_until_explicitly_forked() {
+        let origin = test_origin();
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", b"ACGT", b"IIII", origin, 0);
+        let (original, branch) = read.fork();
+        assert!(original
+            .str_mappings
+            .iter()
+            .all(|(_, mappings)| mappings.shared.is_none()));
+        assert!(branch
+            .str_mappings
+            .iter()
+            .all(|(_, mappings)| mappings.shared.is_none()));
+    }
+
+    #[test]
+    fn uniquely_held_shared_storage_recovers_its_allocation() {
+        let origin = test_origin();
+        let sequence = vec![b'A'; 2_000];
+        let quality = vec![b'I'; 2_000];
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", &sequence, &quality, origin, 0);
+        let original_pointer = read.str_mappings[1].1.string().as_ptr();
+
+        let (mut original, branch) = read.fork();
+        drop(branch);
+        let recovered_pointer = original.str_mappings[1].1.string_mut().as_ptr();
+
+        assert_eq!(recovered_pointer, original_pointer);
+        assert!(original.str_mappings[1].1.shared.is_none());
+    }
+
+    #[test]
+    fn nested_forks_isolate_mutations() {
+        let origin = test_origin();
+        let sequence = vec![b'A'; 2_000];
+        let quality = vec![b'I'; 2_000];
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", &sequence, &quality, origin, 0);
+
+        let (first, second) = read.fork();
+        let (mut second, third) = second.fork();
+        second.str_mappings[1].1.string_mut()[0] = b'C';
+        second.str_mappings[1].1.qual_mut().unwrap()[0] = b'!';
+
+        assert_eq!(first.to_fastq(1).unwrap().1, sequence.as_slice());
+        assert_eq!(third.to_fastq(1).unwrap().1, sequence.as_slice());
+        assert_eq!(second.to_fastq(1).unwrap().1[0], b'C');
+        assert_eq!(first.to_fastq(1).unwrap().2, quality.as_slice());
+        assert_eq!(third.to_fastq(1).unwrap().2, quality.as_slice());
+        assert_eq!(second.to_fastq(1).unwrap().2[0], b'!');
     }
 }

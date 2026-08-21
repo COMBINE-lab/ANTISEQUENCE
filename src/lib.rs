@@ -2853,6 +2853,39 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn test_try_orientation_long_reads_keep_branches_isolated() {
+        let forward = format!("ACGT{}", "A".repeat(1_996));
+        let reverse = format!("{}ACGT", "T".repeat(1_996));
+        let quality = "I".repeat(2_000);
+        let fq = fastq_bytes(&[
+            ("fw_read", forward.as_str(), quality.as_str()),
+            ("rc_read", reverse.as_str(), quality.as_str()),
+        ]);
+
+        let inner = orientation_inner_graph("ACGT");
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(TryOrientationOp::new(inner, 1, b"ori"));
+
+        let outputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let output_clone = outputs.clone();
+        g.add(ForEachOp::new(move |read: &mut Read| {
+            output_clone.lock().unwrap().push(
+                read.str_mappings(StrType::Seq(1))
+                    .unwrap()
+                    .string()
+                    .to_vec(),
+            );
+        }));
+        g.run().unwrap();
+
+        let outputs = outputs.lock().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], forward.as_bytes());
+        assert_eq!(outputs[1], forward.as_bytes());
+    }
+
+    #[test]
     fn test_try_orientation_batch_idx_not_leaked() {
         // BUG 2: TryOrientationOp tags each read with an internal _batch_idx
         // attribute for ordering, but never removes it after sorting. This

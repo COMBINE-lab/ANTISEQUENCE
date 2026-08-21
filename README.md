@@ -95,5 +95,13 @@ mutually exclusive arm may safely end in a terminal projection. The broader
 [metadata and graph-liveness redesign](docs/metadata-liveness-redesign.md) is
 documented as deferred work for arbitrary nested graphs.
 
+Branching operations (`ForkOp`, `TryOp`, and `TryOrientationOp`) use a
+size-dispatched copy-on-write path. Long records share immutable FASTQ storage
+until a branch mutates it, avoiding unconditional long-read copies; short
+records retain the faster ordinary-copy path, and records that never branch
+retain the existing recycled owned buffers. See the
+[graph API guide](docs/graph-api.md#copy-on-write-graph-branches) for the
+semantics and performance gate.
+
 ## Name
 The name of this library is inspired by a K-pop [song](https://youtu.be/pyf8cbqyfPs).

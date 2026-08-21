@@ -116,3 +116,28 @@ retains materialization until a later planner can demonstrate a robust gain.
 The first release gate uses byte-identical output and a five-million-read
 single-thread workload. Direct rendering reduced mean runtime from 0.69290 to
 0.58071 seconds (16.2%) for a fixed-prefix plus mapped-sequence projection.
+
+## Copy-on-write graph branches
+
+`ForkOp`, `TryOp`, and `TryOrientationOp` split records through `Read::fork`.
+For sufficiently large FASTQ records, the two branches initially share the
+immutable name, sequence, and quality buffers. Mapping metadata remains
+branch-local, and the first byte mutation materializes only that FASTQ lane.
+If the other branch has already been dropped, ANTISEQUENCE recovers the
+original allocation without copying it.
+
+Short records continue to use ordinary deep copies. Measurements showed that
+shared ownership is counterproductive for typical short-read records, so the
+dispatch uses total stored FASTQ bytes rather than a protocol name. Reads that
+do not encounter a branching operation retain the existing owned, recycled
+buffers and never create shared storage.
+
+The Milestone 3 microbenchmark gate compares the implementation with the
+pre-change deep-copy path and requires identical results plus no more than a
+3% slowdown on short-read controls. At one worker, the accepted implementation
+was 2.33x faster for a 2 kb fork and 3.42x faster for a 10 kb fork; the 150 bp
+fork and non-branching control were 2.93% and 2.48% slower, respectively. At
+four workers, the 2 kb fork improved from 1.71 to 2.31 million reads/s while
+the non-branching 150 bp control was 2.2% slower. These synthetic results
+isolate branch-copying cost and are not presented as end-to-end protocol
+throughput.

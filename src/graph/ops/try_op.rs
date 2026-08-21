@@ -43,8 +43,8 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
         // transformations. Checking only the first read would route a mixed
         // batch together, so catch/unassigned mode evaluates each read.
         for read in reads {
-            let original = read.clone();
-            let (output, failed, done) = self.try_graph.try_run_one(Some(vec![read]), trace)?;
+            let (attempt, original) = read.fork();
+            let (output, failed, done) = self.try_graph.try_run_one(Some(vec![attempt]), trace)?;
             if done {
                 return Ok((output, true));
             }
