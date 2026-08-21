@@ -510,6 +510,27 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn nondefault_position_policy_covers_unseeded_approximate_search() {
+        for match_type in [HammingSearch(Count(3)), EditSearch(Count(1))] {
+            let fq = fastq_bytes(&[("read1", "AAATAAAT", "IIIIIIII")]);
+            let patterns = Patterns::from_strs(["AAAA"])
+                .with_position_ambiguity_policy(PositionAmbiguityPolicy::NoMatch);
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            graph.add(MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                match_type,
+            ));
+            graph.set_statistics_level(StatisticsLevel::Detailed);
+            graph.run().unwrap();
+            let report = graph.match_distance_counts().remove(0);
+            assert_eq!(report.ambiguity.position_total, 1);
+            assert_eq!(report.ambiguity.position_dropped, 1);
+        }
+    }
+
+    #[test]
     fn test_graph_interleaved_reader() {
         let fq = fastq_bytes(&[
             ("read1_R1", "AAAA", "IIII"),
