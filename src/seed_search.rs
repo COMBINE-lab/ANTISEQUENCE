@@ -469,7 +469,7 @@ cfg_if! {
 fn wyhash_byte(b: u8) -> u64 {
     #[cfg(feature = "seed-baseline")]
     {
-        return wyhash_byte_const(b);
+        wyhash_byte_const(b)
     }
     #[cfg(not(feature = "seed-baseline"))]
     WYHASH_BYTE_LOOKUP[b as usize]

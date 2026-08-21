@@ -14,8 +14,9 @@ use std::marker::Send;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::graph::*;
+use crate::matcher::{MatcherBackend, MatcherPlan, PatternSummary};
 use crate::seed_search::*;
-use crate::{AmbiguityPolicy, Pattern, Patterns};
+use crate::{AmbiguityPolicy, Pattern, Patterns, PositionAmbiguityPolicy};
 
 /// Pre-computed lookup table for fast Hamming matching.
 ///
@@ -48,7 +49,7 @@ impl HammingLookup {
     /// Only ACGT bases are used for mismatch variant generation.
     /// Non-ACGT characters in input sequences may cause false negatives
     /// in the fast lookup path (the slow Hamming fallback handles all bytes).
-    const NUCLEOTIDES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    const NUCLEOTIDES: [u8; 4] = *b"ACGT";
 
     /// Encode a sequence as u64 (up to 8 bytes).
     /// Panics in debug builds if seq.len() > 8.
@@ -179,10 +180,11 @@ pub struct MatchAnyOp {
     max_literal_len: usize,
     all_literals: bool,
     match_type: MatchType,
+    matcher_plan: MatcherPlan,
     aligner: ThreadLocal<Option<RefCell<Box<dyn Aligner + Send>>>>,
     short_edit_searchers: Vec<Option<ShortEditSearcher>>,
     long_edit_searchers: ThreadLocal<RefCell<FxHashMap<usize, LongMyers<u64>>>>,
-    seed_hits: ThreadLocal<RefCell<FxHashSet<(usize, Option<isize>)>>>,
+    seed_hits: ThreadLocal<RefCell<FxHashSet<SeedHitKey>>>,
     seed_searcher: Option<SeedSearchers>,
     /// Fast hash-based lookup for Hamming matching (when applicable)
     hamming_lookup: Option<HammingLookup>,
@@ -192,6 +194,9 @@ pub struct MatchAnyOp {
     // workers before these cells are read and aggregated.
     local_stats: ThreadLocal<Mutex<LocalMatchStats>>,
 }
+
+type SeedHitKey = (usize, Option<isize>);
+type CandidateState = (usize, usize, usize, usize, usize, bool);
 
 enum PostMatchRetention {
     LabelPresent(Label),
@@ -448,7 +453,6 @@ impl MatchAnyOp {
                 }),
         );
 
-        let seed_searcher = Self::get_searcher(&patterns, &match_type);
         let max_literal_len = patterns
             .iter_literals()
             .map(|(_, p)| p.len())
@@ -460,6 +464,14 @@ impl MatchAnyOp {
             .min()
             .unwrap_or(0);
         let all_literals = patterns.iter_exprs().count() == 0;
+        let pattern_summary = PatternSummary {
+            count: patterns.patterns().len(),
+            literal_count: patterns.iter_literals().count(),
+            min_literal_len,
+            max_literal_len,
+        };
+        let matcher_plan = MatcherPlan::build(match_type, pattern_summary);
+        let seed_searcher = Self::get_searcher(&patterns, &match_type);
         let short_edit_searchers = patterns
             .patterns()
             .iter()
@@ -482,25 +494,16 @@ impl MatchAnyOp {
         // 2. Match type is Hamming with small mismatch count (<=2)
         // 3. Pattern count is reasonable (<=1000)
         // 4. Pattern length fits in u64 encoding (<=8 bytes)
-        let hamming_lookup = if let MatchType::Hamming(threshold) = match_type {
+        let hamming_lookup = if matcher_plan.backend == MatcherBackend::HammingLookup {
+            let MatchType::Hamming(threshold) = match_type else {
+                unreachable!("HammingLookup plans require a full Hamming match")
+            };
             let max_mismatches = max_literal_len.saturating_sub(threshold.get(max_literal_len));
-            let pattern_count = patterns.iter_literals().count();
-
-            if all_literals
-                && max_literal_len == min_literal_len
-                && max_mismatches <= 2
-                && pattern_count <= 1000
-                && max_literal_len > 0
-                && max_literal_len <= 8
-            {
-                Some(HammingLookup::new(
-                    patterns.iter_literals(),
-                    max_literal_len,
-                    max_mismatches,
-                ))
-            } else {
-                None
-            }
+            Some(HammingLookup::new(
+                patterns.iter_literals(),
+                max_literal_len,
+                max_mismatches,
+            ))
         } else {
             None
         };
@@ -514,6 +517,7 @@ impl MatchAnyOp {
             max_literal_len,
             all_literals,
             match_type,
+            matcher_plan,
             aligner: ThreadLocal::new(),
             short_edit_searchers,
             long_edit_searchers: ThreadLocal::new(),
@@ -524,6 +528,11 @@ impl MatchAnyOp {
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             local_stats: ThreadLocal::new(),
         }
+    }
+
+    /// The orthogonal semantics and selected implementation for this matcher.
+    pub fn matcher_plan(&self) -> &MatcherPlan {
+        &self.matcher_plan
     }
 
     /// Retain only reads for which this match created `label`.
@@ -593,6 +602,17 @@ impl MatchAnyOp {
             Some(s)
         } else {
             Some(General(GeneralSearcher::new(patterns.iter_literals(), k)))
+        }
+    }
+
+    #[inline]
+    fn candidate_rank(&self, pattern_len: usize, matches: usize) -> usize {
+        use crate::matcher::MatchMetric;
+        match self.matcher_plan.spec.metric {
+            MatchMetric::Exact | MatchMetric::Hamming { .. } | MatchMetric::Edit { .. } => {
+                usize::MAX - pattern_len.saturating_sub(matches)
+            }
+            MatchMetric::Alignment { .. } => matches,
         }
     }
 
@@ -1092,9 +1112,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 seed_hits.extend(self.patterns.iter_exprs().map(|(i, _)| (i, None)));
             }
 
-            let mut max_matches = 0;
-            let mut max_pattern_idx = usize::MAX;
-            let mut best_candidates: SmallVec<[(usize, usize, usize, usize); 4]> = SmallVec::new();
+            let mut best_rank = None;
+            // pattern index, pattern length, matches, cut 1, cut 2, positional tie
+            let mut best_candidates: SmallVec<[CandidateState; 4]> = SmallVec::new();
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -1105,10 +1125,6 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-                if max_matches > pattern_len {
-                    continue;
-                }
-
                 let matches = match self.match_type {
                     Exact => {
                         if text == pattern_str {
@@ -1324,17 +1340,46 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 };
 
                 if let Some((matches, cut_pos1, cut_pos2)) = matches {
-                    if max_pattern_idx == usize::MAX || matches > max_matches {
-                        max_matches = matches;
-                        max_pattern_idx = pattern_idx;
+                    let rank = self.candidate_rank(pattern_len, matches);
+                    if best_rank.is_none_or(|best| rank > best) {
+                        best_rank = Some(rank);
                         best_candidates.clear();
-                        best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
-                    } else if matches == max_matches && pattern_idx != max_pattern_idx {
-                        if !best_candidates
-                            .iter()
-                            .any(|&(candidate_idx, _, _, _)| candidate_idx == pattern_idx)
+                        best_candidates.push((
+                            pattern_idx,
+                            pattern_len,
+                            matches,
+                            cut_pos1,
+                            cut_pos2,
+                            false,
+                        ));
+                    } else if best_rank == Some(rank) {
+                        if let Some(candidate) = best_candidates
+                            .iter_mut()
+                            .find(|candidate| candidate.0 == pattern_idx)
                         {
-                            best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
+                            if candidate.3 != cut_pos1 || candidate.4 != cut_pos2 {
+                                candidate.5 = true;
+                                let prefer_new = match self.patterns.position_ambiguity_policy() {
+                                    PositionAmbiguityPolicy::Rightmost => cut_pos1 > candidate.3,
+                                    PositionAmbiguityPolicy::Leftmost
+                                    | PositionAmbiguityPolicy::NoMatch
+                                    | PositionAmbiguityPolicy::Error => cut_pos1 < candidate.3,
+                                };
+                                if prefer_new {
+                                    candidate.2 = matches;
+                                    candidate.3 = cut_pos1;
+                                    candidate.4 = cut_pos2;
+                                }
+                            }
+                        } else {
+                            best_candidates.push((
+                                pattern_idx,
+                                pattern_len,
+                                matches,
+                                cut_pos1,
+                                cut_pos2,
+                                false,
+                            ));
                         }
                     }
                 }
@@ -1350,7 +1395,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     })?;
                 let candidate_indices: SmallVec<[usize; 4]> = best_candidates
                     .iter()
-                    .map(|&(pattern_idx, _, _, _)| pattern_idx)
+                    .map(|&(pattern_idx, _, _, _, _, _)| pattern_idx)
                     .collect();
                 self.resolve_ambiguity(
                     read,
@@ -1363,11 +1408,56 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 best_candidates.first().map(|candidate| candidate.0)
             };
 
+            let selected_pattern_idx = match selected_pattern_idx {
+                Some(pattern_idx) => {
+                    let position_ambiguous = best_candidates
+                        .iter()
+                        .find(|candidate| candidate.0 == pattern_idx)
+                        .is_some_and(|candidate| candidate.5);
+                    if position_ambiguous {
+                        if let Some(stats) = stats.as_deref_mut() {
+                            stats.ambiguity.position_total += 1;
+                        }
+                        match self.patterns.position_ambiguity_policy() {
+                            PositionAmbiguityPolicy::Leftmost => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_leftmost += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionAmbiguityPolicy::Rightmost => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_rightmost += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionAmbiguityPolicy::NoMatch => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_dropped += 1;
+                                }
+                                None
+                            }
+                            PositionAmbiguityPolicy::Error => {
+                                return Err(Error::GraphExecution(format!(
+                                    "{} found multiple equal-best positions for pattern {}",
+                                    Self::NAME,
+                                    pattern_idx
+                                )));
+                            }
+                        }
+                    } else {
+                        Some(pattern_idx)
+                    }
+                }
+                None => None,
+            };
+
             if let Some(selected_pattern_idx) = selected_pattern_idx {
-                let &(_, max_pattern_len, max_cut_pos1, max_cut_pos2) = best_candidates
-                    .iter()
-                    .find(|&&(pattern_idx, _, _, _)| pattern_idx == selected_pattern_idx)
-                    .expect("resolved candidate must be present in equal-best candidate set");
+                let &(_, max_pattern_len, selected_matches, max_cut_pos1, max_cut_pos2, _) =
+                    best_candidates
+                        .iter()
+                        .find(|&&(pattern_idx, _, _, _, _, _)| pattern_idx == selected_pattern_idx)
+                        .expect("resolved candidate must be present in equal-best candidate set");
                 let selected_pattern = &self.patterns.patterns()[selected_pattern_idx];
                 let pattern_str =
                     selected_pattern
@@ -1379,7 +1469,11 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         })?;
                 let pattern_attrs = selected_pattern.attrs();
                 if let Some(stats) = stats.as_deref_mut() {
-                    Self::record_distance(&mut stats.distance_counts, max_pattern_len, max_matches);
+                    Self::record_distance(
+                        &mut stats.distance_counts,
+                        max_pattern_len,
+                        selected_matches,
+                    );
                 }
                 let pattern_value = self
                     .patterns
@@ -1537,6 +1631,10 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             ambiguity.resolved_first += local.ambiguity.resolved_first;
             ambiguity.resolved_random += local.ambiguity.resolved_random;
             ambiguity.resolved_quality += local.ambiguity.resolved_quality;
+            ambiguity.position_total += local.ambiguity.position_total;
+            ambiguity.position_dropped += local.ambiguity.position_dropped;
+            ambiguity.position_resolved_leftmost += local.ambiguity.position_resolved_leftmost;
+            ambiguity.position_resolved_rightmost += local.ambiguity.position_resolved_rightmost;
             if local.distance_counts.len() > totals.len() {
                 totals.resize(local.distance_counts.len(), 0);
             }

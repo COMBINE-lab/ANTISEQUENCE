@@ -124,6 +124,11 @@ pub struct AmbiguityCounts {
     pub resolved_first: usize,
     pub resolved_random: usize,
     pub resolved_quality: usize,
+    /// Equal-best placements of one pattern at multiple coordinates.
+    pub position_total: usize,
+    pub position_dropped: usize,
+    pub position_resolved_leftmost: usize,
+    pub position_resolved_rightmost: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1405,12 +1410,11 @@ impl<T: Trace> Graph<T> {
             drop(work_receiver);
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<Option<Vec<Read>>>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder = ReorderRing::<Option<Vec<Read>>>::new(if config.preserve_order {
+                config.max_in_flight_batches
+            } else {
+                0
+            });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     window.release();
@@ -1674,12 +1678,12 @@ impl<T: Trace> Graph<T> {
             }
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<PreparedLocalCompletedItem>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder =
+                ReorderRing::<PreparedLocalCompletedItem>::new(if config.preserve_order {
+                    config.max_in_flight_batches
+                } else {
+                    0
+                });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     window.release();
@@ -1886,12 +1890,11 @@ impl<T: Trace> Graph<T> {
             }
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<LocalCompletedItem>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder = ReorderRing::<LocalCompletedItem>::new(if config.preserve_order {
+                config.max_in_flight_batches
+            } else {
+                0
+            });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     let _ = completed.recycle_sender.send(None);
@@ -2140,6 +2143,7 @@ impl<T: Trace> Graph<T> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pipeline_work(
         &self,
         output_start: usize,

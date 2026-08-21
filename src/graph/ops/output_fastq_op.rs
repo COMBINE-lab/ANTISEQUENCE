@@ -303,14 +303,14 @@ impl OutputFastqFileOp {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                let writer: Box<dyn Write + Send> = if file_path.ends_with(".gz")
-                    && self.parallel_gzip_stream.is_some()
+                let writer: Box<dyn Write + Send> = if let (true, Some(stream_config)) =
+                    (file_path.ends_with(".gz"), self.parallel_gzip_stream)
                 {
                     let output = BufWriter::with_capacity(1 << 20, File::create(file_path)?);
                     Box::new(parallel_gzip_stream_writer(
                         output,
                         self.gzip_level,
-                        self.parallel_gzip_stream.expect("checked above"),
+                        stream_config,
                     )?)
                 } else if file_path.ends_with(".gz") && !self.parallel_gzip_members {
                     Box::new(BufWriter::with_capacity(

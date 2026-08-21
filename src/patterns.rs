@@ -23,12 +23,30 @@ pub enum AmbiguityPolicy {
     Error,
 }
 
+/// Determines how equal-best placements of the same pattern are handled in
+/// search and bounded-search scopes. This is deliberately separate from
+/// [`AmbiguityPolicy`], which resolves ties between distinct patterns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PositionAmbiguityPolicy {
+    /// Select the smallest start coordinate. This is the compatibility
+    /// default and is deterministic across matcher backends.
+    #[default]
+    Leftmost,
+    /// Select the largest start coordinate.
+    Rightmost,
+    /// Treat multiple equal-best placements as no match.
+    NoMatch,
+    /// Return an execution error when multiple equal-best placements exist.
+    Error,
+}
+
 pub struct Patterns {
     pattern_name: Option<InlineString>,
     multimatch_name: Option<InlineString>,
     attr_names: Vec<InlineString>,
     patterns: Vec<Pattern>,
     ambiguity_policy: Option<AmbiguityPolicy>,
+    position_ambiguity_policy: PositionAmbiguityPolicy,
 }
 
 impl Patterns {
@@ -42,6 +60,7 @@ impl Patterns {
                 .map(|v| Pattern::from_literal(v.as_ref(), Vec::new()))
                 .collect(),
             ambiguity_policy: None,
+            position_ambiguity_policy: PositionAmbiguityPolicy::Leftmost,
         }
     }
 
@@ -55,6 +74,7 @@ impl Patterns {
                 .map(|v| Pattern::from_expr(v, Vec::new()))
                 .collect(),
             ambiguity_policy: None,
+            position_ambiguity_policy: PositionAmbiguityPolicy::Leftmost,
         }
     }
 
@@ -85,6 +105,7 @@ impl Patterns {
             attr_names,
             patterns,
             ambiguity_policy: None,
+            position_ambiguity_policy: PositionAmbiguityPolicy::Leftmost,
         }
     }
 
@@ -103,6 +124,11 @@ impl Patterns {
         self
     }
 
+    pub fn with_position_ambiguity_policy(mut self, policy: PositionAmbiguityPolicy) -> Self {
+        self.position_ambiguity_policy = policy;
+        self
+    }
+
     pub fn pattern_name(&self) -> Option<InlineString> {
         self.pattern_name
     }
@@ -113,6 +139,10 @@ impl Patterns {
 
     pub fn ambiguity_policy(&self) -> Option<AmbiguityPolicy> {
         self.ambiguity_policy
+    }
+
+    pub fn position_ambiguity_policy(&self) -> PositionAmbiguityPolicy {
+        self.position_ambiguity_policy
     }
 
     pub fn attr_names(&self) -> &[InlineString] {

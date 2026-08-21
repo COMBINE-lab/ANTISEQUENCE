@@ -107,6 +107,7 @@ cfg_if::cfg_if! {
 pub mod errors;
 pub mod expr;
 pub mod graph;
+pub mod matcher;
 mod patterns;
 mod read;
 pub mod trace;
@@ -125,7 +126,7 @@ mod pipeline_tests {
     use crate::expr::*;
     use crate::graph::*;
     use crate::inline_string::InlineString;
-    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns};
+    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns, PositionAmbiguityPolicy};
     use crate::read::*;
     use crate::trace::NoTrace;
     use std::io::{Cursor, Write};
@@ -456,6 +457,56 @@ mod pipeline_tests {
         assert_eq!(dropped.ambiguity.total, 1);
         assert_eq!(dropped.ambiguity.dropped, 1);
         assert_eq!(dropped.ambiguity.accepted, 0);
+    }
+
+    fn position_ambiguity_statistics(policy: PositionAmbiguityPolicy) -> MatchDistanceCounts {
+        let fq = fastq_bytes(&[("read1", "AAAACAAA", "IIIIIIII")]);
+        let patterns = Patterns::from_strs(["AAA"]).with_position_ambiguity_policy(policy);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            ExactSearch,
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        graph.match_distance_counts().remove(0)
+    }
+
+    #[test]
+    fn search_position_ambiguity_is_distinct_and_observable() {
+        let left = position_ambiguity_statistics(PositionAmbiguityPolicy::Leftmost);
+        assert_eq!(left.ambiguity.total, 0);
+        assert_eq!(left.ambiguity.position_total, 1);
+        assert_eq!(left.ambiguity.position_resolved_leftmost, 1);
+
+        let right = position_ambiguity_statistics(PositionAmbiguityPolicy::Rightmost);
+        assert_eq!(right.ambiguity.position_total, 1);
+        assert_eq!(right.ambiguity.position_resolved_rightmost, 1);
+
+        let dropped = position_ambiguity_statistics(PositionAmbiguityPolicy::NoMatch);
+        assert_eq!(dropped.ambiguity.position_total, 1);
+        assert_eq!(dropped.ambiguity.position_dropped, 1);
+    }
+
+    #[test]
+    fn heterogeneous_exact_patterns_tie_by_distance_not_raw_match_count() {
+        let fq = fastq_bytes(&[("read1", "AAAA", "IIII")]);
+        let patterns =
+            Patterns::from_strs(["AAA", "AAAA"]).with_ambiguity_policy(AmbiguityPolicy::First);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            ExactSearch,
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.total, 1);
+        assert_eq!(report.ambiguity.resolved_first, 1);
     }
 
     #[test]

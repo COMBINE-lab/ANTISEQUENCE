@@ -1585,7 +1585,7 @@ impl fmt::Display for StrMappings {
             " {: <len$} record {} in {}",
             "from:".bold(),
             self.idx,
-            &*self.origin
+            *self.origin
         )?;
 
         Ok(())

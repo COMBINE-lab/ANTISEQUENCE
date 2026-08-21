@@ -363,10 +363,10 @@ fn parse_args() -> Args {
     assert!(args.reads > 0, "reads must be positive");
     assert!(args.threads > 0, "threads must be positive");
     assert!(args.repetitions > 0, "repetitions must be positive");
-    assert!(args.queue_capacity.map_or(true, |value| value > 0));
-    assert!(args.max_in_flight_batches.map_or(true, |value| value > 0));
-    assert!(args.batch_size.map_or(true, |value| value > 0));
-    assert!(args.fastq_read_length.map_or(true, |value| value > 0));
+    assert!(args.queue_capacity.is_none_or(|value| value > 0));
+    assert!(args.max_in_flight_batches.is_none_or(|value| value > 0));
+    assert!(args.batch_size.is_none_or(|value| value > 0));
+    assert!(args.fastq_read_length.is_none_or(|value| value > 0));
     assert!(args.gzip_level <= 9, "gzip level must be in 0..=9");
     assert!(args.gzip_threads > 0, "gzip threads must be positive");
     assert!(

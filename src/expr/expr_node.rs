@@ -8,7 +8,7 @@ use crate::read::*;
 
 const UNKNOWN_QUAL: u8 = b'I';
 
-static NUC: [u8; 4] = [b'A', b'C', b'G', b'T'];
+static NUC: [u8; 4] = *b"ACGT";
 static COMP_LUT: [u8; 256] = {
     let mut l = [0u8; 256];
     let mut i = 0;

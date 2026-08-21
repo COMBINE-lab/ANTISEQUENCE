@@ -312,7 +312,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                             b.truncate(i);
                             break 'outer;
                         }
-                        return Err(Error::UnpairedRead(format!("\"{}\"", &**origin)));
+                        return Err(Error::UnpairedRead(format!("\"{}\"", **origin)));
                     };
                     let record = record.map_err(|e| Error::ParseRecord {
                         origin: (***origin).clone(),
@@ -357,7 +357,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                             b.truncate(i);
                             break 'outer;
                         }
-                        return Err(Error::UnpairedRead(format!("\"{}\"", &**origin)));
+                        return Err(Error::UnpairedRead(format!("\"{}\"", **origin)));
                     };
                     let record = record.map_err(|e| Error::ParseRecord {
                         origin: (***origin).clone(),
