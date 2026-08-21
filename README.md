@@ -58,6 +58,8 @@ operation details.
 The remaining optimizer and execution-planner work, its acceptance gates, and
 the boundary before complex-protocol development are recorded in the
 [Milestone 2 execution plan](docs/graph-optimization-and-planning.md).
+The accepted backend policy and its measured crossover matrix are recorded in
+the [Milestone 2 benchmark report](docs/benchmarks/milestone-2-execution-crossover-2026-08-20.md).
 
 ## Terminal read projection
 

@@ -65,8 +65,10 @@ The implementation exposes deterministic `ExecutionRequest`,
 `ExecutionPlan`, and `PlannedExecutionReport` APIs with stable reason codes.
 Automatic mode preserves the whole-graph default except when ordering requires
 the bounded pipeline. seqproc exposes forced modes and reports both the
-optimization and planning decisions in summary schema 1.4.0. The remaining
-acceptance work is the representative crossover matrix.
+optimization and planning decisions in summary schema 1.4.0. The
+[representative crossover matrix](benchmarks/milestone-2-execution-crossover-2026-08-20.md)
+found no stable workload class where a more aggressive automatic selection was
+warranted.
 
 ## Acceptance gates
 

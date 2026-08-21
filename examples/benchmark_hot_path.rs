@@ -31,6 +31,7 @@ struct Args {
     statistics_level: StatisticsLevel,
     mode: Mode,
     execution: Execution,
+    pipeline_input_mode: PipelineInputMode,
     queue_capacity: Option<usize>,
     max_in_flight_batches: Option<usize>,
     batch_size: Option<usize>,
@@ -114,6 +115,7 @@ fn parse_args() -> Args {
         statistics_level: StatisticsLevel::Off,
         mode: Mode::Hamming,
         execution: Execution::WholeGraphWorkers,
+        pipeline_input_mode: PipelineInputMode::WorkerLocal,
         queue_capacity: None,
         max_in_flight_batches: None,
         batch_size: None,
@@ -175,6 +177,16 @@ fn parse_args() -> Args {
                         "unknown execution {value:?}; expected auto, whole-graph, pipeline, or pipeline-ordered"
                     ),
                 }
+            }
+            "--pipeline-input-mode" => {
+                args.pipeline_input_mode =
+                    match cli.next().expect("--pipeline-input-mode value").as_str() {
+                        "worker-local" => PipelineInputMode::WorkerLocal,
+                        "dedicated-reader" => PipelineInputMode::DedicatedReader,
+                        value => panic!(
+                            "unknown pipeline input mode {value:?}; expected worker-local or dedicated-reader"
+                        ),
+                    }
             }
             "--queue-capacity" => {
                 args.queue_capacity = Some(
@@ -331,6 +343,7 @@ fn parse_args() -> Args {
                      [--statistics-level off|basic|detailed] \
                      [--mode passthrough|hamming|seeded|edit-dp] \
                      [--execution auto|whole-graph|pipeline|pipeline-ordered] \
+                     [--pipeline-input-mode worker-local|dedicated-reader] \
                      [--queue-capacity N] [--max-in-flight-batches N] [--batch-size N] \
                      [--output null|plain|gzip|parallel-gzip|parallel-gzip-stream] \
                      [--gzip-threads N] [--gzip-block-size BYTES] [--edit-pattern-length N] \
@@ -592,6 +605,7 @@ fn main() {
         };
         request.pipeline.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
         request.pipeline.direct_output_rendering = args.direct_output_rendering;
+        request.pipeline.input_mode = args.pipeline_input_mode;
         if let Some(queue_capacity) = args.queue_capacity {
             request.pipeline.queue_capacity = queue_capacity;
         }
@@ -679,6 +693,10 @@ fn main() {
             "mode": mode,
             "edit_backend": edit_backend,
             "execution": execution,
+            "pipeline_input_mode": match args.pipeline_input_mode {
+                PipelineInputMode::WorkerLocal => "worker-local",
+                PipelineInputMode::DedicatedReader => "dedicated-reader",
+            },
             "output": output,
             "edit_pattern_length": args.edit_pattern_length,
             "edit_max_edits": args.edit_max_edits,
