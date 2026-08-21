@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::marker::{Send, Sync};
 use std::ops::{Add, Bound, Div, Mul, Not, RangeBounds, Sub};
 
-use crate::errors::NameError;
+use crate::errors::{Name, NameError};
 use crate::expr::*;
 use crate::read::*;
 
@@ -957,6 +957,53 @@ impl ExprNode for Attr {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         vec![LabelOrAttr::Attr(self.clone())]
+    }
+}
+
+fn control_data_eval<'a>(data: &'a Data, use_qual: bool) -> EvalData<'a> {
+    if use_qual {
+        if let Some(bytes) = data.as_bytes() {
+            return EvalData::Bytes(Cow::Owned(vec![UNKNOWN_QUAL; bytes.len()]));
+        }
+    }
+    match data {
+        Data::Bool(value) => EvalData::Bool(*value),
+        Data::Int(value) => EvalData::Int(*value),
+        Data::Float(value) => EvalData::Float(*value),
+        Data::InlineBytes(value) => EvalData::Bytes(Cow::Borrowed(value.as_bytes())),
+        Data::Bytes(value) => EvalData::Bytes(Cow::Borrowed(value)),
+    }
+}
+
+impl ExprNode for RecordAttr {
+    fn eval<'a>(
+        &'a self,
+        read: &'a Read,
+        use_qual: bool,
+    ) -> std::result::Result<EvalData<'a>, NameError> {
+        read.record_data(self.attr)
+            .map(|data| control_data_eval(data, use_qual))
+            .ok_or(NameError::NotInRead(Name::Attr(self.attr)))
+    }
+
+    fn required_names(&self) -> Vec<LabelOrAttr> {
+        vec![LabelOrAttr::RecordAttr(self.clone())]
+    }
+}
+
+impl ExprNode for LaneAttr {
+    fn eval<'a>(
+        &'a self,
+        read: &'a Read,
+        use_qual: bool,
+    ) -> std::result::Result<EvalData<'a>, NameError> {
+        read.lane_data(self.lane, self.attr)
+            .map(|data| control_data_eval(data, use_qual))
+            .ok_or(NameError::NotInRead(Name::Attr(self.attr)))
+    }
+
+    fn required_names(&self) -> Vec<LabelOrAttr> {
+        vec![LabelOrAttr::LaneAttr(self.clone())]
     }
 }
 

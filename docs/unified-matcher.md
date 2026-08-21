@@ -26,9 +26,20 @@ construction; it adds no per-read dispatch decision.
 pattern**:
 
 - `Leftmost` (default) is deterministic and preserves compatibility;
+- EFGDL `best` is an explicit surface alias for global minimum distance
+  followed by the deterministic leftmost residual tie-break already guaranteed
+  by every matcher backend;
 - `Rightmost` selects the largest start coordinate;
+- `Quality { min_delta }` scores exact/Hamming candidates from mismatch-base
+  Phred values, selects the uniquely lower penalty, and otherwise rejects the
+  ambiguity unless the configured score delta is met;
 - `NoMatch` drops the candidate; and
 - `Error` stops execution.
+
+Quality-aware position resolution is deliberately rejected for edit distance
+until an explicit insertion/deletion quality model is part of the semantic
+contract. For searched anchor sets, pattern-quality resolution scores each
+candidate's own matched window rather than a shared coordinate.
 
 Detailed statistics report pattern ambiguity and positional ambiguity in
 separate counters. Identical duplicate patterns should be normalized by the

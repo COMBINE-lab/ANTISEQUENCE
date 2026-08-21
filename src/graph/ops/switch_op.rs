@@ -179,6 +179,20 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
         Ok(live)
     }
 
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> Vec<GraphOptimizationReport> {
+        self.arms
+            .iter_mut()
+            .map(|arm| arm.graph.optimize_for_compilation(optimization))
+            .collect()
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

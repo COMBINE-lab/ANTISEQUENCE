@@ -108,6 +108,17 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
         }
     }
 
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> Vec<GraphOptimizationReport> {
+        vec![self.graph.optimize_for_compilation(optimization)]
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

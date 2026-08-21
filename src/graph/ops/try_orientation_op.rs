@@ -40,6 +40,7 @@ pub struct TryOrientationOp<T: Trace = NoTrace> {
     /// Temporary record-metadata name for batch-index tracking.
     batch_idx_attr: InlineString,
     required_names: [LabelOrAttr; 1],
+    produced_names: [LabelOrAttr; 1],
 }
 
 impl<T: Trace> TryOrientationOp<T> {
@@ -52,14 +53,19 @@ impl<T: Trace> TryOrientationOp<T> {
     /// `Data::Bytes` (`b"fw"` or `b"rc"`). During the compatibility cycle,
     /// reads through `seq{read_idx}.*.{attr_name}` fall back to this value.
     pub fn new(inner: Graph<T>, read_idx: u8, attr_name: impl AsRef<[u8]>) -> Self {
+        let attr_name = InlineString::new(attr_name.as_ref());
         Self {
             inner,
             read_idx,
-            attr_name: InlineString::new(attr_name.as_ref()),
+            attr_name,
             batch_idx_attr: InlineString::new(b"_batch_idx"),
             required_names: [LabelOrAttr::Label(Label {
                 str_type: StrType::Seq(read_idx),
                 label: InlineString::new(b"*"),
+            })],
+            produced_names: [LabelOrAttr::LaneAttr(LaneAttr {
+                lane: read_idx,
+                attr: attr_name,
             })],
         }
     }
@@ -200,14 +206,34 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         &self.required_names
     }
 
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
     fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
-        let mut live = self.inner.validate_liveness_from(live_out)?;
+        let inner_live_out = live_out
+            .iter()
+            .filter(|name| !self.produced_names.contains(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut live = self.inner.validate_liveness_from(&inner_live_out)?;
         for name in &self.required_names {
             if !live.contains(name) {
                 live.push(name.clone());
             }
         }
         Ok(live)
+    }
+
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> Vec<GraphOptimizationReport> {
+        vec![self.inner.optimize_for_compilation(optimization)]
     }
 
     fn name(&self) -> &'static str {

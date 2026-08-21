@@ -1171,6 +1171,16 @@ impl Read {
                     }
                     return false;
                 }
+                crate::expr::LabelOrAttr::RecordAttr(a) => {
+                    if self.record_data(a.attr).is_none() {
+                        return false;
+                    }
+                }
+                crate::expr::LabelOrAttr::LaneAttr(a) => {
+                    if self.lane_data(a.lane, a.attr).is_none() {
+                        return false;
+                    }
+                }
             }
         }
 

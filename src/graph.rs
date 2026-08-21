@@ -608,6 +608,24 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         transfer_liveness(self.descriptor(), live_out)
     }
 
+    /// Whether this node owns one or more nested graphs. Shared nested nodes
+    /// that cannot be mutably inspected during compilation remain barriers.
+    #[inline]
+    fn has_nested_graphs(&self) -> bool {
+        false
+    }
+
+    /// Recursively optimize privately owned nested graphs. The parent graph
+    /// aggregates these reports so optimization remains observable without
+    /// exposing control-flow internals.
+    #[inline]
+    fn optimize_nested_graphs(
+        &mut self,
+        _optimization: GraphOptimizationConfig,
+    ) -> Vec<GraphOptimizationReport> {
+        Vec::new()
+    }
+
     /// Strongest mutation this operation may perform.
     #[inline]
     fn mutation_kind(&self) -> MutationKind {
@@ -831,7 +849,7 @@ fn transfer_liveness(
             .collect(),
         InvalidationEffect::Lane(lane) => live_across
             .iter()
-            .filter(|name| name.str_type() == lane)
+            .filter(|name| name.interval_str_type() == Some(lane))
             .cloned()
             .collect(),
         InvalidationEffect::AllIntervals => live_across.clone(),
@@ -1082,8 +1100,18 @@ impl<T: Trace> Graph<T> {
         &mut self,
         optimization: GraphOptimizationConfig,
     ) -> GraphOptimizationReport {
-        let original_operations = self.nodes.len();
-        let opaque_barriers = self
+        let local_original_operations = self.nodes.len();
+        let mut shared_nested_barriers = 0usize;
+        let mut nested_reports = Vec::new();
+        for node in &mut self.nodes {
+            if let Some(node) = Arc::get_mut(node) {
+                nested_reports.extend(node.optimize_nested_graphs(optimization));
+            } else if node.has_nested_graphs() {
+                shared_nested_barriers += 1;
+            }
+        }
+
+        let local_opaque_barriers = self
             .nodes
             .iter()
             .filter(|node| {
@@ -1122,20 +1150,52 @@ impl<T: Trace> Graph<T> {
             changed_nodes: adjacent_changes,
         });
 
-        let terminal_projection_candidates = self
+        let local_terminal_projection_candidates = self
             .pipeline_output_start()
             .ok()
             .map(|output_start| self.direct_projection_suffix(output_start).1.len())
             .unwrap_or(0);
         passes.push(GraphOptimizationPassReport {
             pass: "terminal_projection_output_fusion",
-            changed_nodes: usize::from(terminal_projection_candidates > 0),
+            changed_nodes: usize::from(local_terminal_projection_candidates > 0),
         });
+
+        for nested in &nested_reports {
+            for nested_pass in &nested.passes {
+                if let Some(pass) = passes.iter_mut().find(|pass| pass.pass == nested_pass.pass) {
+                    pass.changed_nodes += nested_pass.changed_nodes;
+                } else {
+                    passes.push(nested_pass.clone());
+                }
+            }
+        }
+
+        let original_operations = local_original_operations
+            + nested_reports
+                .iter()
+                .map(|report| report.original_operations)
+                .sum::<usize>();
+        let optimized_operations = self.nodes.len()
+            + nested_reports
+                .iter()
+                .map(|report| report.optimized_operations)
+                .sum::<usize>();
+        let opaque_barriers = local_opaque_barriers
+            + shared_nested_barriers
+            + nested_reports
+                .iter()
+                .map(|report| report.opaque_barriers)
+                .sum::<usize>();
+        let terminal_projection_candidates = local_terminal_projection_candidates
+            + nested_reports
+                .iter()
+                .map(|report| report.terminal_projection_candidates)
+                .sum::<usize>();
 
         GraphOptimizationReport {
             enabled: optimization.enabled,
             original_operations,
-            optimized_operations: self.nodes.len(),
+            optimized_operations,
             opaque_barriers,
             terminal_projection_candidates,
             passes,
@@ -2971,6 +3031,34 @@ mod graph_api_tests {
     }
 
     #[test]
+    fn explicit_control_metadata_survives_projection_and_is_live_in_nested_graphs() {
+        let wildcard = Label::new(b"seq1.*").unwrap();
+        let orientation = lane_attr(1, b"ori");
+        let record_route = record_attr(b"route");
+
+        let mut nested = Graph::<NoTrace>::new();
+        nested.add(ProjectOp::new([wildcard.clone()]));
+        nested.add(RetainOp::new(
+            Expr::from(orientation.clone()).eq(b"fw".to_vec()),
+        ));
+        nested.add(RetainOp::new(
+            Expr::from(record_route.clone()).eq(b"keep".to_vec()),
+        ));
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(SetOp::new(orientation, b"fw".to_vec()));
+        builder.add(SetOp::new(record_route, b"keep".to_vec()));
+        builder.add(TryOp::new(nested, Graph::new()).return_catch_output());
+        let compiled = builder.compile().unwrap();
+        let output = compiled
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(output.len(), 1);
+    }
+
+    #[test]
     fn missing_input_policies_are_explicit_and_per_read_when_strict() {
         let trace = NoTrace;
 
@@ -3064,6 +3152,37 @@ mod graph_api_tests {
             optimized_read.to_fastq(1).unwrap(),
             unoptimized_read.to_fastq(1).unwrap()
         );
+    }
+
+    #[test]
+    fn compilation_recursively_optimizes_nested_graphs_and_aggregates_the_report() {
+        let make_builder = || {
+            let mut try_graph = Graph::<NoTrace>::new();
+            try_graph.add(RetainOp::new(true));
+            try_graph.add(TrimOp::new(std::iter::empty::<Label>()));
+            let mut catch_graph = Graph::<NoTrace>::new();
+            catch_graph.add(RetainOp::new(true));
+            let mut builder = GraphBuilder::<NoTrace>::new();
+            builder.add(TryOp::new(try_graph, catch_graph).return_catch_output());
+            builder
+        };
+
+        let optimized = make_builder().compile().unwrap();
+        assert_eq!(optimized.optimization_report().original_operations, 4);
+        assert_eq!(optimized.optimization_report().optimized_operations, 1);
+        assert_eq!(
+            optimized.optimization_report().passes[0],
+            GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 3,
+            }
+        );
+
+        let unoptimized = make_builder()
+            .compile_with(GraphOptimizationConfig { enabled: false })
+            .unwrap();
+        assert_eq!(unoptimized.optimization_report().original_operations, 4);
+        assert_eq!(unoptimized.optimization_report().optimized_operations, 4);
     }
 
     #[test]

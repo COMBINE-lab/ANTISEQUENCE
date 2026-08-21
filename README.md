@@ -55,14 +55,17 @@ invalid operation configuration returns a structured `InvalidOperation` error.
 See the [validated graph API guide](docs/graph-api.md) for migration and custom
 operation details.
 
-The remaining optimizer and execution-planner work, its acceptance gates, and
-the boundary before complex-protocol development are recorded in the
+The completed optimizer and execution-planner work, its acceptance gates, and
+the complex-protocol boundary are recorded in the
 [Milestone 2 execution plan](docs/graph-optimization-and-planning.md).
 The accepted backend policy and its measured crossover matrix are recorded in
 the [Milestone 2 benchmark report](docs/benchmarks/milestone-2-execution-crossover-2026-08-20.md).
 Milestone 3 matcher semantics, observable backend planning, ambiguity axes, and
 rollout gates are described in the
 [unified matcher guide](docs/unified-matcher.md).
+Lazy record/lane control metadata, explicit invalidation effects, recursive
+liveness, and nested-graph optimizer integration are described in the
+[metadata and liveness design](docs/metadata-liveness-redesign.md).
 
 ## Terminal read projection
 

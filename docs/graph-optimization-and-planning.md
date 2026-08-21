@@ -16,7 +16,7 @@ subsequent complex-protocol milestone.
 - `ForkOp`, `TryOp`, and `TryOrientationOp` use size-dispatched copy-on-write
   storage for long records while retaining ordinary copies for short records.
 
-## Remaining Milestone 2 work
+## Completed Milestone 2 optimization work
 
 ### Graph optimization
 
@@ -43,7 +43,16 @@ folds repeated adjacent trims with identical operands: trimming the same
 interval twice is idempotent, required-name behavior is unchanged, and the
 fold is disabled whenever the trace type exposes operation events. Other
 adjacent operations remain unfused until they can provide equally strong
-proofs.
+proofs. Compilation now applies the same passes recursively to privately owned
+graphs in `TryOp`, `SwitchOp`, `SelectOp`, `ForkOp`, `WhileOp`, `TimeOp`, and
+`TryOrientationOp`; aggregate report counts include those nested operations.
+Shared nested nodes remain explicit barriers rather than being mutated through
+an outstanding `Arc`.
+
+Record/lane/interval effects and recursive backward liveness are implemented.
+`ProjectOp` declares lane-wide interval invalidation, while explicit record and
+lane control metadata survive it. Unsafe destructive placement is rejected
+before execution, including across branches and loop fixed points.
 
 ### Execution planning
 

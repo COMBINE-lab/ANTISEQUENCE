@@ -93,7 +93,9 @@ impl TransformExpr {
     pub fn try_after_label(&self, i: usize, context: &'static str) -> Result<Option<Label>> {
         match self.after.get(i).cloned() {
             Some(Some(LabelOrAttr::Label(label))) => Ok(Some(label)),
-            Some(Some(LabelOrAttr::Attr(_))) => Err(Error::InvalidOperation {
+            Some(Some(
+                LabelOrAttr::Attr(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_),
+            )) => Err(Error::InvalidOperation {
                 operation: context,
                 reason: format!("output {i} must be a label, not an attribute"),
             }),
@@ -113,7 +115,9 @@ impl TransformExpr {
     pub fn try_after_attr(&self, i: usize, context: &'static str) -> Result<Option<Attr>> {
         match self.after.get(i).cloned() {
             Some(Some(LabelOrAttr::Attr(attr))) => Ok(Some(attr)),
-            Some(Some(LabelOrAttr::Label(_))) => Err(Error::InvalidOperation {
+            Some(Some(
+                LabelOrAttr::Label(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_),
+            )) => Err(Error::InvalidOperation {
                 operation: context,
                 reason: format!("output {i} must be an attribute, not a label"),
             }),

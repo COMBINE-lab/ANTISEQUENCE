@@ -32,6 +32,7 @@ impl SetOp {
                 str_type: a.str_type,
                 label: a.label,
             })),
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {}
         }
 
         Self {
@@ -50,7 +51,9 @@ impl<T: Trace> GraphNode<T> for SetOp {
     fn mutation_kind(&self) -> MutationKind {
         match &self.label_or_attr {
             LabelOrAttr::Label(_) => MutationKind::Sequence,
-            LabelOrAttr::Attr(_) => MutationKind::Metadata,
+            LabelOrAttr::Attr(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {
+                MutationKind::Metadata
+            }
         }
     }
 
@@ -125,6 +128,30 @@ impl<T: Trace> GraphNode<T> for SetOp {
                         }
                     };
                     *target = new_val;
+                }
+                LabelOrAttr::RecordAttr(attr) => {
+                    let new_val: Data = self
+                        .expr
+                        .eval(read, false)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?
+                        .into();
+                    *read.record_data_mut(attr.attr) = new_val;
+                }
+                LabelOrAttr::LaneAttr(attr) => {
+                    let new_val: Data = self
+                        .expr
+                        .eval(read, false)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?
+                        .into();
+                    *read.lane_data_mut(attr.lane, attr.attr) = new_val;
                 }
             }
         }

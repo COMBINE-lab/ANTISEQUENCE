@@ -54,6 +54,9 @@ pub fn parse_fmt_expr(expr: &[u8]) -> Result<Vec<Expr>> {
                 let e = match LabelOrAttr::new(label)? {
                     LabelOrAttr::Label(label) => Expr::from(label),
                     LabelOrAttr::Attr(attr) => Expr::from(attr),
+                    LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {
+                        unreachable!("text parser only constructs interval-relative names")
+                    }
                 };
                 res.push(e);
                 in_label = false;

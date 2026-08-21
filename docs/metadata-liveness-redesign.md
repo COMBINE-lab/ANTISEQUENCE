@@ -60,8 +60,9 @@ attributes before promoting to an `FxHashMap`. Orientation and internal batch
 identity move to lane and record metadata, respectively. During one compatibility
 cycle, an existing expression such as `seq1.*.ori` falls back to lane metadata
 when the wildcard mapping has no such interval attribute. New Rust APIs name
-record and lane metadata explicitly; EFGDL gains an explicit namespace only
-after the compatibility behavior has shipped and been measured.
+record and lane metadata explicitly through `record_attr(...)` and
+`lane_attr(...)`; EFGDL gains an explicit namespace only after the compatibility
+behavior has shipped and been measured.
 
 ## Chosen graph contract
 
@@ -105,9 +106,13 @@ barriers; they are not silently assumed to preserve or invalidate names.
    - Compute live-in/live-out sets across `SwitchOp`, `TryOp`, loops, and forks.
    - Reject unsafe invalidation with an actionable graph diagnostic.
 4. **Optimization integration**
-   - Permit terminal projection and other destructive fusion inside proven-safe
-     nested scopes.
-   - Remove compatibility aliases once downstream users have migrated.
+   - Compilation recursively optimizes privately owned nested graphs and
+     aggregates their node/pass counts in the parent report.
+   - Terminal projection and other destructive operations are admitted inside
+     nested scopes only when backward liveness proves the enclosing
+     continuation independent of invalidated interval names.
+   - Compatibility aliases remain for one migration cycle; explicit control
+     expressions are the liveness-safe form.
 
 ## Required validation
 
@@ -134,8 +139,9 @@ capture is an error, and dynamically sized collections remain future work.
 
 ## Deferred surface decisions
 
-- The final EFGDL spelling for explicit record/lane metadata. The Rust API and
-  compatibility alias land first so syntax is not frozen before measurement.
+- The final EFGDL spelling for explicit record/lane metadata. The Rust API is
+  available and seqproc uses it internally for orientation routing, while the
+  compatibility alias remains so syntax is not frozen before measurement.
 - Whether liveness sets should later be compiled to dense bitsets. The initial
   concrete-name representation is easier to audit and is off the per-read path.
 - A derive/helper API for custom nodes. Until then, custom nodes default to an
