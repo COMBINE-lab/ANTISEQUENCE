@@ -772,6 +772,8 @@ pub struct OutputFastqOp<'writer> {
     buffers: ThreadLocal<RefCell<Vec<Vec<u8>>>>,
     compressed_buffers: ThreadLocal<RefCell<Vec<Vec<u8>>>>,
     parallel_gzip_level: Option<u32>,
+    statistics_level: AtomicU8,
+    emitted_reads: ThreadLocal<Mutex<usize>>,
 }
 
 impl<'writer> OutputFastqOp<'writer> {
@@ -784,6 +786,8 @@ impl<'writer> OutputFastqOp<'writer> {
             buffers: ThreadLocal::new(),
             compressed_buffers: ThreadLocal::new(),
             parallel_gzip_level: None,
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         }
     }
 
@@ -800,6 +804,8 @@ impl<'writer> OutputFastqOp<'writer> {
             buffers: ThreadLocal::new(),
             compressed_buffers: ThreadLocal::new(),
             parallel_gzip_level: None,
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         }
     }
 
@@ -815,6 +821,8 @@ impl<'writer> OutputFastqOp<'writer> {
             buffers: ThreadLocal::new(),
             compressed_buffers: ThreadLocal::new(),
             parallel_gzip_level: Some(level),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         })
     }
 
@@ -834,6 +842,8 @@ impl<'writer> OutputFastqOp<'writer> {
             buffers: ThreadLocal::new(),
             compressed_buffers: ThreadLocal::new(),
             parallel_gzip_level: Some(level),
+            statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            emitted_reads: ThreadLocal::new(),
         })
     }
 
@@ -1003,6 +1013,13 @@ impl<'writer> OutputFastqOp<'writer> {
         }
         Ok(())
     }
+
+    #[inline]
+    fn record_emitted(&self, count: usize) {
+        if self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8 {
+            *self.emitted_reads.get_or(|| Mutex::new(0)).lock() += count;
+        }
+    }
 }
 
 impl<'writer> Drop for OutputFastqOp<'writer> {
@@ -1063,7 +1080,25 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
     }
 
     fn commit_output(&self, prepared: &mut PreparedOutput) -> Result<()> {
-        self.commit_fastq(prepared)
+        let collect = self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8;
+        let count = if collect {
+            match prepared {
+                PreparedOutput::Fastq(buffers) => buffers
+                    .first()
+                    .map(|buffer| buffer.iter().filter(|byte| **byte == b'\n').count() / 4)
+                    .unwrap_or(0),
+                PreparedOutput::ParallelGzipFastq { raw, .. } => raw
+                    .first()
+                    .map(|buffer| buffer.iter().filter(|byte| **byte == b'\n').count() / 4)
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        self.commit_fastq(prepared)?;
+        self.record_emitted(count);
+        Ok(())
     }
 
     fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
@@ -1115,7 +1150,18 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
         }
         // All locks released together when locked_writers is dropped
 
+        self.record_emitted(reads.len());
+
         Ok((Some(reads), false))
+    }
+
+    fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.statistics_level.store(level as u8, Ordering::Relaxed);
+    }
+
+    fn emitted_reads(&self) -> Option<usize> {
+        (self.statistics_level.load(Ordering::Relaxed) != StatisticsLevel::Off as u8)
+            .then(|| self.emitted_reads.iter().map(|count| *count.lock()).sum())
     }
 
     fn required_names(&self) -> &[LabelOrAttr] {

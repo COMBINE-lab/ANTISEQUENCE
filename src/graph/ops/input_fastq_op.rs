@@ -218,13 +218,16 @@ impl<'reader> InputFastqOp<'reader> {
     ) -> Result<Self> {
         let readers = readers
             .into_iter()
-            .map(|r| {
-                (
-                    Mutex::new(parse_fastx_reader(r).unwrap_or_else(|e| panic!("{e}"))),
+            .map(|reader| -> Result<ReaderWithOrigin<'reader>> {
+                Ok((
+                    Mutex::new(
+                        parse_fastx_reader(reader)
+                            .map_err(|error| Error::BytesIo(Box::new(error)))?,
+                    ),
                     Arc::new(Origin::Bytes),
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         let n_fastqs = readers.len();
 

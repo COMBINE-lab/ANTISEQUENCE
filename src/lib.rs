@@ -886,6 +886,24 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn arbitrary_reader_construction_is_fallible() {
+        let result = InputFastqOp::from_readers([Cursor::new(Vec::<u8>::new())]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn writer_backed_output_reports_emitted_reads() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "TGCA", "IIII")]);
+        let output = SharedWriter::default();
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Basic);
+        graph.try_run_with_threads(1).unwrap();
+        assert_eq!(graph.final_output_reads(), Some(2));
+    }
+
+    #[test]
     fn test_prepared_pipeline_output_fastq_file_preserves_order() {
         let tmp = std::env::temp_dir().join(format!(
             "antiseq_test_prepared_file_{}.fastq",
