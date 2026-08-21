@@ -71,6 +71,16 @@ pub struct GraphOptimizationReport {
     pub passes: Vec<GraphOptimizationPassReport>,
 }
 
+/// An exact, allocation-tolerant operation identity used only while compiling.
+///
+/// Variants are added only when the named operation has proven idempotence for
+/// adjacent identical configurations. This is intentionally not a general
+/// dynamic downcast interface.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdjacentOptimizationSignature {
+    IdempotentTrim(Vec<Label>),
+}
+
 /// Controls the amount of runtime instrumentation collected by graph nodes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -585,6 +595,14 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         false
     }
 
+    /// Return an exact signature when two adjacent identical nodes can be
+    /// replaced by one without changing reads, failures, or termination.
+    /// Event-producing trace implementations disable this pass globally.
+    #[inline]
+    fn adjacent_optimization_signature(&self) -> Option<AdjacentOptimizationSignature> {
+        None
+    }
+
     /// Return the optimizer-facing operation descriptor without allocation.
     #[inline]
     fn descriptor(&self) -> OperationDescriptor<'_> {
@@ -993,6 +1011,26 @@ impl<T: Trace> Graph<T> {
                 changed_nodes: before - self.nodes.len(),
             });
         }
+
+        let mut adjacent_changes = 0;
+        if optimization.enabled && !T::RECORDS_EVENTS {
+            let mut previous = None;
+            self.nodes.retain(|node| {
+                let signature = node.adjacent_optimization_signature();
+                let duplicate = signature.is_some() && signature == previous;
+                if duplicate {
+                    adjacent_changes += 1;
+                    false
+                } else {
+                    previous = signature;
+                    true
+                }
+            });
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "adjacent_idempotent_fusion",
+            changed_nodes: adjacent_changes,
+        });
 
         let terminal_projection_candidates = self
             .pipeline_output_start()
@@ -2865,6 +2903,62 @@ mod graph_api_tests {
     }
 
     #[test]
+    fn compilation_folds_only_proven_adjacent_idempotent_operations() {
+        let target = Label::new(b"seq1.*").unwrap();
+
+        let mut optimized = GraphBuilder::<NoTrace>::new();
+        optimized.add(TrimOp::new([target.clone()]));
+        optimized.add(TrimOp::new([target.clone()]));
+        let optimized = optimized.compile().unwrap();
+        assert_eq!(optimized.descriptors().len(), 1);
+        assert_eq!(
+            optimized.optimization_report().passes[1],
+            GraphOptimizationPassReport {
+                pass: "adjacent_idempotent_fusion",
+                changed_nodes: 1,
+            }
+        );
+
+        let mut unoptimized = GraphBuilder::<NoTrace>::new();
+        unoptimized.add(TrimOp::new([target.clone()]));
+        unoptimized.add(TrimOp::new([target.clone()]));
+        let unoptimized = unoptimized
+            .compile_with(GraphOptimizationConfig { enabled: false })
+            .unwrap();
+        assert_eq!(unoptimized.descriptors().len(), 2);
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+
+        let mut traced = GraphBuilder::<TraceReads>::new();
+        traced.add(TrimOp::new([target.clone()]));
+        traced.add(TrimOp::new([target]));
+        let traced = traced.compile().unwrap();
+        assert_eq!(traced.descriptors().len(), 2);
+        assert_eq!(
+            traced.optimization_report().passes[1].changed_nodes,
+            0,
+            "trace-visible operation boundaries must not be folded"
+        );
+    }
+
+    #[test]
     fn compilation_reports_terminal_projection_candidates() {
         use std::io::Cursor;
 
@@ -2883,7 +2977,7 @@ mod graph_api_tests {
             1
         );
         assert_eq!(
-            compiled.optimization_report().passes[1],
+            compiled.optimization_report().passes[2],
             GraphOptimizationPassReport {
                 pass: "terminal_projection_output_fusion",
                 changed_nodes: 1,

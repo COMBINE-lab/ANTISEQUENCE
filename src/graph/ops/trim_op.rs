@@ -39,6 +39,12 @@ impl<T: Trace> GraphNode<T> for TrimOp {
         self.labels.is_empty()
     }
 
+    fn adjacent_optimization_signature(&self) -> Option<AdjacentOptimizationSignature> {
+        Some(AdjacentOptimizationSignature::IdempotentTrim(
+            self.labels.clone(),
+        ))
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             self.labels

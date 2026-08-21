@@ -49,11 +49,13 @@ struct Args {
     gzip_block_size: usize,
     terminal_projection: bool,
     direct_output_rendering: bool,
+    graph_optimization: bool,
     fork_reads: bool,
 }
 
 #[derive(Clone, Copy)]
 enum Execution {
+    Auto,
     WholeGraphWorkers,
     PipelineUnordered,
     PipelineOrdered,
@@ -130,6 +132,7 @@ fn parse_args() -> Args {
         gzip_block_size: 128 * 1024,
         terminal_projection: false,
         direct_output_rendering: true,
+        graph_optimization: true,
         fork_reads: false,
     };
     let mut cli = std::env::args().skip(1);
@@ -164,11 +167,12 @@ fn parse_args() -> Args {
             }
             "--execution" => {
                 args.execution = match cli.next().expect("--execution value").as_str() {
+                    "auto" => Execution::Auto,
                     "whole-graph" => Execution::WholeGraphWorkers,
                     "pipeline" => Execution::PipelineUnordered,
                     "pipeline-ordered" => Execution::PipelineOrdered,
                     value => panic!(
-                        "unknown execution {value:?}; expected whole-graph, pipeline, or pipeline-ordered"
+                        "unknown execution {value:?}; expected auto, whole-graph, pipeline, or pipeline-ordered"
                     ),
                 }
             }
@@ -305,6 +309,7 @@ fn parse_args() -> Args {
             }
             "--terminal-projection" => args.terminal_projection = true,
             "--no-direct-output-rendering" => args.direct_output_rendering = false,
+            "--no-graph-optimization" => args.graph_optimization = false,
             "--fork" => args.fork_reads = true,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
@@ -325,7 +330,7 @@ fn parse_args() -> Args {
                      [--repetitions N] [--statistics] \
                      [--statistics-level off|basic|detailed] \
                      [--mode passthrough|hamming|seeded|edit-dp] \
-                     [--execution whole-graph|pipeline|pipeline-ordered] \
+                     [--execution auto|whole-graph|pipeline|pipeline-ordered] \
                      [--queue-capacity N] [--max-in-flight-batches N] [--batch-size N] \
                      [--output null|plain|gzip|parallel-gzip|parallel-gzip-stream] \
                      [--gzip-threads N] [--gzip-block-size BYTES] [--edit-pattern-length N] \
@@ -335,7 +340,7 @@ fn parse_args() -> Args {
                      [--seed-text-length N] [--seed-scenario exact|no-match|repetitive] \
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
                      [--gzip-level 0..9] [--terminal-projection] \
-                     [--no-direct-output-rendering] [--fork]"
+                     [--no-direct-output-rendering] [--no-graph-optimization] [--fork]"
                 );
                 std::process::exit(0);
             }
@@ -565,34 +570,43 @@ fn main() {
     let mut seconds = Vec::with_capacity(args.repetitions);
     let mut statistics_aggregation_seconds = Vec::with_capacity(args.repetitions);
     let mut pipeline_reports = Vec::with_capacity(args.repetitions);
+    let mut execution_plans = Vec::with_capacity(args.repetitions);
+    let mut optimization_reports = Vec::with_capacity(args.repetitions);
     let mut output_byte_counts = Vec::with_capacity(args.repetitions);
 
     for _ in 0..args.repetitions {
         let build_start = Instant::now();
         let (graph, output_bytes) = build_graph(input.clone(), &args);
+        let graph = graph
+            .compile_with(GraphOptimizationConfig {
+                enabled: args.graph_optimization,
+            })
+            .expect("compile benchmark graph");
         graph_build_seconds.push(build_start.elapsed().as_secs_f64());
         let start = Instant::now();
-        let report = match args.execution {
-            Execution::WholeGraphWorkers => {
-                graph.try_run_with_threads(args.threads).expect("graph run");
-                None
-            }
-            Execution::PipelineUnordered | Execution::PipelineOrdered => {
-                let mut config = PipelineConfig::new(args.threads);
-                config.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
-                config.direct_output_rendering = args.direct_output_rendering;
-                if let Some(queue_capacity) = args.queue_capacity {
-                    config.queue_capacity = queue_capacity;
-                }
-                if let Some(max_in_flight_batches) = args.max_in_flight_batches {
-                    config.max_in_flight_batches = max_in_flight_batches;
-                }
-                if let Some(batch_size) = args.batch_size {
-                    config.batch_size = batch_size;
-                }
-                Some(graph.try_run_pipeline(config).expect("pipeline run"))
-            }
+        let mut request = ExecutionRequest::new(args.threads);
+        request.mode = match args.execution {
+            Execution::Auto => ExecutionMode::Auto,
+            Execution::WholeGraphWorkers => ExecutionMode::WholeGraph,
+            Execution::PipelineUnordered | Execution::PipelineOrdered => ExecutionMode::Pipeline,
         };
+        request.pipeline.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
+        request.pipeline.direct_output_rendering = args.direct_output_rendering;
+        if let Some(queue_capacity) = args.queue_capacity {
+            request.pipeline.queue_capacity = queue_capacity;
+        }
+        if let Some(max_in_flight_batches) = args.max_in_flight_batches {
+            request.pipeline.max_in_flight_batches = max_in_flight_batches;
+        }
+        if let Some(batch_size) = args.batch_size {
+            request.pipeline.batch_size = batch_size;
+        }
+        let planned = graph
+            .try_run_planned(request)
+            .expect("planned benchmark run");
+        let report = planned.pipeline;
+        let plan = planned.plan;
+        let optimization_report = graph.optimization_report().clone();
         let aggregation_start = Instant::now();
         if args.statistics_level.is_enabled() {
             std::hint::black_box((
@@ -609,6 +623,8 @@ fn main() {
         seconds.push(start.elapsed().as_secs_f64());
         output_byte_counts.push(output_bytes.load(Ordering::Relaxed));
         pipeline_reports.push(report);
+        execution_plans.push(plan);
+        optimization_reports.push(optimization_report);
     }
 
     let mean_seconds = seconds.iter().sum::<f64>() / seconds.len() as f64;
@@ -621,6 +637,7 @@ fn main() {
         Mode::EditDp => "edit-dp",
     };
     let execution = match args.execution {
+        Execution::Auto => "auto",
         Execution::WholeGraphWorkers => "whole-graph",
         Execution::PipelineUnordered => "pipeline",
         Execution::PipelineOrdered => "pipeline-ordered",
@@ -681,6 +698,7 @@ fn main() {
             "gzip_block_size": args.gzip_block_size,
             "terminal_projection": args.terminal_projection,
             "direct_output_rendering": args.direct_output_rendering,
+            "graph_optimization": args.graph_optimization,
             "fork_reads": args.fork_reads,
             "reads": args.reads,
             "threads": args.threads,
@@ -697,6 +715,8 @@ fn main() {
             "mean_graph_build_seconds": mean_graph_build_seconds,
             "mean_reads_per_second": args.reads as f64 / mean_seconds,
             "pipeline_reports": pipeline_reports,
+            "execution_plans": execution_plans,
+            "optimization_reports": optimization_reports,
         }))
         .expect("serialize benchmark result")
     );

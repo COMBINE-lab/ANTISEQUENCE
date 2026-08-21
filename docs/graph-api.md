@@ -37,9 +37,12 @@ Compilation enables conservative graph optimization by default. Use
 `compile_with(GraphOptimizationConfig { enabled: false })` to construct a
 byte-level differential oracle. `CompiledGraph::optimization_report()` records
 the original and final operation counts, each pass, opaque barriers, and
-terminal projection candidates. The current structural pass removes only
-configuration-specific operations that declare themselves semantic no-ops;
-unknown and custom nodes remain barriers.
+terminal projection candidates. Structural passes remove only
+configuration-specific operations that declare themselves semantic no-ops and
+fold repeated adjacent `TrimOp` nodes with identical operands. The latter is
+valid because trimming an already-trimmed interval is idempotent and the
+required-name set is unchanged; it is disabled for trace types that expose
+operation events. Unknown and custom nodes remain barriers.
 
 ## Missing inputs
 

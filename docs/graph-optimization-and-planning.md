@@ -36,10 +36,14 @@ arbitrary dead-label elimination or nested-graph reordering remains governed
 by `metadata-liveness-redesign.md`; an optimizer must not guess across those
 boundaries.
 
-The first implementation now provides the optimization configuration/report,
-sound expression read-dependence tracking, semantic no-op removal, terminal
-projection candidate reporting, and conservative opaque barriers. Further
-adjacent-operation fusion remains subject to the same proof requirements.
+The implementation provides the optimization configuration/report, sound
+expression read-dependence tracking, semantic no-op removal, terminal
+projection candidate reporting, and conservative opaque barriers. It also
+folds repeated adjacent trims with identical operands: trimming the same
+interval twice is idempotent, required-name behavior is unchanged, and the
+fold is disabled whenever the trace type exposes operation events. Other
+adjacent operations remain unfused until they can provide equally strong
+proofs.
 
 ### Execution planning
 
@@ -57,11 +61,12 @@ Callers may request automatic planning or force a backend for controlled
 benchmarking. The planner must preserve current behavior until representative
 measurements justify changing a default.
 
-The first implementation now exposes deterministic `ExecutionRequest`,
+The implementation exposes deterministic `ExecutionRequest`,
 `ExecutionPlan`, and `PlannedExecutionReport` APIs with stable reason codes.
 Automatic mode preserves the whole-graph default except when ordering requires
-the bounded pipeline. The remaining work is seqproc integration and the
-representative crossover matrix.
+the bounded pipeline. seqproc exposes forced modes and reports both the
+optimization and planning decisions in summary schema 1.4.0. The remaining
+acceptance work is the representative crossover matrix.
 
 ## Acceptance gates
 
