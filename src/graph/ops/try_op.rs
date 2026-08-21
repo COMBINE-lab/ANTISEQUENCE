@@ -8,6 +8,7 @@ pub struct TryOp<T: Trace = NoTrace> {
     catch_graph: Graph<T>,
     statistics_level: AtomicU8,
     failed_reads: ThreadLocal<Mutex<usize>>,
+    return_catch_output: bool,
 }
 
 impl<T: Trace> TryOp<T> {
@@ -26,7 +27,18 @@ impl<T: Trace> TryOp<T> {
             catch_graph,
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             failed_reads: ThreadLocal::new(),
+            return_catch_output: false,
         }
+    }
+
+    /// Return successful catch-graph records to the enclosing graph instead
+    /// of treating the catch graph as a side-effect-only sink.
+    ///
+    /// The default remains side-effect-only for compatibility with unassigned
+    /// FASTQ routing. Ordered layout alternatives should enable this mode.
+    pub fn return_catch_output(mut self) -> Self {
+        self.return_catch_output = true;
+        self
     }
 }
 
@@ -53,7 +65,15 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
                 if collect_stats {
                     rejected_count += 1;
                 }
-                let _ = self.catch_graph.run_one(Some(vec![original]), trace)?;
+                let (catch_output, done) = self.catch_graph.run_one(Some(vec![original]), trace)?;
+                if done {
+                    return Ok((catch_output, true));
+                }
+                if self.return_catch_output {
+                    if let Some(mut catch_output) = catch_output {
+                        accepted.append(&mut catch_output);
+                    }
+                }
             } else if let Some(mut output) = output {
                 accepted.append(&mut output);
             }

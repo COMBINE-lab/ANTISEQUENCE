@@ -1412,6 +1412,21 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn try_op_can_return_successful_fallback_records() {
+        let fq = fastq_bytes(&[("read1", "ACGTNNNN", "IIIIIIII")]);
+        let mut preferred = Graph::<NoTrace>::new();
+        preferred.add(TrimOp::new([label("seq1.missing")]));
+        let fallback = Graph::<NoTrace>::new();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(TryOp::new(preferred, fallback).return_catch_output());
+        let returned = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
+        assert_eq!(returned.counts(), [1]);
+    }
+
+    #[test]
     fn test_graph_bernoulli_op() {
         let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "TGCA", "IIII")]);
 
