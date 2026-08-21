@@ -104,8 +104,9 @@ materialization. This optimization is reported in `PipelineReport` and can be
 disabled through `PipelineConfig` for differential testing.
 `SwitchOp` evaluates all routing predicates before running any arm, so each
 mutually exclusive arm may safely end in a terminal projection. The broader
-[metadata and graph-liveness redesign](docs/metadata-liveness-redesign.md) is
-documented as deferred work for arbitrary nested graphs.
+[metadata and graph-liveness redesign](docs/metadata-liveness-redesign.md) now
+provides record/lane control metadata, explicit invalidation effects, and
+recursive validation for arbitrary privately owned nested graphs.
 
 Branching operations (`ForkOp`, `TryOp`, and `TryOrientationOp`) use a
 size-dispatched copy-on-write path. Long records share immutable FASTQ storage

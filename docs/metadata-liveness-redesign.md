@@ -2,10 +2,12 @@
 
 ## Status
 
-Active implementation plan. `SwitchOp` remains the compatibility solution for
-conditional terminal output, but it is no longer the final liveness model.
-The implementation is staged so that every public representation introduced
-here remains valid for indexed captures and later optimizer passes.
+Implemented foundation. `SwitchOp` remains the compatibility solution for
+conditional terminal output, while scoped metadata and recursive liveness are
+now the general model. The remaining deferred choices are limited to public
+EFGDL metadata syntax, possible dense liveness sets, and helper APIs for custom
+nodes; the representation already supports indexed captures and later
+optimizer passes.
 
 ## Current model and limitation
 
@@ -77,15 +79,16 @@ behavior has shipped and been measured.
 - cardinality and ordering effects where nested control flow needs them.
 
 The graph validator computes live names backwards through a graph and
-through every nested arm. It should reject a node that invalidates something in
+through every nested arm. It rejects a node that invalidates something in
 its live-out set. A terminal projection becomes legal inside a nested branch
 when the branch and all enclosing continuations have no live dependency on the
 discarded mappings.
 
-This contract should also replace representative-first-read dependency checks
-where read-level availability may differ within one batch. Static validation
-handles configuration errors; genuinely data-dependent absence must be routed
-per read by an explicit conditional/try operation.
+This contract works alongside strict per-record missing-input handling where
+read-level availability differs within one batch. Static validation handles
+configuration errors; genuinely data-dependent absence is either rejected per
+record or routed by an explicit conditional/try operation, according to the
+configured missing-input policy.
 
 Nested nodes participate through a virtual liveness-transfer hook rather than
 exposing their private graph representation. `TryOp`, `SwitchOp`, and

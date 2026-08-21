@@ -91,10 +91,13 @@ warranted.
 - Planner and optimization decisions exposed through the Rust API and seqproc
   `explain`/run reports.
 
-## Milestone 3 boundary
+## Milestone 3 follow-on status
 
-Milestone 3 begins only after these gates. It contains the complex-protocol
-work: layout algebra, expanded anchor and ambiguity semantics, a unified
-matcher abstraction and dispatch layer, and its verification and staged
-rollout. Milestone 2 performance work is not evidence that those capabilities
-have been implemented.
+The execution gates above were completed before the complex-protocol layer was
+added. The follow-on implementation now includes the unified matcher contract,
+inspectable backend dispatch, independent pattern/position ambiguity axes, and
+the exhaustive reference oracle described in `unified-matcher.md`. seqproc's
+EFGDL 2 compiler builds bounded layout algebra and statically indexed captures
+on these graph and matcher foundations. Their separate differential,
+property, end-to-end, and performance gates remain important: the Milestone 2
+execution measurements alone are not evidence for the later language features.
