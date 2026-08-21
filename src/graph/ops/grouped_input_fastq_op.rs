@@ -222,7 +222,7 @@ impl GroupedInputStatsAccumulator {
 /// Streams synchronized logical FASTQ lanes whose inputs are split across
 /// ordered shards. Only the active shard in each lane is open at a time.
 pub struct GroupedInputFastqOp {
-    lanes: Vec<Mutex<ShardedFastqReader>>,
+    lanes: SmallVec<[Mutex<ShardedFastqReader>; 3]>,
     shard_count: usize,
     interleaved: usize,
     n_fastqs: usize,
@@ -336,7 +336,7 @@ impl GroupedInputFastqOp {
                 });
             }
         }
-        let lanes: Vec<_> = lanes
+        let lanes: SmallVec<[_; 3]> = lanes
             .into_iter()
             .enumerate()
             .map(|(lane, files)| Mutex::new(ShardedFastqReader::new(files, lane, decoder)))

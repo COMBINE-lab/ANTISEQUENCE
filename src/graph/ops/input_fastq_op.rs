@@ -65,7 +65,10 @@ impl InputStatsAccumulator {
 }
 
 pub struct InputFastqOp<'reader> {
-    readers: Vec<ReaderWithOrigin<'reader>>,
+    // The public seqproc hot paths are bounded at one, two, or three lanes.
+    // Keep those reader handles inline without forcing const generics through
+    // the graph; direct ANTISEQUENCE callers with larger arities spill safely.
+    readers: SmallVec<[ReaderWithOrigin<'reader>; 3]>,
     idx: AtomicUsize,
     interleaved: usize,
     batch_size: AtomicUsize,
@@ -86,7 +89,10 @@ impl<'reader> InputFastqOp<'reader> {
         let n_fastqs = 1;
 
         Ok(Self {
-            readers: vec![(reader, Arc::new(Origin::File(file.as_ref().to_owned())))],
+            readers: smallvec::smallvec![(
+                reader,
+                Arc::new(Origin::File(file.as_ref().to_owned()))
+            )],
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
@@ -110,7 +116,7 @@ impl<'reader> InputFastqOp<'reader> {
                     Arc::new(Origin::File(file.to_owned())),
                 ))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<SmallVec<_>>>()?;
 
         let n_fastqs = readers.len();
 
@@ -163,7 +169,7 @@ impl<'reader> InputFastqOp<'reader> {
                 };
                 Ok((Mutex::new(reader), Arc::new(Origin::File(file.to_owned()))))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<SmallVec<_>>>()?;
         let n_fastqs = readers.len();
         Ok(Self {
             readers,
@@ -185,7 +191,10 @@ impl<'reader> InputFastqOp<'reader> {
         let n_fastqs = interleaved;
 
         Ok(Self {
-            readers: vec![(reader, Arc::new(Origin::File(file.as_ref().to_owned())))],
+            readers: smallvec::smallvec![(
+                reader,
+                Arc::new(Origin::File(file.as_ref().to_owned()))
+            )],
             idx: AtomicUsize::new(0),
             interleaved,
             batch_size: AtomicUsize::new(chunk_size()),
@@ -202,7 +211,7 @@ impl<'reader> InputFastqOp<'reader> {
         let n_fastqs = 1;
 
         Ok(Self {
-            readers: vec![(reader, Arc::new(Origin::Bytes))],
+            readers: smallvec::smallvec![(reader, Arc::new(Origin::Bytes))],
             idx: AtomicUsize::new(0),
             interleaved: 1,
             batch_size: AtomicUsize::new(chunk_size()),
@@ -227,7 +236,7 @@ impl<'reader> InputFastqOp<'reader> {
                     Arc::new(Origin::Bytes),
                 ))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<SmallVec<_>>>()?;
 
         let n_fastqs = readers.len();
 
@@ -252,7 +261,7 @@ impl<'reader> InputFastqOp<'reader> {
         let n_fastqs = interleaved;
 
         Ok(Self {
-            readers: vec![(reader, Arc::new(Origin::Bytes))],
+            readers: smallvec::smallvec![(reader, Arc::new(Origin::Bytes))],
             idx: AtomicUsize::new(0),
             interleaved,
             batch_size: AtomicUsize::new(chunk_size()),
@@ -294,7 +303,7 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             .readers
             .iter()
             .map(|(r, o)| (r.lock(), o))
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[_; 3]>>();
 
         let mut i = 0;
         'outer: for _ in 0..cs {
