@@ -41,6 +41,10 @@ impl<T: Trace> GraphNode<T> for NullOutputOp {
         true
     }
 
+    fn has_explicit_name_observation(&self) -> bool {
+        true
+    }
+
     fn supports_direct_projection(&self) -> bool {
         true
     }

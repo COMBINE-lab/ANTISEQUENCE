@@ -28,13 +28,16 @@ pass set is:
 2. fold compatible adjacent operations where ordering, rejection, tracing,
    and missing-input behavior remain equivalent;
 3. retain the existing terminal projection/output fusion as a named pass;
-4. expose conservative barriers for custom or incompletely described nodes.
+4. remove proven-dead metadata production using recursive continuation
+   liveness;
+5. place total selective filters before independent, infallible work; and
+6. expose conservative barriers for custom or incompletely described nodes.
 
-Optimized and unoptimized compilation must remain available for differential
-testing. The broader record/lane/interval liveness analysis required for
-arbitrary dead-label elimination or nested-graph reordering remains governed
-by `metadata-liveness-redesign.md`; an optimizer must not guess across those
-boundaries.
+Optimized and unoptimized compilation remain available for differential
+testing, including per-pass ablation. The record/lane/interval liveness model
+from `metadata-liveness-redesign.md` now supplies enclosing continuation state
+to privately owned nested graphs; an optimizer still does not guess across
+shared or opaque boundaries.
 
 The implementation provides the optimization configuration/report, sound
 expression read-dependence tracking, semantic no-op removal, terminal

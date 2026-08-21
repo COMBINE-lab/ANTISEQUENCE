@@ -66,6 +66,9 @@ rollout gates are described in the
 Lazy record/lane control metadata, explicit invalidation effects, recursive
 liveness, and nested-graph optimizer integration are described in the
 [metadata and liveness design](docs/metadata-liveness-redesign.md).
+Proof-backed dead-label elimination and early selective-filter placement,
+including per-pass ablation and measurements, are described in the
+[optimizer passes guide](docs/optimizer-passes.md).
 
 ## Terminal read projection
 

@@ -56,8 +56,9 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        _live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
-        vec![self.graph.optimize_for_compilation(optimization)]
+        vec![self.graph.optimize_for_compilation_from(optimization, &[])]
     }
 
     fn name(&self) -> &'static str {

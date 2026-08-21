@@ -1070,6 +1070,25 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
         }
     }
 
+    fn is_selective_filter(&self) -> bool {
+        self.post_match_retention.is_some()
+    }
+
+    fn is_infallible_selective_filter(&self) -> bool {
+        use crate::patterns::{AmbiguityPolicy, PositionAmbiguityPolicy};
+        self.post_match_retention.is_some()
+            && !matches!(
+                self.effective_ambiguity_policy(),
+                AmbiguityPolicy::Error | AmbiguityPolicy::Quality { .. }
+            )
+            && matches!(
+                self.patterns.position_ambiguity_policy(),
+                PositionAmbiguityPolicy::Leftmost
+                    | PositionAmbiguityPolicy::Rightmost
+                    | PositionAmbiguityPolicy::NoMatch
+            )
+    }
+
     fn cost_class(&self) -> CostClass {
         use MatchType::*;
         match self.match_type {

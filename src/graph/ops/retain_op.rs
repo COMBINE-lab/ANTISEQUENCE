@@ -37,6 +37,14 @@ impl<T: Trace> GraphNode<T> for RetainOp {
         self.constant_result == Some(true)
     }
 
+    fn is_selective_filter(&self) -> bool {
+        self.constant_result != Some(true)
+    }
+
+    fn is_infallible_selective_filter(&self) -> bool {
+        self.constant_result == Some(false)
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let mut error = None;
         reads.retain(|read| {

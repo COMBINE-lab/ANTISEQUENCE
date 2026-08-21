@@ -40,16 +40,38 @@ pub struct CompiledGraph<T: Trace = NoTrace> {
 }
 
 /// Compile-time graph optimization settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct GraphOptimizationConfig {
     /// Apply transformations whose semantic preconditions are proven by the
     /// operation descriptors and optimization hooks.
     pub enabled: bool,
+    pub semantic_noop_elimination: bool,
+    pub adjacent_idempotent_fusion: bool,
+    pub dead_label_elimination: bool,
+    pub early_selective_filter_placement: bool,
+    pub terminal_projection_output_fusion: bool,
 }
 
 impl Default for GraphOptimizationConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            semantic_noop_elimination: true,
+            adjacent_idempotent_fusion: true,
+            dead_label_elimination: true,
+            early_selective_filter_placement: true,
+            terminal_projection_output_fusion: true,
+        }
+    }
+}
+
+impl GraphOptimizationConfig {
+    /// Disable every pass while retaining an explicit, reportable policy.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
     }
 }
 
@@ -64,6 +86,8 @@ pub struct GraphOptimizationPassReport {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GraphOptimizationReport {
     pub enabled: bool,
+    #[serde(skip)]
+    pub config: GraphOptimizationConfig,
     pub original_operations: usize,
     pub optimized_operations: usize,
     pub opaque_barriers: usize,
@@ -624,6 +648,7 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     fn optimize_nested_graphs(
         &mut self,
         _optimization: GraphOptimizationConfig,
+        _live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
         Vec::new()
     }
@@ -653,6 +678,43 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     /// return true only for a configuration-specific identity operation.
     #[inline]
     fn is_semantic_noop(&self) -> bool {
+        false
+    }
+
+    /// Whether the complete node may be removed when none of its declared
+    /// outputs are live. Implementations must also prove that skipping the
+    /// operation cannot suppress an error or any externally visible effect.
+    #[inline]
+    fn removable_when_outputs_dead(&self) -> bool {
+        false
+    }
+
+    /// Whether this node rejects a useful fraction of records and is eligible
+    /// for conservative placement before independent work.
+    #[inline]
+    fn is_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether filtering is total for every record satisfying the declared
+    /// requirements. This is required to preserve error ordering exactly.
+    #[inline]
+    fn is_infallible_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether this operation is safe to move after an independent selective
+    /// filter. A true result proves it is non-rejecting, has no observations
+    /// on records that will be rejected, and cannot fail for those records.
+    #[inline]
+    fn can_move_after_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether this terminal output completely declares the names whose
+    /// values affect its externally emitted representation.
+    #[inline]
+    fn has_explicit_name_observation(&self) -> bool {
         false
     }
 
@@ -829,6 +891,75 @@ fn push_unique(names: &mut Vec<LabelOrAttr>, name: LabelOrAttr) {
     if !names.contains(&name) {
         names.push(name);
     }
+}
+
+fn produced_name_is_live(produced: &LabelOrAttr, live: &[LabelOrAttr]) -> bool {
+    live.iter().any(|needed| {
+        produced == needed
+            || matches!(
+                (produced, needed),
+                (LabelOrAttr::Label(label), LabelOrAttr::Attr(attr))
+                    if label.str_type == attr.str_type && label.label == attr.label
+            )
+    })
+}
+
+fn invalidates_requirement(
+    invalidation: InvalidationEffect<'_>,
+    requirement: &LabelOrAttr,
+) -> bool {
+    match invalidation {
+        InvalidationEffect::PreserveAll => false,
+        InvalidationEffect::Names(names) => names.contains(requirement),
+        InvalidationEffect::Lane(lane) => requirement.interval_str_type() == Some(lane),
+        InvalidationEffect::AllIntervals | InvalidationEffect::Opaque => true,
+    }
+}
+
+fn can_place_filter_before<T: Trace>(
+    predecessor: &Arc<dyn GraphNode<T>>,
+    filter: &Arc<dyn GraphNode<T>>,
+) -> bool {
+    if !predecessor.can_move_after_selective_filter()
+        || !filter.is_selective_filter()
+        || !filter.is_infallible_selective_filter()
+    {
+        return false;
+    }
+    let predecessor = predecessor.descriptor();
+    let filter = filter.descriptor();
+    if predecessor.stage != NodeStage::Transform
+        || filter.stage != NodeStage::Transform
+        || predecessor.rejection != RejectionBehavior::Never
+    {
+        return false;
+    }
+    if filter
+        .requirements
+        .iter()
+        .any(|required| invalidates_requirement(predecessor.invalidation, required))
+    {
+        return false;
+    }
+    if predecessor.produced.is_none()
+        || predecessor.produced.unwrap_or(&[]).iter().any(|produced| {
+            filter
+                .requirements
+                .iter()
+                .any(|required| produced_name_is_live(produced, std::slice::from_ref(required)))
+        })
+    {
+        return false;
+    }
+    if filter.produced.unwrap_or(&[]).iter().any(|produced| {
+        predecessor
+            .requirements
+            .iter()
+            .any(|required| produced_name_is_live(produced, std::slice::from_ref(required)))
+    }) {
+        return false;
+    }
+    true
 }
 
 fn transfer_liveness(
@@ -1090,7 +1221,7 @@ impl<T: Trace> Graph<T> {
         optimization: GraphOptimizationConfig,
     ) -> Result<CompiledGraph<T>> {
         self.validate_for_compilation()?;
-        let optimization_report = self.optimize_for_compilation(optimization);
+        let optimization_report = self.optimize_for_compilation_from(optimization, &[]);
         self.validate_for_compilation()?;
         Ok(CompiledGraph {
             graph: self,
@@ -1098,16 +1229,27 @@ impl<T: Trace> Graph<T> {
         })
     }
 
-    fn optimize_for_compilation(
+    fn optimize_for_compilation_from(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> GraphOptimizationReport {
         let local_original_operations = self.nodes.len();
         let mut shared_nested_barriers = 0usize;
         let mut nested_reports = Vec::new();
-        for node in &mut self.nodes {
+        let mut continuation_liveness = vec![Vec::new(); self.nodes.len()];
+        let mut live = live_out.to_vec();
+        for (index, node) in self.nodes.iter().enumerate().rev() {
+            continuation_liveness[index] = live.clone();
+            live = node
+                .liveness_transfer(&live)
+                .expect("graph liveness was validated before optimization");
+        }
+        for (index, node) in self.nodes.iter_mut().enumerate() {
             if let Some(node) = Arc::get_mut(node) {
-                nested_reports.extend(node.optimize_nested_graphs(optimization));
+                nested_reports.extend(
+                    node.optimize_nested_graphs(optimization, &continuation_liveness[index]),
+                );
             } else if node.has_nested_graphs() {
                 shared_nested_barriers += 1;
             }
@@ -1123,17 +1265,92 @@ impl<T: Trace> Graph<T> {
             .count();
         let mut passes = Vec::new();
 
-        if optimization.enabled {
+        if optimization.enabled && optimization.semantic_noop_elimination {
             let before = self.nodes.len();
             self.nodes.retain(|node| !node.is_semantic_noop());
             passes.push(GraphOptimizationPassReport {
                 pass: "semantic_noop_elimination",
                 changed_nodes: before - self.nodes.len(),
             });
+        } else {
+            passes.push(GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 0,
+            });
         }
 
+        let mut dead_label_changes = 0usize;
+        let explicit_terminal_names = self
+            .nodes
+            .iter()
+            .position(|node| node.stage() == NodeStage::Output)
+            .is_some_and(|start| {
+                self.nodes[start..]
+                    .iter()
+                    .all(|node| node.has_explicit_name_observation())
+            });
+        if optimization.enabled
+            && optimization.dead_label_elimination
+            && !T::RECORDS_EVENTS
+            && self.statistics_level() == StatisticsLevel::Off
+            && (explicit_terminal_names || !live_out.is_empty())
+        {
+            let mut live = live_out.to_vec();
+            let mut remove = vec![false; self.nodes.len()];
+            for (index, node) in self.nodes.iter().enumerate().rev() {
+                let produced = node.produced_names().unwrap_or(&[]);
+                let outputs_are_dead = !produced.is_empty()
+                    && produced
+                        .iter()
+                        .all(|produced| !produced_name_is_live(produced, &live));
+                if outputs_are_dead && node.removable_when_outputs_dead() {
+                    remove[index] = true;
+                    dead_label_changes += 1;
+                } else {
+                    live = node
+                        .liveness_transfer(&live)
+                        .expect("graph liveness was validated before optimization");
+                }
+            }
+            let mut index = 0usize;
+            self.nodes.retain(|_| {
+                let retain = !remove[index];
+                index += 1;
+                retain
+            });
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "dead_label_elimination",
+            changed_nodes: dead_label_changes,
+        });
+
+        let mut filter_moves = 0usize;
+        if optimization.enabled
+            && optimization.early_selective_filter_placement
+            && !T::RECORDS_EVENTS
+            && self.statistics_level() == StatisticsLevel::Off
+        {
+            for index in 1..self.nodes.len() {
+                if !self.nodes[index].is_selective_filter() {
+                    continue;
+                }
+                let mut position = index;
+                while position > 0
+                    && can_place_filter_before(&self.nodes[position - 1], &self.nodes[position])
+                {
+                    self.nodes.swap(position - 1, position);
+                    filter_moves += 1;
+                    position -= 1;
+                }
+            }
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "early_selective_filter_placement",
+            changed_nodes: filter_moves,
+        });
+
         let mut adjacent_changes = 0;
-        if optimization.enabled && !T::RECORDS_EVENTS {
+        if optimization.enabled && optimization.adjacent_idempotent_fusion && !T::RECORDS_EVENTS {
             let mut previous = None;
             self.nodes.retain(|node| {
                 let signature = node.adjacent_optimization_signature();
@@ -1152,11 +1369,15 @@ impl<T: Trace> Graph<T> {
             changed_nodes: adjacent_changes,
         });
 
-        let local_terminal_projection_candidates = self
-            .pipeline_output_start()
-            .ok()
-            .map(|output_start| self.direct_projection_suffix(output_start).1.len())
-            .unwrap_or(0);
+        let local_terminal_projection_candidates =
+            if optimization.enabled && optimization.terminal_projection_output_fusion {
+                self.pipeline_output_start()
+                    .ok()
+                    .map(|output_start| self.direct_projection_suffix(output_start).1.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
         passes.push(GraphOptimizationPassReport {
             pass: "terminal_projection_output_fusion",
             changed_nodes: usize::from(local_terminal_projection_candidates > 0),
@@ -1196,6 +1417,7 @@ impl<T: Trace> Graph<T> {
 
         GraphOptimizationReport {
             enabled: optimization.enabled,
+            config: optimization,
             original_operations,
             optimized_operations,
             opaque_barriers,
@@ -2865,6 +3087,7 @@ mod reorder_ring_tests {
 mod graph_api_tests {
     use super::*;
     use crate::patterns::Patterns;
+    use proptest::prelude::*;
     use std::sync::Arc;
 
     struct DeclaredOp {
@@ -2873,6 +3096,101 @@ mod graph_api_tests {
     }
 
     struct StagedOp(NodeStage);
+
+    struct DeclaredOutputOp {
+        required: Vec<LabelOrAttr>,
+    }
+
+    struct InfallibleFilterOp {
+        required: Vec<LabelOrAttr>,
+    }
+
+    impl InfallibleFilterOp {
+        fn new(required: impl Into<LabelOrAttr>) -> Self {
+            Self {
+                required: vec![required.into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for InfallibleFilterOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            let retained = reads
+                .into_iter()
+                .filter(|read| {
+                    read.substring(self.required[0].str_type(), self.required[0].label())
+                        .is_ok_and(|sequence| !sequence.is_empty())
+                })
+                .collect::<Vec<_>>();
+            Ok(((!retained.is_empty()).then_some(retained), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&[])
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::None
+        }
+
+        fn is_selective_filter(&self) -> bool {
+            true
+        }
+
+        fn is_infallible_selective_filter(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "InfallibleFilterOp"
+        }
+    }
+
+    impl DeclaredOutputOp {
+        fn new(required: impl Into<LabelOrAttr>) -> Self {
+            Self {
+                required: vec![required.into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for DeclaredOutputOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&[])
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::None
+        }
+
+        fn rejection_behavior(&self) -> RejectionBehavior {
+            RejectionBehavior::Never
+        }
+
+        fn stage(&self) -> NodeStage {
+            NodeStage::Output
+        }
+
+        fn has_explicit_name_observation(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "DeclaredOutputOp"
+        }
+    }
 
     impl GraphNode<NoTrace> for StagedOp {
         fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
@@ -3098,7 +3416,16 @@ mod graph_api_tests {
         optimized.add(DeclaredOp::new());
         let optimized = optimized.compile().unwrap();
 
-        assert_eq!(optimized.descriptors().len(), 1);
+        assert_eq!(
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(optimized.optimization_report().original_operations, 3);
         assert_eq!(optimized.optimization_report().optimized_operations, 1);
         assert_eq!(
@@ -3114,7 +3441,7 @@ mod graph_api_tests {
         unoptimized.add(TrimOp::new(std::iter::empty::<Label>()));
         unoptimized.add(DeclaredOp::new());
         let unoptimized = unoptimized
-            .compile_with(GraphOptimizationConfig { enabled: false })
+            .compile_with(GraphOptimizationConfig::disabled())
             .unwrap();
         assert_eq!(unoptimized.descriptors().len(), 3);
         assert_eq!(unoptimized.optimization_report().optimized_operations, 3);
@@ -3164,7 +3491,7 @@ mod graph_api_tests {
         );
 
         let unoptimized = make_builder()
-            .compile_with(GraphOptimizationConfig { enabled: false })
+            .compile_with(GraphOptimizationConfig::disabled())
             .unwrap();
         assert_eq!(unoptimized.optimization_report().original_operations, 4);
         assert_eq!(unoptimized.optimization_report().optimized_operations, 4);
@@ -3178,9 +3505,18 @@ mod graph_api_tests {
         optimized.add(TrimOp::new([target.clone()]));
         optimized.add(TrimOp::new([target.clone()]));
         let optimized = optimized.compile().unwrap();
-        assert_eq!(optimized.descriptors().len(), 1);
         assert_eq!(
-            optimized.optimization_report().passes[1],
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[3],
             GraphOptimizationPassReport {
                 pass: "adjacent_idempotent_fusion",
                 changed_nodes: 1,
@@ -3191,7 +3527,7 @@ mod graph_api_tests {
         unoptimized.add(TrimOp::new([target.clone()]));
         unoptimized.add(TrimOp::new([target.clone()]));
         let unoptimized = unoptimized
-            .compile_with(GraphOptimizationConfig { enabled: false })
+            .compile_with(GraphOptimizationConfig::disabled())
             .unwrap();
         assert_eq!(unoptimized.descriptors().len(), 2);
 
@@ -3220,7 +3556,7 @@ mod graph_api_tests {
         let traced = traced.compile().unwrap();
         assert_eq!(traced.descriptors().len(), 2);
         assert_eq!(
-            traced.optimization_report().passes[1].changed_nodes,
+            traced.optimization_report().passes[3].changed_nodes,
             0,
             "trace-visible operation boundaries must not be folded"
         );
@@ -3245,12 +3581,199 @@ mod graph_api_tests {
             1
         );
         assert_eq!(
-            compiled.optimization_report().passes[2],
+            compiled.optimization_report().passes[4],
             GraphOptimizationPassReport {
                 pass: "terminal_projection_output_fusion",
                 changed_nodes: 1,
             }
         );
+    }
+
+    #[test]
+    fn dead_label_elimination_removes_only_proven_unobserved_metadata() {
+        let dead = record_attr(b"dead");
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        let dead_set = SetOp::new(dead.clone(), b"unused".to_vec());
+        assert!(<SetOp as GraphNode<NoTrace>>::removable_when_outputs_dead(
+            &dead_set
+        ));
+        builder.add(dead_set);
+        builder.add(NullOutputOp::new());
+        let optimized = builder.compile().unwrap();
+        assert_eq!(
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[1],
+            GraphOptimizationPassReport {
+                pass: "dead_label_elimination",
+                changed_nodes: 1,
+            }
+        );
+
+        let mut live_builder = GraphBuilder::<NoTrace>::new();
+        live_builder.add(SetOp::new(dead.clone(), b"retained".to_vec()));
+        live_builder.add(DeclaredOutputOp::new(dead));
+        let live = live_builder.compile().unwrap();
+        assert_eq!(live.descriptors().len(), 2);
+        assert_eq!(live.optimization_report().passes[1].changed_nodes, 0);
+    }
+
+    #[test]
+    fn early_filter_placement_is_independent_ablatable_and_byte_equivalent() {
+        let route = record_attr(b"route");
+        let whole = Label::new(b"seq1.*").unwrap();
+        let make_builder = || {
+            let mut builder = GraphBuilder::<NoTrace>::new();
+            builder.add(SetOp::new(route.clone(), b"kept".to_vec()));
+            builder.add(InfallibleFilterOp::new(whole.clone()));
+            builder.add(DeclaredOutputOp::new(route.clone()));
+            builder
+        };
+
+        let optimized = make_builder().compile().unwrap();
+        let optimized_names = optimized
+            .descriptors()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            optimized_names,
+            vec!["InfallibleFilterOp", "SetOp", "DeclaredOutputOp"]
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[2],
+            GraphOptimizationPassReport {
+                pass: "early_selective_filter_placement",
+                changed_nodes: 1,
+            }
+        );
+
+        let mut config = GraphOptimizationConfig::default();
+        config.early_selective_filter_placement = false;
+        let unoptimized = make_builder().compile_with(config).unwrap();
+        let unoptimized_names = unoptimized
+            .descriptors()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unoptimized_names,
+            vec!["SetOp", "InfallibleFilterOp", "DeclaredOutputOp"]
+        );
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+        assert_eq!(
+            optimized_read.record_data(route.attr),
+            unoptimized_read.record_data(route.attr)
+        );
+    }
+
+    #[test]
+    fn nested_continuation_liveness_prevents_dead_metadata_removal() {
+        let route = record_attr(b"route");
+        let mut arm = Graph::<NoTrace>::new();
+        arm.add(SetOp::new(route.clone(), b"nested".to_vec()));
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(TryOp::new(arm, Graph::new()).return_catch_output());
+        builder.add(DeclaredOutputOp::new(route));
+        let compiled = builder.compile().unwrap();
+        assert_eq!(compiled.optimization_report().passes[1].changed_nodes, 0);
+        assert_eq!(compiled.optimization_report().optimized_operations, 3);
+    }
+
+    #[test]
+    fn observable_statistics_disable_reordering_and_dead_label_elimination() {
+        let route = record_attr(b"route");
+        let whole = Label::new(b"seq1.*").unwrap();
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.set_statistics_level(StatisticsLevel::Detailed);
+        builder.add(SetOp::new(route, b"unused".to_vec()));
+        builder.add(InfallibleFilterOp::new(whole));
+        builder.add(NullOutputOp::new());
+        let compiled = builder.compile().unwrap();
+        assert_eq!(compiled.optimization_report().passes[1].changed_nodes, 0);
+        assert_eq!(compiled.optimization_report().passes[2].changed_nodes, 0);
+    }
+
+    proptest! {
+        #[test]
+        fn generated_graphs_preserve_live_labels_fastq_and_rejection(
+            dead_assignments in 0usize..8,
+            sequence in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 0..64),
+        ) {
+            let route = record_attr(b"route");
+            let whole = Label::new(b"seq1.*").unwrap();
+            let make_builder = || {
+                let mut builder = GraphBuilder::<NoTrace>::new();
+                for index in 0..dead_assignments {
+                    builder.add(SetOp::new(
+                        record_attr(format!("dead{index}")),
+                        b"unused".to_vec(),
+                    ));
+                }
+                builder.add(SetOp::new(route.clone(), b"live".to_vec()));
+                builder.add(InfallibleFilterOp::new(whole.clone()));
+                builder.add(DeclaredOutputOp::new(route.clone()));
+                builder
+            };
+
+            let optimized = make_builder().compile().unwrap();
+            let baseline = make_builder()
+                .compile_with(GraphOptimizationConfig::disabled())
+                .unwrap();
+            let make_read = || {
+                let mut read = Read::new();
+                read.add_fastq(
+                    1,
+                    b"generated",
+                    &sequence,
+                    &vec![b'I'; sequence.len()],
+                    Arc::new(Origin::Bytes),
+                    0,
+                );
+                read
+            };
+            let optimized_result = optimized.run_one(Some(vec![make_read()]), &NoTrace).unwrap().0;
+            let baseline_result = baseline.run_one(Some(vec![make_read()]), &NoTrace).unwrap().0;
+            prop_assert_eq!(optimized_result.is_some(), baseline_result.is_some());
+            if let (Some(mut optimized_reads), Some(mut baseline_reads)) =
+                (optimized_result, baseline_result)
+            {
+                let optimized_read = optimized_reads.pop().unwrap();
+                let baseline_read = baseline_reads.pop().unwrap();
+                prop_assert_eq!(
+                    optimized_read.to_fastq(1).unwrap(),
+                    baseline_read.to_fastq(1).unwrap()
+                );
+                prop_assert_eq!(
+                    optimized_read.record_data(route.attr),
+                    baseline_read.record_data(route.attr)
+                );
+            }
+        }
     }
 
     fn compiled_projected_fastq() -> CompiledGraph<NoTrace> {

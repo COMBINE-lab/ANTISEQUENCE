@@ -52,6 +52,9 @@ block-aligner = { version = "0.5", features = ["simd_avx2"] }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 block-aligner = { version = "0.5", features = ["simd_neon"] }
 
+[dev-dependencies]
+proptest = "1.7"
+
 [profile.bench]
 opt-level = 3
 codegen-units = 1

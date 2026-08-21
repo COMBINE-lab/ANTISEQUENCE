@@ -4,6 +4,7 @@ pub struct SetOp {
     required_names: Vec<LabelOrAttr>,
     label_or_attr: LabelOrAttr,
     expr: Expr,
+    reorder_safe: bool,
 }
 
 impl SetOp {
@@ -34,11 +35,17 @@ impl SetOp {
             })),
             LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {}
         }
+        let reorder_safe = matches!(
+            &label_or_attr,
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_)
+        ) && required_names.is_empty()
+            && expr.eval(&Read::new(), false).is_ok();
 
         Self {
             required_names,
             label_or_attr,
             expr,
+            reorder_safe,
         }
     }
 }
@@ -59,6 +66,14 @@ impl<T: Trace> GraphNode<T> for SetOp {
 
     fn rejection_behavior(&self) -> RejectionBehavior {
         RejectionBehavior::Never
+    }
+
+    fn removable_when_outputs_dead(&self) -> bool {
+        self.reorder_safe
+    }
+
+    fn can_move_after_selective_filter(&self) -> bool {
+        self.reorder_safe
     }
 
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {

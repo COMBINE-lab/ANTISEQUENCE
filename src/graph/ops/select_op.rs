@@ -116,8 +116,11 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
-        vec![self.graph.optimize_for_compilation(optimization)]
+        vec![self
+            .graph
+            .optimize_for_compilation_from(optimization, live_out)]
     }
 
     fn name(&self) -> &'static str {

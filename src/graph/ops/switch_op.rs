@@ -186,10 +186,14 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
         self.arms
             .iter_mut()
-            .map(|arm| arm.graph.optimize_for_compilation(optimization))
+            .map(|arm| {
+                arm.graph
+                    .optimize_for_compilation_from(optimization, live_out)
+            })
             .collect()
     }
 

@@ -615,6 +615,7 @@ fn main() {
         let graph = graph
             .compile_with(GraphOptimizationConfig {
                 enabled: args.graph_optimization,
+                ..GraphOptimizationConfig::default()
             })
             .expect("compile benchmark graph");
         graph_build_seconds.push(build_start.elapsed().as_secs_f64());

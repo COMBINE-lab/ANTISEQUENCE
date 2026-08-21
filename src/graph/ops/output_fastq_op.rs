@@ -614,6 +614,10 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
         true
     }
 
+    fn has_explicit_name_observation(&self) -> bool {
+        true
+    }
+
     fn supports_direct_projection(&self) -> bool {
         true
     }
@@ -1055,6 +1059,10 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
     }
 
     fn supports_prepared_output(&self) -> bool {
+        true
+    }
+
+    fn has_explicit_name_observation(&self) -> bool {
         true
     }
 

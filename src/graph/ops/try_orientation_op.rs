@@ -232,8 +232,16 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
-        vec![self.inner.optimize_for_compilation(optimization)]
+        let inner_live_out = live_out
+            .iter()
+            .filter(|name| !self.produced_names.contains(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        vec![self
+            .inner
+            .optimize_for_compilation_from(optimization, &inner_live_out)]
     }
 
     fn name(&self) -> &'static str {

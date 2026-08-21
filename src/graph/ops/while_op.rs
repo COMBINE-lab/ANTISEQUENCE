@@ -115,8 +115,28 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
-        vec![self.graph.optimize_for_compilation(optimization)]
+        let mut body_live = live_out.to_vec();
+        for name in &self.required_names {
+            push_unique(&mut body_live, name.clone());
+        }
+        loop {
+            let before = body_live.len();
+            for name in self
+                .graph
+                .validate_liveness_from(&body_live)
+                .expect("loop liveness was validated before optimization")
+            {
+                push_unique(&mut body_live, name);
+            }
+            if body_live.len() == before {
+                break;
+            }
+        }
+        vec![self
+            .graph
+            .optimize_for_compilation_from(optimization, &body_live)]
     }
 
     fn name(&self) -> &'static str {

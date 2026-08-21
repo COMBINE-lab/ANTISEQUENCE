@@ -115,10 +115,19 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
     fn optimize_nested_graphs(
         &mut self,
         optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
         vec![
-            self.try_graph.optimize_for_compilation(optimization),
-            self.catch_graph.optimize_for_compilation(optimization),
+            self.try_graph
+                .optimize_for_compilation_from(optimization, live_out),
+            self.catch_graph.optimize_for_compilation_from(
+                optimization,
+                if self.return_catch_output {
+                    live_out
+                } else {
+                    &[]
+                },
+            ),
         ]
     }
 
