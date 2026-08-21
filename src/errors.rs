@@ -42,11 +42,11 @@ pub enum Error {
     #[error("Error reading or writing \"{file}\": {source}")]
     FileIo {
         file: String,
-        source: Box<dyn std::error::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[error("Error reading or writing bytes: {0}")]
-    BytesIo(Box<dyn std::error::Error>),
+    BytesIo(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Unpaired read in {0}")]
     UnpairedRead(String),
@@ -81,7 +81,7 @@ pub enum Error {
     ParseRecord {
         origin: Origin,
         idx: usize,
-        source: Box<dyn std::error::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[error("Could not parse \"{string}\" in \"{context}\": {reason}")]
@@ -104,7 +104,7 @@ pub enum Error {
     #[error("Error parsing patterns:\n\"{patterns}\"\n{source}")]
     ParsePatterns {
         patterns: String,
-        source: Box<dyn std::error::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
