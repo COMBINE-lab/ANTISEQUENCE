@@ -566,6 +566,42 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn pattern_quality_uses_each_searched_anchors_own_window() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNTCGA", "IIIIIIII!III")]);
+        let patterns = Patterns::from_strs(["ACGT", "ACGA"])
+            .with_ambiguity_policy(AmbiguityPolicy::Quality { min_delta: 1 });
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(
+            MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                HammingSearch(Count(3)),
+            )
+            .retain_label_present("seq1.anchor"),
+        );
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(label("seq1.left"))],
+        ));
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        assert_eq!(
+            output_bytes.lock().unwrap().as_slice(),
+            b"@read1\nTCGTNNNN\n+\nIIIIIIII\n"
+        );
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.total, 1);
+        assert_eq!(report.ambiguity.resolved_quality, 1);
+        assert_eq!(report.ambiguity.dropped, 0);
+    }
+
+    #[test]
     fn heterogeneous_exact_patterns_tie_by_distance_not_raw_match_count() {
         let fq = fastq_bytes(&[("read1", "AAAA", "IIII")]);
         let patterns =

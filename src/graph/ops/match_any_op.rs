@@ -962,6 +962,95 @@ impl MatchAnyOp {
             }
         }
     }
+
+    /// Resolve an equal-best pattern tie for searched, equal-length windows
+    /// using the qualities at each candidate's own placement. The ordinary
+    /// full-string resolver remains the fast path for non-search matchers.
+    fn resolve_search_quality_ambiguity(
+        &self,
+        read: &Read,
+        text: &[u8],
+        quality: Option<&[u8]>,
+        candidates: &[CandidateState],
+        mut stats: Option<&mut LocalMatchStats>,
+    ) -> Result<Option<usize>> {
+        let AmbiguityPolicy::Quality { min_delta } = self.effective_ambiguity_policy() else {
+            unreachable!("search quality resolver requires the quality policy")
+        };
+        let quality = quality.ok_or_else(|| {
+            Error::GraphExecution(format!(
+                "quality ambiguity policy requires quality scores for {}.{}",
+                self.label.str_type, self.label.label
+            ))
+        })?;
+        if quality.len() != text.len() {
+            return Err(Error::GraphExecution(format!(
+                "quality length {} does not match sequence length {} for {}.{}",
+                quality.len(),
+                text.len(),
+                self.label.str_type,
+                self.label.label
+            )));
+        }
+
+        let mut ordered: SmallVec<[&CandidateState; 4]> = candidates.iter().collect();
+        ordered.sort_unstable_by_key(|candidate| candidate.0);
+        ordered.dedup_by_key(|candidate| candidate.0);
+        if ordered.len() == 1 {
+            return Ok(ordered.first().map(|candidate| candidate.0));
+        }
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.ambiguity.total += 1;
+        }
+
+        let mut scores: SmallVec<[(u64, usize); 4]> = SmallVec::new();
+        for candidate in ordered {
+            let &(pattern_idx, _, _, start, end, _) = candidate;
+            let observed = text.get(start..end).ok_or_else(|| {
+                Error::GraphExecution(format!(
+                    "quality ambiguity candidate range {start}..{end} exceeds searched text length {}",
+                    text.len()
+                ))
+            })?;
+            let observed_quality = &quality[start..end];
+            let pattern = self.patterns.patterns()[pattern_idx]
+                .get(read)
+                .map_err(|source| Error::NameError {
+                    source,
+                    read: read.clone(),
+                    context: Self::NAME,
+                })?;
+            if pattern.len() != observed.len() {
+                return Err(Error::GraphExecution(
+                    "quality ambiguity policy requires equal-length candidate windows".to_string(),
+                ));
+            }
+            let mismatch_quality = pattern
+                .iter()
+                .zip(observed)
+                .zip(observed_quality)
+                .filter_map(|((&pattern_base, &query_base), &q)| {
+                    (pattern_base != query_base).then_some(u64::from(q.saturating_sub(33)))
+                })
+                .sum();
+            scores.push((mismatch_quality, pattern_idx));
+        }
+        scores.sort_unstable();
+        let (best_score, best_idx) = scores[0];
+        let runner_up_score = scores[1].0;
+        if best_score < runner_up_score && runner_up_score - best_score >= u64::from(min_delta) {
+            if let Some(stats) = stats {
+                stats.ambiguity.accepted += 1;
+                stats.ambiguity.resolved_quality += 1;
+            }
+            Ok(Some(best_idx))
+        } else {
+            if let Some(stats) = stats {
+                stats.ambiguity.dropped += 1;
+            }
+            Ok(None)
+        }
+    }
 }
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
@@ -1588,17 +1677,33 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         read: read.clone(),
                         context: Self::NAME,
                     })?;
-                let candidate_indices: SmallVec<[usize; 4]> = best_candidates
-                    .iter()
-                    .map(|&(pattern_idx, _, _, _, _, _)| pattern_idx)
-                    .collect();
-                self.resolve_ambiguity(
-                    read,
-                    text,
-                    quality,
-                    &candidate_indices,
-                    stats.as_deref_mut(),
-                )?
+                if matches!(
+                    self.effective_ambiguity_policy(),
+                    AmbiguityPolicy::Quality { .. }
+                ) && matches!(
+                    self.matcher_plan.spec.scope,
+                    MatchScope::Search | MatchScope::Bounded { .. }
+                ) {
+                    self.resolve_search_quality_ambiguity(
+                        read,
+                        text,
+                        quality,
+                        &best_candidates,
+                        stats.as_deref_mut(),
+                    )?
+                } else {
+                    let candidate_indices: SmallVec<[usize; 4]> = best_candidates
+                        .iter()
+                        .map(|&(pattern_idx, _, _, _, _, _)| pattern_idx)
+                        .collect();
+                    self.resolve_ambiguity(
+                        read,
+                        text,
+                        quality,
+                        &candidate_indices,
+                        stats.as_deref_mut(),
+                    )?
+                }
             } else {
                 best_candidates.first().map(|candidate| candidate.0)
             };
