@@ -66,7 +66,10 @@ impl ControlMetadata {
         for (_, metadata) in &mut self.lanes {
             metadata.clear();
         }
-        self.lanes.clear();
+        // Keep the lane slots themselves: recycled reads normally use the
+        // same small set of FASTQ lanes on every record. Empty maps expose no
+        // stale values, while avoiding reconstruction of the lane metadata
+        // container on the next record.
     }
 
     #[inline(always)]

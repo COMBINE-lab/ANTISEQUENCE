@@ -80,6 +80,7 @@ will migrate to these methods before the next breaking release.
 with:
 
 - `requirements` and `produced` labels or attributes;
+- interval preservation/invalidation effects;
 - the strongest `MutationKind`;
 - `RejectionBehavior`;
 - a coarse `CostClass`; and
@@ -98,11 +99,11 @@ arbitrary-function operations declare their known effects. An omitted custom
 declaration remains conservative and therefore cannot be reordered or fused
 by a future optimizer.
 
-These descriptors are the stable seam for later constant folding, dead-label
-elimination, safe fusion, filter hoisting, and terminal rendering. Detailed
-record/lane/interval metadata preservation and nested-graph liveness remain a
-separate redesign, documented in
-[`metadata-liveness-redesign.md`](metadata-liveness-redesign.md).
+These descriptors drive constant folding, safe fusion, recursive liveness, and
+terminal rendering. Lazy record/lane control metadata and interval
+preservation are implemented as documented in
+[`metadata-liveness-redesign.md`](metadata-liveness-redesign.md). Unknown
+custom nodes remain opaque optimizer barriers.
 
 Expression constant folding uses an explicit read-dependence proof. An empty
 required-name list is not sufficient: label/attribute existence predicates
@@ -172,6 +173,6 @@ the non-branching 150 bp control was 2.2% slower. These synthetic results
 isolate branch-copying cost and are not presented as end-to-end protocol
 throughput.
 
-This storage optimization is part of the Milestone 2 execution work. It does
-not implement the complex-protocol language and matcher work planned for
-Milestone 3.
+This storage optimization is part of the Milestone 2 execution work. The
+bounded complex-protocol language and unified matcher semantics are separate
+Milestone 3 layers built on that execution foundation.

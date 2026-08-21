@@ -4,7 +4,9 @@
 //! keeps FASTQ generation and input cloning outside the measured interval, and
 //! emits machine-readable JSON for the reproducible benchmark harness.
 
-use antisequence::expr::{label, lane_attr, Expr};
+#![recursion_limit = "256"]
+
+use antisequence::expr::{attr, label, lane_attr, Expr};
 use antisequence::graph::*;
 use antisequence::*;
 use flate2::{write::GzEncoder, Compression};
@@ -53,6 +55,7 @@ struct Args {
     graph_optimization: bool,
     fork_reads: bool,
     control_metadata: bool,
+    interval_metadata: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -138,6 +141,7 @@ fn parse_args() -> Args {
         graph_optimization: true,
         fork_reads: false,
         control_metadata: false,
+        interval_metadata: false,
     };
     let mut cli = std::env::args().skip(1);
     while let Some(flag) = cli.next() {
@@ -326,6 +330,7 @@ fn parse_args() -> Args {
             "--no-graph-optimization" => args.graph_optimization = false,
             "--fork" => args.fork_reads = true,
             "--control-metadata" => args.control_metadata = true,
+            "--interval-metadata" => args.interval_metadata = true,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
                     "passthrough" => Mode::Passthrough,
@@ -357,7 +362,7 @@ fn parse_args() -> Args {
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
                      [--gzip-level 0..9] [--terminal-projection] \
                      [--no-direct-output-rendering] [--no-graph-optimization] [--fork] \
-                     [--control-metadata]"
+                     [--control-metadata|--interval-metadata]"
                 );
                 std::process::exit(0);
             }
@@ -367,6 +372,10 @@ fn parse_args() -> Args {
     assert!(args.reads > 0, "reads must be positive");
     assert!(args.threads > 0, "threads must be positive");
     assert!(args.repetitions > 0, "repetitions must be positive");
+    assert!(
+        !(args.control_metadata && args.interval_metadata),
+        "choose at most one metadata benchmark scope"
+    );
     assert!(args.queue_capacity.is_none_or(|value| value > 0));
     assert!(args.max_in_flight_batches.is_none_or(|value| value > 0));
     assert!(args.batch_size.is_none_or(|value| value > 0));
@@ -542,6 +551,10 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
     }
     if args.control_metadata {
         let route = lane_attr(1, b"route");
+        graph.add(SetOp::new(route.clone(), b"keep".to_vec()));
+        graph.add(RetainOp::new(Expr::from(route).eq(b"keep".to_vec())));
+    } else if args.interval_metadata {
+        let route = attr(b"seq1.*.route");
         graph.add(SetOp::new(route.clone(), b"keep".to_vec()));
         graph.add(RetainOp::new(Expr::from(route).eq(b"keep".to_vec())));
     }
@@ -728,6 +741,7 @@ fn main() {
             "graph_optimization": args.graph_optimization,
             "fork_reads": args.fork_reads,
             "control_metadata": args.control_metadata,
+            "interval_metadata": args.interval_metadata,
             "reads": args.reads,
             "threads": args.threads,
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),
