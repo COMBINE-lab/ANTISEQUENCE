@@ -340,6 +340,7 @@ pub struct GraphCostSummary {
 /// Deterministic, inspectable execution decision.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExecutionPlan {
+    pub requested_mode: ExecutionMode,
     pub backend: ExecutionBackend,
     pub pipeline: PipelineConfig,
     pub costs: GraphCostSummary,
@@ -920,6 +921,7 @@ impl<T: Trace> CompiledGraph<T> {
         }
 
         Ok(ExecutionPlan {
+            requested_mode: request.mode,
             backend,
             pipeline,
             costs,
@@ -3006,6 +3008,7 @@ mod graph_api_tests {
         let first = graph.plan_execution(request).unwrap();
         let second = graph.plan_execution(request).unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.requested_mode, ExecutionMode::Auto);
         assert_eq!(first.backend, ExecutionBackend::WorkerLocalPipeline);
         assert!(first.prepared_output);
         assert!(first.direct_output_rendering);
@@ -3035,6 +3038,7 @@ mod graph_api_tests {
         dedicated.mode = ExecutionMode::Pipeline;
         dedicated.pipeline.input_mode = PipelineInputMode::DedicatedReader;
         let dedicated = graph.plan_execution(dedicated).unwrap();
+        assert_eq!(dedicated.requested_mode, ExecutionMode::Pipeline);
         assert_eq!(dedicated.backend, ExecutionBackend::DedicatedReaderPipeline);
         assert!(dedicated.reason_codes.contains(&"forced_pipeline"));
     }

@@ -112,10 +112,10 @@ are read-dependent unless they explicitly prove otherwise.
 ## Execution planning
 
 `CompiledGraph::plan_execution(ExecutionRequest)` returns an `ExecutionPlan`
-without starting workers. The plan includes the selected backend, effective
-pipeline configuration, graph cost summary, prepared/direct-output decisions,
-opaque-node count, and stable reason codes. Repeated calls with the same graph
-and request are deterministic.
+without starting workers. The plan includes the requested mode, selected
+backend, effective pipeline configuration, graph cost summary,
+prepared/direct-output decisions, opaque-node count, and stable reason codes.
+Repeated calls with the same graph and request are deterministic.
 
 `ExecutionMode::WholeGraph` and `ExecutionMode::Pipeline` are explicit
 benchmark controls. `ExecutionMode::Auto` requires a bounded pipeline for
