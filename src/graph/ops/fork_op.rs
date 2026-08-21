@@ -18,7 +18,7 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(reads) = reads else {
-            panic!("Expected some reads!")
+            return Err(Error::MissingNodeInput(self.name()))
         };
         let mut originals = Vec::with_capacity(reads.len());
         let mut branches = Vec::with_capacity(reads.len());

@@ -25,7 +25,7 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(reads) = reads else {
-            panic!("Expected some reads!")
+            return Err(Error::MissingNodeInput(self.name()))
         };
 
         // Preserve original ordering: record which indices pass the selector,

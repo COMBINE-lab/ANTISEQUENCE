@@ -25,7 +25,7 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(mut current_batch) = reads else {
-            panic!("Expected some reads!")
+            return Err(Error::MissingNodeInput(self.name()))
         };
 
         let mut final_results = Vec::with_capacity(current_batch.len());
