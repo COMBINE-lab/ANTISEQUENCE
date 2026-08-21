@@ -55,6 +55,10 @@ invalid operation configuration returns a structured `InvalidOperation` error.
 See the [validated graph API guide](docs/graph-api.md) for migration and custom
 operation details.
 
+The remaining optimizer and execution-planner work, its acceptance gates, and
+the boundary before complex-protocol development are recorded in the
+[Milestone 2 execution plan](docs/graph-optimization-and-planning.md).
+
 ## Terminal read projection
 
 `ProjectOp` efficiently constructs a final FASTQ sequence from labeled

@@ -132,7 +132,7 @@ dispatch uses total stored FASTQ bytes rather than a protocol name. Reads that
 do not encounter a branching operation retain the existing owned, recycled
 buffers and never create shared storage.
 
-The Milestone 3 microbenchmark gate compares the implementation with the
+The branch-copy performance gate compares the implementation with the
 pre-change deep-copy path and requires identical results plus no more than a
 3% slowdown on short-read controls. At one worker, the accepted implementation
 was 2.33x faster for a 2 kb fork and 3.42x faster for a 10 kb fork; the 150 bp
@@ -141,3 +141,7 @@ four workers, the 2 kb fork improved from 1.71 to 2.31 million reads/s while
 the non-branching 150 bp control was 2.2% slower. These synthetic results
 isolate branch-copying cost and are not presented as end-to-end protocol
 throughput.
+
+This storage optimization is part of the Milestone 2 execution work. It does
+not implement the complex-protocol language and matcher work planned for
+Milestone 3.
