@@ -629,6 +629,14 @@ fn main() {
         request.pipeline.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
         request.pipeline.direct_output_rendering = args.direct_output_rendering;
         request.pipeline.input_mode = args.pipeline_input_mode;
+        request.batch_planning.automatic_queue_capacity = args.queue_capacity.is_none();
+        request.batch_planning.automatic_max_in_flight = args.max_in_flight_batches.is_none();
+        request.batch_planning.automatic_batch_size = args.batch_size.is_none();
+        request.batch_planning.estimated_bases_per_fragment = args.fastq_read_length.unwrap_or(150);
+        request.batch_planning.compressed_output = matches!(
+            args.output,
+            OutputMode::Gzip | OutputMode::ParallelGzip | OutputMode::ParallelGzipStream
+        );
         if let Some(queue_capacity) = args.queue_capacity {
             request.pipeline.queue_capacity = queue_capacity;
         }

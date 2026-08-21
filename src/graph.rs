@@ -362,6 +362,7 @@ pub enum ExecutionBackend {
 pub struct ExecutionRequest {
     pub mode: ExecutionMode,
     pub pipeline: PipelineConfig,
+    pub batch_planning: BatchPlanningHints,
 }
 
 impl ExecutionRequest {
@@ -369,8 +370,68 @@ impl ExecutionRequest {
         Self {
             mode: ExecutionMode::Auto,
             pipeline: PipelineConfig::new(workers),
+            batch_planning: BatchPlanningHints::default(),
         }
     }
+}
+
+/// Static inputs to deterministic batch and queue planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BatchPlanningHints {
+    pub enabled: bool,
+    pub automatic_batch_size: bool,
+    pub automatic_queue_capacity: bool,
+    pub automatic_max_in_flight: bool,
+    pub input_lanes: usize,
+    pub output_lanes: usize,
+    /// Estimated sequence plus quality bases across one synchronized fragment.
+    pub estimated_bases_per_fragment: usize,
+    pub compressed_input: bool,
+    pub compressed_output: bool,
+    /// Buffers not proportional to the number of admitted record batches.
+    pub fixed_buffer_bytes: usize,
+    pub memory_budget_bytes: usize,
+}
+
+impl Default for BatchPlanningHints {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            automatic_batch_size: true,
+            automatic_queue_capacity: true,
+            automatic_max_in_flight: true,
+            input_lanes: 1,
+            output_lanes: 1,
+            estimated_bases_per_fragment: 150,
+            compressed_input: false,
+            compressed_output: false,
+            fixed_buffer_bytes: 0,
+            memory_budget_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Reproducible result of static batch and queue planning.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BatchSizePlan {
+    pub enabled: bool,
+    pub automatic_batch_size: bool,
+    pub automatic_queue_capacity: bool,
+    pub automatic_max_in_flight: bool,
+    pub input_lanes: usize,
+    pub output_lanes: usize,
+    pub estimated_bases_per_fragment: usize,
+    pub compressed_input: bool,
+    pub compressed_output: bool,
+    pub fixed_buffer_bytes: usize,
+    pub batch_size: usize,
+    pub queue_capacity: usize,
+    pub max_in_flight_batches: usize,
+    pub estimated_fragment_bytes: usize,
+    pub estimated_batch_bytes: usize,
+    pub estimated_peak_live_bytes: usize,
+    pub memory_budget_bytes: usize,
+    pub reason_codes: Vec<&'static str>,
 }
 
 /// Planner summary of the graph's declared operation costs.
@@ -390,6 +451,7 @@ pub struct ExecutionPlan {
     pub requested_mode: ExecutionMode,
     pub backend: ExecutionBackend,
     pub pipeline: PipelineConfig,
+    pub batch_planning: BatchSizePlan,
     pub costs: GraphCostSummary,
     pub prepared_output: bool,
     pub direct_output_rendering: bool,
@@ -423,6 +485,117 @@ impl PipelineConfig {
             input_mode: PipelineInputMode::WorkerLocal,
         }
     }
+}
+
+fn floor_power_of_two(value: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        1usize << (usize::BITS - 1 - value.leading_zeros())
+    }
+}
+
+fn plan_batch_configuration(
+    mut pipeline: PipelineConfig,
+    hints: BatchPlanningHints,
+    costs: GraphCostSummary,
+) -> (PipelineConfig, BatchSizePlan) {
+    let mut reason_codes = Vec::new();
+    let estimated_fragment_bytes = hints
+        .estimated_bases_per_fragment
+        .max(hints.input_lanes.max(1) * 16)
+        .saturating_mul(2)
+        .saturating_add(
+            hints
+                .input_lanes
+                .saturating_add(hints.output_lanes)
+                .saturating_mul(192),
+        )
+        .saturating_add(256)
+        .saturating_add(if hints.compressed_input { 64 } else { 0 })
+        .saturating_add(if hints.compressed_output { 64 } else { 0 });
+
+    if !hints.enabled {
+        reason_codes.push("dynamic_batch_planning_disabled");
+    } else {
+        if hints.automatic_queue_capacity {
+            pipeline.queue_capacity = 2;
+            reason_codes.push("measured_shallow_queue_default");
+        } else {
+            reason_codes.push("manual_queue_capacity");
+        }
+        if hints.automatic_max_in_flight {
+            pipeline.max_in_flight_batches = pipeline.workers.max(1);
+            reason_codes.push("one_admitted_batch_per_worker");
+        } else {
+            reason_codes.push("manual_in_flight_bound");
+        }
+
+        if hints.automatic_batch_size {
+            let cost_units = costs
+                .constant
+                .saturating_add(costs.linear.saturating_mul(2))
+                .saturating_add(costs.search.saturating_mul(8))
+                .saturating_add(costs.alignment.saturating_mul(16))
+                .max(1);
+            let work_limited = 4096usize.saturating_div(cost_units).clamp(16, 256);
+            let length_limited = (153_600usize
+                .saturating_div(hints.estimated_bases_per_fragment.max(1)))
+            .clamp(16, 256);
+            let available = hints
+                .memory_budget_bytes
+                .saturating_sub(hints.fixed_buffer_bytes);
+            let memory_limited = available
+                .saturating_div(pipeline.max_in_flight_batches.max(1))
+                .saturating_div(estimated_fragment_bytes.max(1))
+                .clamp(1, 256);
+            let selected =
+                floor_power_of_two(work_limited.min(length_limited).min(memory_limited).max(1))
+                    .max(1);
+            pipeline.batch_size = selected;
+            reason_codes.push("static_graph_cost_model");
+            reason_codes.push("geometry_length_estimate");
+            reason_codes.push("bounded_peak_memory");
+            if costs.alignment > 0 {
+                reason_codes.push("alignment_cost_reduces_batch");
+            } else if costs.search > 0 {
+                reason_codes.push("search_cost_reduces_batch");
+            }
+            if hints.estimated_bases_per_fragment > 1_000 {
+                reason_codes.push("long_reads_reduce_batch");
+            }
+        } else {
+            reason_codes.push("manual_batch_size");
+        }
+    }
+
+    let estimated_batch_bytes = estimated_fragment_bytes.saturating_mul(pipeline.batch_size);
+    let estimated_peak_live_bytes = hints.fixed_buffer_bytes.saturating_add(
+        estimated_batch_bytes.saturating_mul(pipeline.max_in_flight_batches.max(1)),
+    );
+    (
+        pipeline,
+        BatchSizePlan {
+            enabled: hints.enabled,
+            automatic_batch_size: hints.automatic_batch_size,
+            automatic_queue_capacity: hints.automatic_queue_capacity,
+            automatic_max_in_flight: hints.automatic_max_in_flight,
+            input_lanes: hints.input_lanes,
+            output_lanes: hints.output_lanes,
+            estimated_bases_per_fragment: hints.estimated_bases_per_fragment,
+            compressed_input: hints.compressed_input,
+            compressed_output: hints.compressed_output,
+            fixed_buffer_bytes: hints.fixed_buffer_bytes,
+            batch_size: pipeline.batch_size,
+            queue_capacity: pipeline.queue_capacity,
+            max_in_flight_batches: pipeline.max_in_flight_batches,
+            estimated_fragment_bytes,
+            estimated_batch_bytes,
+            estimated_peak_live_bytes,
+            memory_budget_bytes: hints.memory_budget_bytes,
+            reason_codes,
+        },
+    )
 }
 
 /// Measurements from one bounded pipeline run.
@@ -1089,7 +1262,8 @@ impl<T: Trace> CompiledGraph<T> {
             }
         }
 
-        let mut pipeline = request.pipeline;
+        let (mut pipeline, batch_planning) =
+            plan_batch_configuration(request.pipeline, request.batch_planning, costs);
         let mut reason_codes = Vec::new();
         let backend = match request.mode {
             ExecutionMode::WholeGraph => {
@@ -1160,6 +1334,7 @@ impl<T: Trace> CompiledGraph<T> {
             requested_mode: request.mode,
             backend,
             pipeline,
+            batch_planning,
             costs,
             prepared_output,
             direct_output_rendering,
@@ -3830,6 +4005,82 @@ mod graph_api_tests {
         assert_eq!(dedicated.requested_mode, ExecutionMode::Pipeline);
         assert_eq!(dedicated.backend, ExecutionBackend::DedicatedReaderPipeline);
         assert!(dedicated.reason_codes.contains(&"forced_pipeline"));
+    }
+
+    #[test]
+    fn batch_planner_is_deterministic_bounded_and_preserves_manual_overrides() {
+        let cases = [
+            (1, 1, 150, GraphCostSummary::default(), 256),
+            (2, 2, 300, GraphCostSummary::default(), 256),
+            (3, 3, 450, GraphCostSummary::default(), 256),
+            (1, 1, 10_000, GraphCostSummary::default(), 16),
+            (
+                1,
+                1,
+                150,
+                GraphCostSummary {
+                    alignment: 1,
+                    ..GraphCostSummary::default()
+                },
+                256,
+            ),
+        ];
+        for (input_lanes, output_lanes, bases, costs, expected) in cases {
+            let hints = BatchPlanningHints {
+                input_lanes,
+                output_lanes,
+                estimated_bases_per_fragment: bases,
+                ..BatchPlanningHints::default()
+            };
+            let first = plan_batch_configuration(PipelineConfig::new(4), hints, costs);
+            let second = plan_batch_configuration(PipelineConfig::new(4), hints, costs);
+            assert_eq!(first, second);
+            assert_eq!(first.0.batch_size, expected);
+            assert!(first.1.estimated_peak_live_bytes <= hints.memory_budget_bytes);
+        }
+
+        let pipeline = PipelineConfig {
+            workers: 4,
+            queue_capacity: 7,
+            max_in_flight_batches: 9,
+            batch_size: 777,
+            preserve_order: true,
+            direct_output_rendering: false,
+            input_mode: PipelineInputMode::DedicatedReader,
+        };
+        let hints = BatchPlanningHints {
+            automatic_batch_size: false,
+            automatic_queue_capacity: false,
+            automatic_max_in_flight: false,
+            ..BatchPlanningHints::default()
+        };
+        let (planned, report) = plan_batch_configuration(pipeline, hints, Default::default());
+        assert_eq!(planned, pipeline);
+        assert_eq!(report.batch_size, 777);
+        assert_eq!(report.queue_capacity, 7);
+        assert_eq!(report.max_in_flight_batches, 9);
+        assert!(report.reason_codes.contains(&"manual_batch_size"));
+        assert!(report.reason_codes.contains(&"manual_queue_capacity"));
+        assert!(report.reason_codes.contains(&"manual_in_flight_bound"));
+    }
+
+    #[test]
+    fn batch_planner_honors_memory_budget_after_fixed_compression_buffers() {
+        let hints = BatchPlanningHints {
+            input_lanes: 3,
+            output_lanes: 3,
+            estimated_bases_per_fragment: 30_000,
+            compressed_input: true,
+            compressed_output: true,
+            fixed_buffer_bytes: 8 * 1024 * 1024,
+            memory_budget_bytes: 16 * 1024 * 1024,
+            ..BatchPlanningHints::default()
+        };
+        let (_, report) =
+            plan_batch_configuration(PipelineConfig::new(8), hints, Default::default());
+        assert!(report.estimated_peak_live_bytes <= report.memory_budget_bytes);
+        assert!(report.reason_codes.contains(&"bounded_peak_memory"));
+        assert!(report.reason_codes.contains(&"long_reads_reduce_batch"));
     }
 
     #[test]

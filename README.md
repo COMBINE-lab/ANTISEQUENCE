@@ -69,6 +69,8 @@ liveness, and nested-graph optimizer integration are described in the
 Proof-backed dead-label elimination and early selective-filter placement,
 including per-pass ablation and measurements, are described in the
 [optimizer passes guide](docs/optimizer-passes.md).
+Deterministic graph-, geometry-, and memory-aware batch sizing is documented
+in the [batch planning guide](docs/batch-planning.md).
 
 ## Terminal read projection
 
