@@ -370,11 +370,12 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                 let curr_read = &mut b[i];
                 curr_read.reset_control_metadata();
                 let mut slot_idx = 0;
+                let mut first_lane_exhausted = false;
                 for (j, (locked_reader, origin)) in locked_readers.iter_mut().enumerate() {
                     let Some(record) = locked_reader.next() else {
                         if j == 0 {
-                            b.truncate(i);
-                            break 'outer;
+                            first_lane_exhausted = true;
+                            break;
                         }
                         return Err(Error::UnpairedRead(format!("\"{}\"", **origin)));
                     };
@@ -405,6 +406,18 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                         idx,
                     );
                     slot_idx += 1;
+                }
+                if first_lane_exhausted {
+                    // Lane 0 EOF is clean end-of-input only if every other lane
+                    // is exhausted too; otherwise trailing records would be
+                    // silently dropped.
+                    for (other_reader, other_origin) in locked_readers.iter_mut().skip(1) {
+                        if other_reader.next().is_some() {
+                            return Err(Error::UnpairedRead(format!("\"{}\"", **other_origin)));
+                        }
+                    }
+                    b.truncate(i);
+                    break 'outer;
                 }
                 curr_read.truncate_fastq_entries(slot_idx);
             }

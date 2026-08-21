@@ -319,6 +319,66 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn unequal_lane_record_counts_error_in_both_directions() {
+        // Lane 0 running out first must not silently drop trailing lane-1
+        // records; both orders are hard errors.
+        let short = fastq_bytes(&[("read1", "AAAA", "IIII")]);
+        let long = fastq_bytes(&[
+            ("read1", "CCCC", "IIII"),
+            ("read2", "GGGG", "IIII"),
+            ("read3", "TTTT", "IIII"),
+        ]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(
+            InputFastqOp::from_readers(vec![
+                Cursor::new(short.clone()),
+                Cursor::new(long.clone()),
+            ])
+            .unwrap(),
+        );
+        assert!(g.run().is_err());
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_readers(vec![Cursor::new(long), Cursor::new(short)]).unwrap());
+        assert!(g.run().is_err());
+    }
+
+    #[test]
+    fn bounded_match_tolerates_reads_shorter_than_window() {
+        // Reads shorter than the bounded window must yield no match, not a
+        // panic on an out-of-range slice.
+        for match_type in [
+            ExactBoundedMatch { from: 1, to: 6 },
+            HammingBoundedMatch {
+                threshold: Count(3),
+                from: 1,
+                to: 6,
+            },
+            EditBoundedMatch {
+                threshold: Count(1),
+                from: 1,
+                to: 6,
+            },
+        ] {
+            let fq = fastq_bytes(&[("read1", "AC", "II"), ("read2", "A", "I")]);
+            let patterns = Patterns::from_strs(["ACGT"]);
+
+            let mut g = Graph::<NoTrace>::new();
+            g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            g.add(MatchAnyOp::new(
+                te("seq1.* -> seq1.before, seq1.match, seq1.after"),
+                patterns,
+                match_type,
+            ));
+            let counter = g.add(CountOp::new([true]));
+            g.run().unwrap();
+
+            assert_eq!(counter.counts()[0], 2);
+        }
+    }
+
+    #[test]
     fn test_graph_match_distance_counts() {
         let g = Graph::<NoTrace>::new();
         let counts = g.match_distance_counts();

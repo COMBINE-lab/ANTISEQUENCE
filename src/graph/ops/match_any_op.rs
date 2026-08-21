@@ -1284,8 +1284,12 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     }
                     ExactSearch => (text, 0, true),
                     ExactBoundedMatch { from, to } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        // Verification treats `to` as inclusive; the prefilter
+                        // window must not be narrower. Short reads clamp to an
+                        // empty window instead of panicking.
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                     Hamming(_) => (text, 0, false),
                     HammingPrefix(_) => (&text[..text.len().min(self.max_literal_len)], 0, false),
@@ -1299,8 +1303,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         from,
                         to,
                     } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                     GlobalAln(_) => (text, 0, false),
                     LocalAln { .. } => (text, 0, true),
@@ -1337,8 +1342,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         from,
                         to,
                     } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                 };
 
@@ -1441,10 +1447,14 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                                 })
                             }
                             ExactBoundedMatch { from, to } => {
-                                let to = text.len().min(to);
-                                let text_around = &text[from..=to];
+                                // `to` is inclusive; clamp both bounds so reads
+                                // shorter than the window yield no match instead
+                                // of panicking on an out-of-range slice.
+                                let end = text.len().min(to.saturating_add(1));
+                                let start = from.min(end);
+                                let text_around = &text[start..end];
                                 memmem::find(text_around, pattern_str)
-                                    .map(|i| (pattern_len, from + i, from + i + pattern_len))
+                                    .map(|i| (pattern_len, start + i, start + i + pattern_len))
                             }
                             Hamming(t) => {
                                 let t = t.get(pattern_len);

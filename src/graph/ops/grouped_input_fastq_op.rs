@@ -67,14 +67,13 @@ impl ShardedFastqReader {
         };
         let shard = self.next_shard;
         self.next_shard += 1;
-        if std::fs::metadata(&file)
-            .map_err(|source| Error::FileIo {
-                file: file.clone(),
-                source: Box::new(source),
-            })?
-            .len()
-            == 0
-        {
+        // Only a regular file can be classified as empty by size: FIFOs,
+        // process substitutions, and devices report size 0 while holding data.
+        let metadata = std::fs::metadata(&file).map_err(|source| Error::FileIo {
+            file: file.clone(),
+            source: Box::new(source),
+        })?;
+        if metadata.is_file() && metadata.len() == 0 {
             self.active_shard = Some(shard);
             self.empty_shard = Some(shard);
             return Ok(true);
