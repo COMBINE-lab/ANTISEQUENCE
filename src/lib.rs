@@ -675,7 +675,9 @@ mod pipeline_tests {
         let mut graph = Graph::<NoTrace>::new();
         graph.add(InputFastqOp::from_interleaved_reader(Cursor::new(fq), 2).unwrap());
         let error = graph.try_run_with_threads(1).unwrap_err();
-        assert!(error.to_string().contains("Unpaired read"));
+        let message = error.to_string();
+        assert!(message.contains("expected 2 records, observed 1"));
+        assert!(message.contains("fragment 1"));
     }
 
     #[test]

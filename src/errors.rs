@@ -67,6 +67,16 @@ pub enum Error {
         fragment: usize,
     },
 
+    #[error(
+        "Interleaved FASTQ shard {shard} ended within fragment {fragment}: expected {expected} records, observed {observed}"
+    )]
+    IncompleteInterleavedFragment {
+        shard: usize,
+        fragment: usize,
+        expected: usize,
+        observed: usize,
+    },
+
     #[error("Error parsing record {idx} in {origin}: {source}")]
     ParseRecord {
         origin: Origin,

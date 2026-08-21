@@ -121,6 +121,7 @@ impl ShardedFastqReader {
         &mut self,
         read: &mut Read,
         slot_index: usize,
+        logical_lane: usize,
         fragment_index: usize,
         stats: Option<&mut GroupedInputStatsAccumulator>,
         collect_lengths: bool,
@@ -151,9 +152,9 @@ impl ShardedFastqReader {
         })?;
         let sequence = record.seq();
         if let Some(stats) = stats {
-            stats.update(self.lane, shard, sequence.len(), collect_lengths);
+            stats.update(logical_lane, shard, sequence.len(), collect_lengths);
         }
-        let lane_number = (self.lane + 1) as u8;
+        let lane_number = (logical_lane + 1) as u8;
         read.set_fastq_entry(
             slot_index,
             StrType::Name(lane_number),
@@ -223,6 +224,8 @@ impl GroupedInputStatsAccumulator {
 pub struct GroupedInputFastqOp {
     lanes: Vec<Mutex<ShardedFastqReader>>,
     shard_count: usize,
+    interleaved: usize,
+    n_fastqs: usize,
     fragment_index: AtomicUsize,
     batch_size: AtomicUsize,
     statistics_level: AtomicU8,
@@ -235,7 +238,7 @@ impl GroupedInputFastqOp {
     pub fn from_files<S: AsRef<str>>(
         lanes: impl IntoIterator<Item = impl IntoIterator<Item = S>>,
     ) -> Result<Self> {
-        Self::from_files_with_decoder(lanes, DecoderMode::Automatic)
+        Self::from_files_with_decoder(lanes, DecoderMode::Automatic, 1)
     }
 
     pub fn from_files_accelerated_gzip<S: AsRef<str>>(
@@ -256,14 +259,54 @@ impl GroupedInputFastqOp {
                 threads: decoder_threads,
                 chunk_size_bytes,
             },
+            1,
+        )
+    }
+
+    /// Stream ordered shards in which each complete fragment consists of
+    /// `interleaved` consecutive FASTQ records.
+    pub fn from_interleaved_files<S: AsRef<str>>(
+        files: impl IntoIterator<Item = S>,
+        interleaved: usize,
+    ) -> Result<Self> {
+        Self::from_files_with_decoder([files], DecoderMode::Automatic, interleaved)
+    }
+
+    pub fn from_interleaved_files_accelerated_gzip<S: AsRef<str>>(
+        files: impl IntoIterator<Item = S>,
+        interleaved: usize,
+        decoder_threads: usize,
+        chunk_size_bytes: usize,
+    ) -> Result<Self> {
+        if decoder_threads == 0 || chunk_size_bytes == 0 {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "accelerated gzip threads and chunk size must be greater than zero"
+                    .to_owned(),
+            });
+        }
+        Self::from_files_with_decoder(
+            [files],
+            DecoderMode::Accelerated {
+                threads: decoder_threads,
+                chunk_size_bytes,
+            },
+            interleaved,
         )
     }
 
     fn from_files_with_decoder<S: AsRef<str>>(
         lanes: impl IntoIterator<Item = impl IntoIterator<Item = S>>,
         decoder: DecoderMode,
+        interleaved: usize,
     ) -> Result<Self> {
-        let lanes = lanes
+        if interleaved == 0 {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "interleaved FASTQ arity must be greater than zero".to_owned(),
+            });
+        }
+        let lanes: Vec<_> = lanes
             .into_iter()
             .map(|lane| {
                 lane.into_iter()
@@ -293,14 +336,21 @@ impl GroupedInputFastqOp {
                 });
             }
         }
-        let lanes = lanes
+        let lanes: Vec<_> = lanes
             .into_iter()
             .enumerate()
             .map(|(lane, files)| Mutex::new(ShardedFastqReader::new(files, lane, decoder)))
             .collect();
+        let n_fastqs = if interleaved > 1 {
+            interleaved
+        } else {
+            lanes.len()
+        };
         Ok(Self {
             lanes,
             shard_count,
+            interleaved,
+            n_fastqs,
             fragment_index: AtomicUsize::new(0),
             batch_size: AtomicUsize::new(grouped_chunk_size()),
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
@@ -330,7 +380,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
         let stats_cell = (statistics_level != StatisticsLevel::Off as u8).then(|| {
             self.local_stats.get_or(|| {
                 Mutex::new(GroupedInputStatsAccumulator::new(
-                    self.lanes.len(),
+                    self.n_fastqs,
                     self.shard_count,
                 ))
             })
@@ -347,19 +397,74 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
             let read = &mut batch[filled];
             read.reset_control_metadata();
 
+            if self.interleaved > 1 {
+                loop {
+                    let fragment = self.fragment_index.load(Ordering::Relaxed);
+                    let first = lanes[0].next_into(
+                        read,
+                        0,
+                        0,
+                        fragment,
+                        stats.as_deref_mut(),
+                        collect_lengths,
+                    )?;
+                    match first {
+                        ShardProgress::Record { shard } => {
+                            for logical_lane in 1..self.interleaved {
+                                match lanes[0].next_into(
+                                    read,
+                                    logical_lane * 2,
+                                    logical_lane,
+                                    fragment,
+                                    stats.as_deref_mut(),
+                                    collect_lengths,
+                                )? {
+                                    ShardProgress::Record { shard: observed }
+                                        if observed == shard => {}
+                                    ShardProgress::Record { .. }
+                                    | ShardProgress::EndShard { .. }
+                                    | ShardProgress::EndAll => {
+                                        return Err(Error::IncompleteInterleavedFragment {
+                                            shard: shard + 1,
+                                            fragment,
+                                            expected: self.interleaved,
+                                            observed: logical_lane,
+                                        });
+                                    }
+                                }
+                            }
+                            read.truncate_fastq_entries(self.interleaved * 2);
+                            self.fragment_index.fetch_add(1, Ordering::Relaxed);
+                            filled += 1;
+                            break;
+                        }
+                        ShardProgress::EndShard { .. } => continue,
+                        ShardProgress::EndAll => break 'batch,
+                    }
+                }
+                continue;
+            }
+
             loop {
                 // Reader locks serialize this section, so `load` is a unique
                 // tentative index. It is published only after every lane has
                 // supplied the fragment; shard boundaries consume no index.
                 let fragment = self.fragment_index.load(Ordering::Relaxed);
-                let first =
-                    lanes[0].next_into(read, 0, fragment, stats.as_deref_mut(), collect_lengths)?;
+                let first = lanes[0].next_into(
+                    read,
+                    0,
+                    0,
+                    fragment,
+                    stats.as_deref_mut(),
+                    collect_lengths,
+                )?;
                 match first {
                     ShardProgress::Record { shard } => {
                         for (lane, reader) in lanes.iter_mut().enumerate().skip(1) {
                             match reader.next_into(
                                 read,
                                 lane * 2,
+                                lane,
                                 fragment,
                                 stats.as_deref_mut(),
                                 collect_lengths,
@@ -374,7 +479,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
                                 }
                             }
                         }
-                        read.truncate_fastq_entries(self.lanes.len() * 2);
+                        read.truncate_fastq_entries(self.n_fastqs * 2);
                         self.fragment_index.fetch_add(1, Ordering::Relaxed);
                         filled += 1;
                         break;
@@ -384,6 +489,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
                             if reader.next_into(
                                 read,
                                 lane * 2,
+                                lane,
                                 fragment,
                                 stats.as_deref_mut(),
                                 collect_lengths,
@@ -402,6 +508,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
                             if reader.next_into(
                                 read,
                                 lane * 2,
+                                lane,
                                 fragment,
                                 stats.as_deref_mut(),
                                 collect_lengths,
@@ -459,7 +566,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
         if level == StatisticsLevel::Off as u8 {
             return None;
         }
-        let mut totals = GroupedInputStatsAccumulator::new(self.lanes.len(), self.shard_count);
+        let mut totals = GroupedInputStatsAccumulator::new(self.n_fastqs, self.shard_count);
         for local in self.local_stats.iter() {
             let local = local.lock();
             for (total, observed) in totals.lanes.iter_mut().zip(&local.lanes) {
@@ -478,7 +585,7 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
         }
         let detailed = level == StatisticsLevel::Detailed as u8;
         Some(InputStats {
-            n_fastqs: self.lanes.len(),
+            n_fastqs: self.n_fastqs,
             lengths_collected: detailed,
             read_counts: totals.lanes.iter().map(|stats| stats.count).collect(),
             read_length_min: totals
@@ -627,5 +734,72 @@ mod tests {
         assert_eq!(stats.shard_read_counts, vec![vec![1, 1], vec![1, 1]]);
         assert_eq!(stats.read_length_min, vec![4, 2]);
         assert_eq!(stats.read_length_max, vec![4, 2]);
+    }
+
+    #[test]
+    fn grouped_interleaved_shards_preserve_complete_fragments_and_statistics() {
+        let fixture = Fixture::write(&[
+            "@a/1\nAAAA\n+\nIIII\n@a/2\nTT\n+\nKK\n",
+            "",
+            "@b/1\nCCCC\n+\nJJJJ\n@b/2\nGG\n+\nLL\n",
+        ]);
+        let op =
+            GroupedInputFastqOp::from_interleaved_files(fixture.strings(&[0, 1, 2]), 2).unwrap();
+        <GroupedInputFastqOp as GraphNode<NoTrace>>::set_batch_size(&op, 16);
+        <GroupedInputFastqOp as GraphNode<NoTrace>>::set_statistics_level(
+            &op,
+            StatisticsLevel::Detailed,
+        );
+        let (reads, done) =
+            <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap();
+        assert!(!done);
+        let reads = reads.unwrap();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].to_fastq(1).unwrap().1, b"AAAA");
+        assert_eq!(reads[0].to_fastq(2).unwrap().1, b"TT");
+        assert_eq!(reads[1].to_fastq(1).unwrap().1, b"CCCC");
+        assert_eq!(reads[1].to_fastq(2).unwrap().1, b"GG");
+        let stats = <GroupedInputFastqOp as GraphNode<NoTrace>>::input_stats(&op).unwrap();
+        assert_eq!(stats.read_counts, vec![2, 2]);
+        assert_eq!(stats.shard_read_counts, vec![vec![1, 0, 1], vec![1, 0, 1]]);
+    }
+
+    #[test]
+    fn grouped_interleaved_shards_reject_partial_fragment_at_boundary() {
+        let fixture = Fixture::write(&[
+            "@a/1\nAAAA\n+\nIIII\n",
+            "@b/1\nCCCC\n+\nJJJJ\n@b/2\nGG\n+\nLL\n",
+        ]);
+        let op = GroupedInputFastqOp::from_interleaved_files(fixture.strings(&[0, 1]), 2).unwrap();
+        let error =
+            <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::IncompleteInterleavedFragment {
+                shard: 1,
+                fragment: 0,
+                expected: 2,
+                observed: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn grouped_interleaved_supports_one_and_three_record_arities() {
+        let single = Fixture::write(&["@a\nAAAA\n+\nIIII\n"]);
+        let op = GroupedInputFastqOp::from_interleaved_files(single.strings(&[0]), 1).unwrap();
+        let (reads, _) =
+            <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap();
+        assert_eq!(reads.unwrap()[0].to_fastq(1).unwrap().1, b"AAAA");
+
+        let triple = Fixture::write(&["@a/1\nAA\n+\nII\n@a/2\nCC\n+\nJJ\n@a/3\nGG\n+\nKK\n"]);
+        let op = GroupedInputFastqOp::from_interleaved_files(triple.strings(&[0]), 3).unwrap();
+        let (reads, _) =
+            <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap();
+        let reads = reads.unwrap();
+        let read = &reads[0];
+        assert_eq!(read.to_fastq(1).unwrap().1, b"AA");
+        assert_eq!(read.to_fastq(2).unwrap().1, b"CC");
+        assert_eq!(read.to_fastq(3).unwrap().1, b"GG");
     }
 }

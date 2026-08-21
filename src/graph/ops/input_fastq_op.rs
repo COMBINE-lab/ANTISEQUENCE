@@ -316,7 +316,12 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
                             b.truncate(i);
                             break 'outer;
                         }
-                        return Err(Error::UnpairedRead(format!("\"{}\"", **origin)));
+                        return Err(Error::IncompleteInterleavedFragment {
+                            shard: 1,
+                            fragment: idx / self.interleaved,
+                            expected: self.interleaved,
+                            observed: j,
+                        });
                     };
                     let record = record.map_err(|e| Error::ParseRecord {
                         origin: (***origin).clone(),
