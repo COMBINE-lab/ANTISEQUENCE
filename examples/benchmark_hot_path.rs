@@ -4,7 +4,7 @@
 //! keeps FASTQ generation and input cloning outside the measured interval, and
 //! emits machine-readable JSON for the reproducible benchmark harness.
 
-use antisequence::expr::label;
+use antisequence::expr::{label, lane_attr, Expr};
 use antisequence::graph::*;
 use antisequence::*;
 use flate2::{write::GzEncoder, Compression};
@@ -52,6 +52,7 @@ struct Args {
     direct_output_rendering: bool,
     graph_optimization: bool,
     fork_reads: bool,
+    control_metadata: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +137,7 @@ fn parse_args() -> Args {
         direct_output_rendering: true,
         graph_optimization: true,
         fork_reads: false,
+        control_metadata: false,
     };
     let mut cli = std::env::args().skip(1);
     while let Some(flag) = cli.next() {
@@ -323,6 +325,7 @@ fn parse_args() -> Args {
             "--no-direct-output-rendering" => args.direct_output_rendering = false,
             "--no-graph-optimization" => args.graph_optimization = false,
             "--fork" => args.fork_reads = true,
+            "--control-metadata" => args.control_metadata = true,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
                     "passthrough" => Mode::Passthrough,
@@ -353,7 +356,8 @@ fn parse_args() -> Args {
                      [--seed-text-length N] [--seed-scenario exact|no-match|repetitive] \
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
                      [--gzip-level 0..9] [--terminal-projection] \
-                     [--no-direct-output-rendering] [--no-graph-optimization] [--fork]"
+                     [--no-direct-output-rendering] [--no-graph-optimization] [--fork] \
+                     [--control-metadata]"
                 );
                 std::process::exit(0);
             }
@@ -535,6 +539,11 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
         let mut branch = Graph::new();
         branch.add(NullOutputOp::new());
         graph.add(ForkOp::new(branch));
+    }
+    if args.control_metadata {
+        let route = lane_attr(1, b"route");
+        graph.add(SetOp::new(route.clone(), b"keep".to_vec()));
+        graph.add(RetainOp::new(Expr::from(route).eq(b"keep".to_vec())));
     }
     graph.set_statistics_level(args.statistics_level);
     match args.output {
@@ -718,6 +727,7 @@ fn main() {
             "direct_output_rendering": args.direct_output_rendering,
             "graph_optimization": args.graph_optimization,
             "fork_reads": args.fork_reads,
+            "control_metadata": args.control_metadata,
             "reads": args.reads,
             "threads": args.threads,
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),
