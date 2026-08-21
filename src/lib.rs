@@ -1068,6 +1068,21 @@ mod pipeline_tests {
         }
     }
 
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "downstream reader closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_try_graph_with_threads_returns_output_error() {
         let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
@@ -1078,6 +1093,18 @@ mod pipeline_tests {
         let error = g.try_run_with_threads(2).unwrap_err();
         assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
         assert!(error.to_string().contains("intentional write failure"));
+    }
+
+    #[test]
+    fn broken_pipe_cancels_execution_without_panicking() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(BrokenPipeWriter));
+
+        let error = graph.try_run_with_threads(2).unwrap_err();
+        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(error.to_string().contains("downstream reader closed"));
     }
 
     #[derive(Clone, Default)]
