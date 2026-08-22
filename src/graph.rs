@@ -1553,7 +1553,7 @@ impl<T: Trace> Graph<T> {
         // `TryOp`/`WhileOp` call it once per read across every worker. A
         // failed `compare_exchange` still takes the cacheline exclusively,
         // so the already-running common case must be a plain load.
-        match self.execution_state.load(Ordering::Acquire) {
+        match self.execution_state.load(Ordering::Relaxed) {
             GRAPH_RUNNING => return Ok(()),
             GRAPH_READY => {}
             _ => return Err(Error::GraphAlreadyFinished),
