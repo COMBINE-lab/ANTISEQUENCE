@@ -33,7 +33,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Check baseline and accelerated APIs
         run: cargo check --locked --all-targets --features accelerated-gzip
-      - name: Test library and documentation
-        run: cargo test --locked --lib --doc --features accelerated-gzip
+      - name: Test library
+        run: cargo test --locked --lib --features accelerated-gzip
+      - name: Test documentation
+        run: cargo test --locked --doc --features accelerated-gzip
       - name: Clippy
         run: cargo clippy --locked --lib --features accelerated-gzip -- -D warnings
