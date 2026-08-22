@@ -1706,6 +1706,70 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn invalid_pipeline_configuration_is_retryable_and_does_not_touch_output() {
+        let path = std::env::temp_dir().join(format!(
+            "antisequence-invalid-config-output-{}.fastq",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"sentinel\n").unwrap();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(Vec::<u8>::new())).unwrap());
+        graph.add(OutputFastqFileOp::from_file(
+            path.to_string_lossy().into_owned(),
+        ));
+        let mut invalid = PipelineConfig::new(1);
+        invalid.queue_capacity = 0;
+        assert!(matches!(
+            graph.try_run_pipeline(invalid),
+            Err(crate::errors::Error::InvalidPipelineConfig(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel\n");
+
+        graph.try_run_pipeline(PipelineConfig::new(1)).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn failed_execution_is_terminal_and_does_not_finalize_output() {
+        let path = std::env::temp_dir().join(format!(
+            "antisequence-failed-run-output-{}.fastq",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"sentinel\n").unwrap();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read1\nACGT\n+\nIII\n".to_vec())).unwrap(),
+        );
+        graph.add(OutputFastqFileOp::from_file(
+            path.to_string_lossy().into_owned(),
+        ));
+        assert!(graph.run().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel\n");
+        assert!(matches!(
+            graph.run(),
+            Err(crate::errors::Error::GraphAlreadyFinished)
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn successfully_finished_graph_cannot_be_executed_again() {
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1))).unwrap());
+        graph.add(NullOutputOp::new());
+        graph.run().unwrap();
+        assert!(matches!(
+            graph.run(),
+            Err(crate::errors::Error::GraphAlreadyFinished)
+        ));
+        // Explicit repeated finalization remains harmless.
+        graph.finish().unwrap();
+    }
+
+    #[test]
     fn test_bounded_ordered_pipeline_keeps_interleaved_outputs_in_lockstep() {
         let output1 = SharedWriter::default();
         let output2 = SharedWriter::default();
@@ -2337,6 +2401,29 @@ mod pipeline_tests {
         ));
         let counter = g.add(CountOp::new([true]));
         g.run().unwrap();
+
+        assert_eq!(counter.counts()[0], 1);
+    }
+
+    #[test]
+    fn test_hamming_search_mixed_lengths_does_not_use_unsound_common_seed() {
+        // Count(8) makes the 8-base literals exact matches, but permits eight
+        // mismatches in the 16-base literal. Deriving the common seed length
+        // from only the shortest literal used k=8 and missed this valid long
+        // match because the query contains no eight-base A run.
+        let fq = fastq_bytes(&[("read1", "ACACACACACACACAC", "IIIIIIIIIIIIIIII")]);
+        let patterns =
+            Patterns::from_strs(["CCCCCCCC", "GGGGGGGG", "TTTTTTTT", "AAAAAAAAAAAAAAAA"]);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.before, seq1.match, seq1.after"),
+            patterns,
+            HammingSearch(Count(8)),
+        ));
+        let counter = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
 
         assert_eq!(counter.counts()[0], 1);
     }

@@ -21,7 +21,12 @@ pub struct Graph<T: Trace = NoTrace> {
     nodes: Vec<Arc<dyn GraphNode<T>>>,
     statistics_level: AtomicU8,
     missing_input_policy: AtomicU8,
+    execution_state: AtomicU8,
 }
+
+const GRAPH_READY: u8 = 0;
+const GRAPH_RUNNING: u8 = 1;
+const GRAPH_FINISHED: u8 = 2;
 
 /// Mutable graph construction API.
 ///
@@ -1506,6 +1511,38 @@ impl<T: Trace> Graph<T> {
             nodes: Vec::new(),
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             missing_input_policy: AtomicU8::new(MissingInputPolicy::Skip as u8),
+            execution_state: AtomicU8::new(GRAPH_READY),
+        }
+    }
+
+    /// Claim this graph for a complete top-level execution.
+    fn begin_execution(&self) -> Result<()> {
+        match self.execution_state.compare_exchange(
+            GRAPH_READY,
+            GRAPH_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(GRAPH_RUNNING) => Err(Error::GraphAlreadyRunning),
+            Err(_) => Err(Error::GraphAlreadyFinished),
+        }
+    }
+
+    /// Start or continue an explicitly incremental execution.
+    ///
+    /// Top-level runners claim the graph once and may then call `run_one`
+    /// concurrently. Public callers can also drive a graph batch by batch,
+    /// but must call `finish` when the stream is complete.
+    fn begin_or_continue_execution(&self) -> Result<()> {
+        match self.execution_state.compare_exchange(
+            GRAPH_READY,
+            GRAPH_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(GRAPH_RUNNING) => Ok(()),
+            Err(_) => Err(Error::GraphAlreadyFinished),
         }
     }
 
@@ -1891,6 +1928,7 @@ impl<T: Trace> Graph<T> {
     }
 
     fn run_trace_inner(&self, trace: &T) -> Result<()> {
+        self.begin_execution()?;
         let execution = self.run_trace_inner_until_cancelled(trace, None);
         self.finish_after(execution)
     }
@@ -1955,6 +1993,7 @@ impl<T: Trace> Graph<T> {
         if threads == 0 {
             return Err(Error::InvalidThreadCount(threads));
         }
+        self.begin_execution()?;
 
         let cancelled = AtomicBool::new(false);
         let failures = Mutex::new(Vec::<Error>::new());
@@ -2008,13 +2047,15 @@ impl<T: Trace> Graph<T> {
         trace_path: impl AsRef<Path>,
     ) -> Result<PipelineReport> {
         let trace = T::new(trace_path);
-        let result = self.finish_after(self.run_pipeline_inner(config, &trace));
+        let result = self
+            .validate_pipeline_config(config)
+            .and_then(|()| self.begin_execution())
+            .and_then(|()| self.finish_after(self.run_pipeline_inner(config, &trace)));
         trace.finish();
         result
     }
 
     fn run_pipeline_inner(&self, config: PipelineConfig, trace: &T) -> Result<PipelineReport> {
-        self.validate_pipeline_config(config)?;
         match config.input_mode {
             PipelineInputMode::WorkerLocal => self.run_locality_pipeline_inner(config, trace),
             PipelineInputMode::DedicatedReader => {
@@ -2907,6 +2948,9 @@ impl<T: Trace> Graph<T> {
     /// Finish every node, retaining all failures so one broken output cannot
     /// hide a second broken output.
     pub fn finish(&self) -> Result<()> {
+        if self.execution_state.swap(GRAPH_FINISHED, Ordering::AcqRel) == GRAPH_FINISHED {
+            return Ok(());
+        }
         let failures = self
             .nodes
             .iter()
@@ -2920,11 +2964,16 @@ impl<T: Trace> Graph<T> {
     }
 
     fn finish_after<R>(&self, execution: Result<R>) -> Result<R> {
-        let finish = self.finish();
-        match (execution, finish) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(execution), Err(finish)) => Err(aggregate_failures(vec![execution, finish])),
+        match execution {
+            Ok(value) => self.finish().map(|()| value),
+            Err(error) => {
+                // Finalization may materialize constant outputs and flush or
+                // truncate destinations. A failed execution must be terminal,
+                // but must not turn partial state into apparently valid output.
+                self.execution_state
+                    .store(GRAPH_FINISHED, Ordering::Release);
+                Err(error)
+            }
         }
     }
 
@@ -3006,6 +3055,7 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool)> {
+        self.begin_or_continue_execution()?;
         for node in &self.nodes {
             // If there is no current read, only the input node can produce one.
             if curr.is_none() {
@@ -3053,6 +3103,7 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool, bool)> {
+        self.begin_or_continue_execution()?;
         let mut failed = false;
         for node in &self.nodes {
             if let Some(reads) = &mut curr {

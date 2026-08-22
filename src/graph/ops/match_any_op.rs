@@ -651,12 +651,16 @@ impl MatchAnyOp {
             return None;
         }
 
-        let min_len = patterns
+        // A common seed length is sound only when it is safe for every
+        // pattern. In particular, a large absolute Hamming allowance can
+        // leave fewer guaranteed matching bases in a short pattern than in a
+        // long one, so deriving k from only the shortest literal can produce
+        // false negatives for mixed-length sets.
+        let k = patterns
             .iter_literals()
-            .map(|(_, p)| p.len())
+            .map(|(_, pattern)| match_type.k(pattern.len()))
             .min()
             .unwrap_or(0);
-        let k = match_type.k(min_len);
 
         use SeedSearchers::*;
         let res = match k {
@@ -814,6 +818,22 @@ impl MatchAnyOp {
             }),
             resolution,
         )))
+    }
+
+    /// Whether the exhaustive positional oracle can affect this operation.
+    ///
+    /// Keeping this predicate outside the per-candidate loop is important:
+    /// the default leftmost/statistics-off path must not allocate or hash just
+    /// to cache values that are always `None`.
+    #[inline]
+    fn uses_reference_position_oracle(&self, collect_detailed_statistics: bool) -> bool {
+        (collect_detailed_statistics
+            || self.patterns.position_ambiguity_policy() != PositionAmbiguityPolicy::Leftmost)
+            && matches!(
+                self.matcher_plan.spec.scope,
+                MatchScope::Search | MatchScope::Bounded { .. }
+            )
+            && !matches!(self.matcher_plan.spec.metric, MatchMetric::Alignment { .. })
     }
 
     #[inline]
@@ -1455,10 +1475,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             // cache is keyed sparsely by the patterns the seeds actually hit:
             // a dense per-pattern table would cost O(pattern count) per read,
             // which is prohibitive for whitelist-scale pattern sets.
-            let mut reference_positions: FxHashMap<
-                usize,
-                Option<(Option<MatchPlacement>, PositionResolution)>,
-            > = FxHashMap::default();
+            let mut reference_positions = self.uses_reference_position_oracle(collect_stats).then(
+                FxHashMap::<usize, Option<(Option<MatchPlacement>, PositionResolution)>>::default,
+            );
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -1469,18 +1488,21 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-                let reference_position = if let Some(cached) = reference_positions.get(&pattern_idx)
-                {
-                    *cached
+                let reference_position = if let Some(cache) = reference_positions.as_mut() {
+                    if let Some(cached) = cache.get(&pattern_idx) {
+                        *cached
+                    } else {
+                        let computed = self.reference_position_candidate(
+                            text,
+                            position_quality,
+                            pattern_str,
+                            collect_stats,
+                        )?;
+                        cache.insert(pattern_idx, computed);
+                        computed
+                    }
                 } else {
-                    let computed = self.reference_position_candidate(
-                        text,
-                        position_quality,
-                        pattern_str,
-                        collect_stats,
-                    )?;
-                    reference_positions.insert(pattern_idx, computed);
-                    computed
+                    None
                 };
                 let (matches, position_resolution) = if let Some(reference) = reference_position {
                     reference
@@ -2309,7 +2331,7 @@ fn edit_search_long_myers(
     // than that window. Ends ascend, so tracebacks stop once no later end can
     // improve the lexicographic (start, end) minimum; this keeps equal-best
     // tie resolution linear on repetitive reads.
-    let window = pattern_len + best_distance;
+    let window = pattern_len.saturating_add(best_distance);
     let mut best: Option<(usize, usize)> = None;
     for end in best_ends {
         if let Some((best_start, _)) = best {
@@ -2397,7 +2419,7 @@ fn edit_search_myers(
     // can start before the current best start, the lexicographic (start, end)
     // minimum is final. Both bounds keep tie resolution linear on repetitive
     // reads with many equal-best ends.
-    let window = m + best_score;
+    let window = m.saturating_add(best_score);
     let mut best: Option<(usize, usize)> = None;
     for end in best_ends {
         if let Some((best_start, _)) = best {
@@ -2505,7 +2527,7 @@ fn edit_search_dp(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usiz
     // can start before the current best start, the lexicographic (start, end)
     // minimum is final. Both bounds keep tie resolution linear on repetitive
     // reads with many equal-best ends.
-    let window = m + best_score;
+    let window = m.saturating_add(best_score);
     let mut best: Option<(usize, usize)> = None;
     for end in best_ends {
         if let Some((best_start, _)) = best {
@@ -3225,6 +3247,27 @@ mod edit_distance_tests {
                 "long Myers differential failure in case {case_idx}: pattern_len={pattern_len}, max_edits={max_edits}"
             );
         }
+    }
+
+    #[test]
+    fn test_edit_search_repetitive_ties_choose_leftmost_short_pattern() {
+        let pattern = vec![b'A'; 32];
+        let text = vec![b'A'; 10_000];
+        assert_eq!(edit_search(&text, &pattern, 2), Some((32, 0, 32)));
+    }
+
+    #[test]
+    fn test_edit_search_repetitive_ties_choose_leftmost_long_pattern() {
+        let pattern = vec![b'A'; 96];
+        let text = vec![b'A'; 10_000];
+        let expected = Some((96, 0, 96));
+        assert_eq!(edit_search_dp(&text, &pattern, 2), expected);
+
+        let mut searcher = LongMyers::<u64>::new(&pattern);
+        assert_eq!(
+            edit_search_long_myers(&mut searcher, &text, pattern.len(), 2),
+            expected
+        );
     }
 
     // -- Bug 1: edit_search_myers estimates start position instead of computing it exactly --

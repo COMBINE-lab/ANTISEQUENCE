@@ -9,6 +9,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("Graph execution has already finished and cannot be restarted")]
+    GraphAlreadyFinished,
+
+    #[error("Graph execution is already active")]
+    GraphAlreadyRunning,
+
     #[error("Number of threads must be greater than zero (received {0})")]
     InvalidThreadCount(usize),
 
