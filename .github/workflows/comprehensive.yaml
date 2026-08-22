@@ -1,0 +1,67 @@
+name: Comprehensive CI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
+  schedule:
+    - cron: "0 6 15 * *"
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: antisequence-comprehensive-baseline
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --features accelerated-gzip -- -D warnings
+      - run: cargo test --locked --all-targets --features accelerated-gzip --no-fail-fast
+      - run: cargo doc --locked --no-deps --features accelerated-gzip
+      - run: cargo package --locked
+      - run: bash scripts/verify_downstream.sh
+
+  release-simd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: antisequence-comprehensive-release-simd
+      - name: Test architecture-tuned matcher backend
+        run: >-
+          cargo test --locked --all-targets --no-default-features
+          --features release-simd,accelerated-gzip --no-fail-fast
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: antisequence-msrv-1.88
+      - run: cargo check --locked --all-targets --features accelerated-gzip
+
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: antisequence-macos-arm64
+      - run: cargo test --locked --lib --doc --features accelerated-gzip

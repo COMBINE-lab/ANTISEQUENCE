@@ -1,13 +1,13 @@
-# Dependency audit (2026-08-19)
+# Dependency audit (2026-08-21)
 
 This audit covers all direct dependencies and the complete resolved graph used
-to test ANTISEQUENCE on 2026-08-19. Version information came from the crates.io
+to test ANTISEQUENCE on 2026-08-21. Version information came from the crates.io
 API and `cargo update --dry-run --verbose`; advisories came from RustSec database
 commit `2f08fbb85332687b721f2f22706d07448369451b` via `cargo-audit 0.22.2`.
 
-ANTISEQUENCE is a library, so it intentionally does not commit `Cargo.lock`.
-Applications must commit their lockfile; the seqproc lockfile records the exact
-ANTISEQUENCE dependency closure used for releases and paper benchmarks.
+ANTISEQUENCE commits `Cargo.lock` so CI, review, and release preparation all
+exercise the same dependency closure. Cargo consumers still resolve the
+library under their own application lockfiles, as usual.
 
 ## Immediate decisions
 
@@ -17,6 +17,14 @@ ANTISEQUENCE dependency closure used for releases and paper benchmarks.
   rand_xoshiro 0.6 stream used by ambiguity-policy tests.
 - `bio` 4.0.1, `block-aligner` 0.5.1, and `hashbrown` 0.17.1 are already the
   latest stable releases.
+- The direct error-derive dependency now uses `thiserror` 2; `bio-types`
+  retains one transitive 1.x copy outside ANTISEQUENCE's control.
+- `rapidgzip-core` is optional behind `accelerated-gzip`. seqproc enables it
+  explicitly, while applications using only graph/matcher APIs do not compile
+  or ship the speculative decoder.
+- Block aligner uses library-safe SSE2/NEON defaults. The mutually exclusive
+  `release-simd` application feature selects AVX2 on x86_64 and NEON on
+  aarch64, and is tested separately.
 - Compatible patch/minor releases are accepted by the existing caret
   requirements and are exercised by lockfile-free library CI.
 - The declared Rust floor is 1.88, matching the highest minimum in the fresh
@@ -37,9 +45,9 @@ admit the current compatible releases in the “keep” rows.
 | `hashbrown` | 0.17.1 | 0.17.1 | Keep; current. |
 | `flate2` | 1.1.9 | 1.1.9 | Keep; current. |
 | `gzp` | 2.0.4 | 2.0.4 | Keep; current. |
-| `rapidgzip-core` | 0.2.1 | 0.3.1 | Defer: validate gzip correctness, memory, and throughput. |
+| `rapidgzip-core` (optional) | 0.2.1 | 0.3.1 | Keep for 0.1; opt-in feature is differentially tested against standard gzip. Defer the 0.3 migration to a dedicated correctness/memory/throughput pass. |
 | `regex` | 1.13.1 | 1.13.1 | Keep; current. |
-| `thiserror` | 1.0.69 | 2.0.20 | Defer: no security need, and `bio` still brings the 1.x line. |
+| `thiserror` | 2.0.20 | 2.0.20 | Updated direct dependency; `bio-types` still brings the 1.x line transitively. |
 | `rand` | 0.8.7 | 0.10.2 | Keep 0.8 after its security patch; preserve deterministic ambiguity choices. |
 | `rand_xoshiro` | 0.6.0 | 0.8.1 | Keep with rand 0.8; migrate and golden-test together. |
 | `thread_local` | 1.1.10 | 1.1.10 | Keep; current. |
@@ -54,7 +62,7 @@ admit the current compatible releases in the “keep” rows.
 | `crossbeam-channel` | 0.5.16 | 0.5.16 | Keep; current. |
 | `mimalloc` (optional) | 0.1.52 | 0.1.52 | Keep; current. |
 | `jemallocator` (optional) | 0.5.4 | 0.5.4 | Keep; current. |
-| `block-aligner` | 0.5.1 | 0.5.1 | Keep; current; architecture-specific SIMD features are intentional. |
+| `block-aligner` | 0.5.1 | 0.5.1 | Keep; current. SSE2/NEON is the library baseline; `release-simd` selects AVX2 for tuned x86_64 applications. |
 
 ## Transitive findings
 
@@ -75,7 +83,8 @@ costs rather than duplicated per-read work.
 ```bash
 cargo update --dry-run --verbose
 cargo tree --duplicates
-cargo test --all-targets
-cargo package --allow-dirty
+cargo test --locked --all-targets --features accelerated-gzip
+cargo test --locked --all-targets --no-default-features --features release-simd,accelerated-gzip
+cargo package --locked --allow-dirty
 cargo audit
 ```

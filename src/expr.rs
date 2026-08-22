@@ -9,23 +9,38 @@ use crate::inline_string::*;
 use crate::parse_utils::*;
 use crate::read::*;
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Label {
     pub str_type: StrType,
     pub label: InlineString,
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Attr {
     pub str_type: StrType,
     pub label: InlineString,
     pub attr: InlineString,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Record-scoped control metadata, independent of FASTQ lanes and intervals.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordAttr {
+    pub attr: InlineString,
+}
+
+/// Lane-scoped control metadata, independent of interval projection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LaneAttr {
+    pub lane: u8,
+    pub attr: InlineString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LabelOrAttr {
     Label(Label),
     Attr(Attr),
+    RecordAttr(RecordAttr),
+    LaneAttr(LaneAttr),
 }
 
 impl Label {
@@ -125,6 +140,20 @@ impl LabelOrAttr {
         match self {
             LabelOrAttr::Label(l) => l.str_type,
             LabelOrAttr::Attr(a) => a.str_type,
+            LabelOrAttr::LaneAttr(a) => StrType::Seq(a.lane),
+            LabelOrAttr::RecordAttr(_) => {
+                panic!("record-scoped metadata has no FASTQ string type")
+            }
+        }
+    }
+
+    /// FASTQ string type for interval-relative names, or `None` for control
+    /// metadata that survives interval projection.
+    pub fn interval_str_type(&self) -> Option<StrType> {
+        match self {
+            LabelOrAttr::Label(label) => Some(label.str_type),
+            LabelOrAttr::Attr(attr) => Some(attr.str_type),
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => None,
         }
     }
 
@@ -132,6 +161,9 @@ impl LabelOrAttr {
         match self {
             LabelOrAttr::Label(l) => l.label,
             LabelOrAttr::Attr(a) => a.label,
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {
+                panic!("control metadata has no interval label")
+            }
         }
     }
 }
@@ -145,6 +177,18 @@ impl From<Label> for LabelOrAttr {
 impl From<Attr> for LabelOrAttr {
     fn from(attr: Attr) -> Self {
         LabelOrAttr::Attr(attr)
+    }
+}
+
+impl From<RecordAttr> for LabelOrAttr {
+    fn from(attr: RecordAttr) -> Self {
+        LabelOrAttr::RecordAttr(attr)
+    }
+}
+
+impl From<LaneAttr> for LabelOrAttr {
+    fn from(attr: LaneAttr) -> Self {
+        LabelOrAttr::LaneAttr(attr)
     }
 }
 
@@ -168,6 +212,27 @@ pub fn label(s: impl AsRef<[u8]>) -> Label {
 /// Create an attribute by parsing a byte string of the form `type.label.attr`.
 pub fn attr(s: impl AsRef<[u8]>) -> Attr {
     Attr::new(s.as_ref()).unwrap_or_else(|e| panic!("Error creating attr:\n{e}"))
+}
+
+/// Create a record-scoped control-metadata reference.
+pub fn record_attr(name: impl AsRef<[u8]>) -> RecordAttr {
+    RecordAttr {
+        attr: InlineString::new(
+            check_valid_name(name.as_ref())
+                .unwrap_or_else(|| panic!("invalid record metadata name")),
+        ),
+    }
+}
+
+/// Create a lane-scoped control-metadata reference.
+pub fn lane_attr(lane: u8, name: impl AsRef<[u8]>) -> LaneAttr {
+    assert!(lane > 0, "FASTQ lane indices are one-based");
+    LaneAttr {
+        lane,
+        attr: InlineString::new(
+            check_valid_name(name.as_ref()).unwrap_or_else(|| panic!("invalid lane metadata name")),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,100 @@ pub use ops::*;
 pub struct Graph<T: Trace = NoTrace> {
     nodes: Vec<Arc<dyn GraphNode<T>>>,
     statistics_level: AtomicU8,
+    missing_input_policy: AtomicU8,
+    execution_state: AtomicU8,
+}
+
+const GRAPH_READY: u8 = 0;
+const GRAPH_RUNNING: u8 = 1;
+const GRAPH_FINISHED: u8 = 2;
+const GRAPH_FINISHING: u8 = 3;
+const GRAPH_FINISH_FAILED: u8 = 4;
+
+/// Mutable graph construction API.
+///
+/// Calling [`GraphBuilder::compile`] validates stage ordering and transfers
+/// the nodes into a structurally immutable [`CompiledGraph`]. Runtime
+/// instrumentation is selected before compilation because statistics are an
+/// observable optimizer barrier.
+pub struct GraphBuilder<T: Trace = NoTrace> {
+    graph: Graph<T>,
+}
+
+/// Validated graph whose operation sequence can no longer be changed.
+pub struct CompiledGraph<T: Trace = NoTrace> {
+    graph: Graph<T>,
+    optimization_report: GraphOptimizationReport,
+}
+
+/// Compile-time graph optimization settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GraphOptimizationConfig {
+    /// Apply transformations whose semantic preconditions are proven by the
+    /// operation descriptors and optimization hooks.
+    pub enabled: bool,
+    pub semantic_noop_elimination: bool,
+    pub adjacent_idempotent_fusion: bool,
+    pub dead_label_elimination: bool,
+    pub early_selective_filter_placement: bool,
+    pub terminal_projection_output_fusion: bool,
+}
+
+impl Default for GraphOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            semantic_noop_elimination: true,
+            adjacent_idempotent_fusion: true,
+            dead_label_elimination: true,
+            early_selective_filter_placement: true,
+            terminal_projection_output_fusion: true,
+        }
+    }
+}
+
+impl GraphOptimizationConfig {
+    /// Disable every pass while retaining an explicit, reportable policy.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+/// Stable names and node counts for one compile-time optimization pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphOptimizationPassReport {
+    pub pass: &'static str,
+    pub changed_nodes: usize,
+}
+
+/// Observable result of validating and optimizing a graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphOptimizationReport {
+    pub enabled: bool,
+    #[serde(skip)]
+    pub config: GraphOptimizationConfig,
+    pub original_operations: usize,
+    pub optimized_operations: usize,
+    pub opaque_barriers: usize,
+    /// Nested nodes whose external `Arc` handles prevented recursive mutation
+    /// during compilation. This is separately observable so callers do not
+    /// mistake a partially optimized graph for the fully private case.
+    pub shared_nested_graph_barriers: usize,
+    pub terminal_projection_candidates: usize,
+    pub passes: Vec<GraphOptimizationPassReport>,
+}
+
+/// An exact, allocation-tolerant operation identity used only while compiling.
+///
+/// Variants are added only when the named operation has proven idempotence for
+/// adjacent identical configurations. This is intentionally not a general
+/// dynamic downcast interface.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdjacentOptimizationSignature {
+    IdempotentTrim(Vec<Label>),
 }
 
 /// Controls the amount of runtime instrumentation collected by graph nodes.
@@ -65,6 +159,12 @@ pub struct AmbiguityCounts {
     pub resolved_first: usize,
     pub resolved_random: usize,
     pub resolved_quality: usize,
+    /// Equal-best placements of one pattern at multiple coordinates.
+    pub position_total: usize,
+    pub position_dropped: usize,
+    pub position_resolved_leftmost: usize,
+    pub position_resolved_rightmost: usize,
+    pub position_resolved_quality: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +183,8 @@ pub struct InputStats {
     pub read_length_min: Vec<usize>,
     pub read_length_max: Vec<usize>,
     pub read_length_sum: Vec<usize>,
+    /// Per-lane, per-shard record counts when grouped input is used.
+    pub shard_read_counts: Vec<Vec<usize>>,
 }
 
 /// Execution stage occupied by a graph node in the bounded pipeline.
@@ -91,6 +193,112 @@ pub enum NodeStage {
     Input,
     Transform,
     Output,
+}
+
+impl NodeStage {
+    #[inline(always)]
+    const fn order(self) -> u8 {
+        match self {
+            Self::Input => 0,
+            Self::Transform => 1,
+            Self::Output => 2,
+        }
+    }
+}
+
+/// Behavior when an operation's declared labels or attributes are unavailable.
+///
+/// `Skip` preserves ANTISEQUENCE's historical behavior. New applications
+/// should generally select `Error` for strict pipelines or `Reject` when an
+/// absent value is an expected filtering outcome.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MissingInputPolicy {
+    Error = 0,
+    Reject = 1,
+    #[default]
+    Skip = 2,
+}
+
+impl MissingInputPolicy {
+    #[inline(always)]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Error,
+            1 => Self::Reject,
+            _ => Self::Skip,
+        }
+    }
+}
+
+/// Coarse operation cost used by graph planners without tying the public API
+/// to a particular implementation or hardware model.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CostClass {
+    Constant,
+    #[default]
+    Linear,
+    Search,
+    Alignment,
+    Io,
+}
+
+/// The strongest class of mutation an operation may apply to a read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    #[default]
+    None,
+    Metadata,
+    Sequence,
+    Record,
+}
+
+/// Whether an operation can remove records from the stream.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionBehavior {
+    #[default]
+    Never,
+    MayReject,
+}
+
+/// Interval-name state invalidated by an operation.
+///
+/// Record and lane control metadata are intentionally outside this interval
+/// namespace and survive sequence projection. `Opaque` is an optimizer
+/// barrier but does not invent a destructive effect for legacy custom nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationEffect<'a> {
+    PreserveAll,
+    Names(&'a [LabelOrAttr]),
+    Lane(StrType),
+    AllIntervals,
+    Opaque,
+}
+
+/// Static, allocation-free description of a graph operation.
+///
+/// Descriptors are intentionally conservative: custom operations inherit
+/// their declared requirements and execution stage, and may override the
+/// remaining effects as the optimizer-facing API evolves.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationDescriptor<'a> {
+    pub name: &'static str,
+    pub requirements: &'a [LabelOrAttr],
+    /// Known produced names, or `None` when a custom operation has not
+    /// declared this effect. `Some(&[])` explicitly means no names are added.
+    pub produced: Option<&'a [LabelOrAttr]>,
+    pub invalidation: InvalidationEffect<'a>,
+    pub mutation: MutationKind,
+    pub rejection: RejectionBehavior,
+    pub cost: CostClass,
+    pub stage: NodeStage,
+}
+
+/// Borrowed terminal projection that an output node may render directly.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectReadProjection<'a> {
+    pub str_type: StrType,
+    pub parts: &'a [ProjectPart],
 }
 
 /// Owned output payload prepared by transform workers and committed by the
@@ -111,7 +319,8 @@ pub enum PreparedOutput {
     Json(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PipelineInputMode {
     /// Parse and transform each batch on the same worker for cache locality.
     WorkerLocal,
@@ -120,7 +329,7 @@ pub enum PipelineInputMode {
 }
 
 /// Configuration for bounded reader -> worker -> writer execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PipelineConfig {
     /// Number of parallel transform workers.
     pub workers: usize,
@@ -132,7 +341,143 @@ pub struct PipelineConfig {
     pub batch_size: usize,
     /// Write completed batches in input order.
     pub preserve_order: bool,
+    /// Fuse a terminal top-level projection suffix into prepared FASTQ output.
+    pub direct_output_rendering: bool,
     pub input_mode: PipelineInputMode,
+}
+
+/// Requested execution policy for a compiled graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Select a backend from graph effects and runtime constraints.
+    #[default]
+    Auto,
+    /// Preserve the historical worker-per-whole-graph executor.
+    WholeGraph,
+    /// Use the bounded reader/worker/writer executor.
+    Pipeline,
+}
+
+/// Concrete backend selected by the execution planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionBackend {
+    WholeGraph,
+    WorkerLocalPipeline,
+    DedicatedReaderPipeline,
+}
+
+/// Runtime inputs to execution planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionRequest {
+    pub mode: ExecutionMode,
+    pub pipeline: PipelineConfig,
+    pub batch_planning: BatchPlanningHints,
+}
+
+impl ExecutionRequest {
+    pub fn new(workers: usize) -> Self {
+        Self {
+            mode: ExecutionMode::Auto,
+            pipeline: PipelineConfig::new(workers),
+            batch_planning: BatchPlanningHints::default(),
+        }
+    }
+}
+
+/// Static inputs to deterministic batch and queue planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BatchPlanningHints {
+    pub enabled: bool,
+    pub automatic_batch_size: bool,
+    pub automatic_queue_capacity: bool,
+    pub automatic_max_in_flight: bool,
+    pub input_lanes: usize,
+    pub output_lanes: usize,
+    /// Estimated sequence plus quality bases across one synchronized fragment.
+    pub estimated_bases_per_fragment: usize,
+    pub compressed_input: bool,
+    pub compressed_output: bool,
+    /// Buffers not proportional to the number of admitted record batches.
+    pub fixed_buffer_bytes: usize,
+    pub memory_budget_bytes: usize,
+}
+
+impl Default for BatchPlanningHints {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            automatic_batch_size: true,
+            automatic_queue_capacity: true,
+            automatic_max_in_flight: true,
+            input_lanes: 1,
+            output_lanes: 1,
+            estimated_bases_per_fragment: 150,
+            compressed_input: false,
+            compressed_output: false,
+            fixed_buffer_bytes: 0,
+            memory_budget_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Reproducible result of static batch and queue planning.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BatchSizePlan {
+    pub enabled: bool,
+    pub automatic_batch_size: bool,
+    pub automatic_queue_capacity: bool,
+    pub automatic_max_in_flight: bool,
+    pub input_lanes: usize,
+    pub output_lanes: usize,
+    pub estimated_bases_per_fragment: usize,
+    pub compressed_input: bool,
+    pub compressed_output: bool,
+    pub fixed_buffer_bytes: usize,
+    pub batch_size: usize,
+    pub queue_capacity: usize,
+    pub max_in_flight_batches: usize,
+    pub estimated_fragment_bytes: usize,
+    pub estimated_batch_bytes: usize,
+    pub estimated_peak_live_bytes: usize,
+    pub memory_budget_bytes: usize,
+    /// Whether the static estimate fits the requested budget. The planner
+    /// cannot promise a hard cap when fixed buffers alone exceed the budget or
+    /// the minimum viable batch is still larger than the remaining allowance.
+    pub memory_budget_satisfied: bool,
+    pub reason_codes: Vec<&'static str>,
+}
+
+/// Planner summary of the graph's declared operation costs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GraphCostSummary {
+    pub constant: usize,
+    pub linear: usize,
+    pub search: usize,
+    pub alignment: usize,
+    pub io: usize,
+    pub opaque: usize,
+}
+
+/// Deterministic, inspectable execution decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionPlan {
+    pub requested_mode: ExecutionMode,
+    pub backend: ExecutionBackend,
+    pub pipeline: PipelineConfig,
+    pub batch_planning: BatchSizePlan,
+    pub costs: GraphCostSummary,
+    pub prepared_output: bool,
+    pub direct_output_rendering: bool,
+    pub reason_codes: Vec<&'static str>,
+}
+
+/// Result of executing one previously planned graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlannedExecutionReport {
+    pub plan: ExecutionPlan,
+    pub pipeline: Option<PipelineReport>,
 }
 
 impl PipelineConfig {
@@ -151,9 +496,128 @@ impl PipelineConfig {
             // is still configurable for unusually long or cheap records.
             batch_size: 256,
             preserve_order: false,
+            direct_output_rendering: true,
             input_mode: PipelineInputMode::WorkerLocal,
         }
     }
+}
+
+fn floor_power_of_two(value: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        1usize << (usize::BITS - 1 - value.leading_zeros())
+    }
+}
+
+fn plan_batch_configuration(
+    mut pipeline: PipelineConfig,
+    hints: BatchPlanningHints,
+    costs: GraphCostSummary,
+) -> (PipelineConfig, BatchSizePlan) {
+    let mut reason_codes = Vec::new();
+    let estimated_fragment_bytes = hints
+        .estimated_bases_per_fragment
+        .max(hints.input_lanes.max(1) * 16)
+        .saturating_mul(2)
+        .saturating_add(
+            hints
+                .input_lanes
+                .saturating_add(hints.output_lanes)
+                .saturating_mul(192),
+        )
+        .saturating_add(256)
+        .saturating_add(if hints.compressed_input { 64 } else { 0 })
+        .saturating_add(if hints.compressed_output { 64 } else { 0 });
+
+    if !hints.enabled {
+        reason_codes.push("dynamic_batch_planning_disabled");
+    } else {
+        if hints.automatic_queue_capacity {
+            pipeline.queue_capacity = 2;
+            reason_codes.push("measured_shallow_queue_default");
+        } else {
+            reason_codes.push("manual_queue_capacity");
+        }
+        if hints.automatic_max_in_flight {
+            pipeline.max_in_flight_batches = pipeline.workers.max(1);
+            reason_codes.push("one_admitted_batch_per_worker");
+        } else {
+            reason_codes.push("manual_in_flight_bound");
+        }
+
+        if hints.automatic_batch_size {
+            let cost_units = costs
+                .constant
+                .saturating_add(costs.linear.saturating_mul(2))
+                .saturating_add(costs.search.saturating_mul(8))
+                .saturating_add(costs.alignment.saturating_mul(16))
+                .max(1);
+            let work_limited = 4096usize.saturating_div(cost_units).clamp(16, 256);
+            let length_limited = (153_600usize
+                .saturating_div(hints.estimated_bases_per_fragment.max(1)))
+            .clamp(16, 256);
+            let available = hints
+                .memory_budget_bytes
+                .saturating_sub(hints.fixed_buffer_bytes);
+            let memory_limited = available
+                .saturating_div(pipeline.max_in_flight_batches.max(1))
+                .saturating_div(estimated_fragment_bytes.max(1))
+                .clamp(1, 256);
+            let selected =
+                floor_power_of_two(work_limited.min(length_limited).min(memory_limited).max(1))
+                    .max(1);
+            pipeline.batch_size = selected;
+            reason_codes.push("static_graph_cost_model");
+            reason_codes.push("geometry_length_estimate");
+            reason_codes.push("memory_budget_target");
+            if costs.alignment > 0 {
+                reason_codes.push("alignment_cost_reduces_batch");
+            } else if costs.search > 0 {
+                reason_codes.push("search_cost_reduces_batch");
+            }
+            if hints.estimated_bases_per_fragment > 1_000 {
+                reason_codes.push("long_reads_reduce_batch");
+            }
+        } else {
+            reason_codes.push("manual_batch_size");
+        }
+    }
+
+    let estimated_batch_bytes = estimated_fragment_bytes.saturating_mul(pipeline.batch_size);
+    let estimated_peak_live_bytes = hints.fixed_buffer_bytes.saturating_add(
+        estimated_batch_bytes.saturating_mul(pipeline.max_in_flight_batches.max(1)),
+    );
+    let memory_budget_satisfied = estimated_peak_live_bytes <= hints.memory_budget_bytes;
+    reason_codes.push(if memory_budget_satisfied {
+        "memory_budget_estimate_satisfied"
+    } else {
+        "memory_budget_estimate_exceeded"
+    });
+    (
+        pipeline,
+        BatchSizePlan {
+            enabled: hints.enabled,
+            automatic_batch_size: hints.automatic_batch_size,
+            automatic_queue_capacity: hints.automatic_queue_capacity,
+            automatic_max_in_flight: hints.automatic_max_in_flight,
+            input_lanes: hints.input_lanes,
+            output_lanes: hints.output_lanes,
+            estimated_bases_per_fragment: hints.estimated_bases_per_fragment,
+            compressed_input: hints.compressed_input,
+            compressed_output: hints.compressed_output,
+            fixed_buffer_bytes: hints.fixed_buffer_bytes,
+            batch_size: pipeline.batch_size,
+            queue_capacity: pipeline.queue_capacity,
+            max_in_flight_batches: pipeline.max_in_flight_batches,
+            estimated_fragment_bytes,
+            estimated_batch_bytes,
+            estimated_peak_live_bytes,
+            memory_budget_bytes: hints.memory_budget_bytes,
+            memory_budget_satisfied,
+            reason_codes,
+        },
+    )
 }
 
 /// Measurements from one bounded pipeline run.
@@ -165,6 +629,7 @@ pub struct PipelineReport {
     pub max_in_flight_batches_observed: usize,
     pub max_reorder_batches_observed: usize,
     pub prepared_output: bool,
+    pub direct_output_rendering: bool,
     pub transform_worker_nanos: u64,
     pub prepare_output_worker_nanos: u64,
     pub commit_output_writer_nanos: u64,
@@ -339,6 +804,146 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     fn required_names(&self) -> &[LabelOrAttr];
     fn name(&self) -> &'static str;
 
+    /// Labels and attributes this operation may create.
+    #[inline]
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        None
+    }
+
+    /// Whether the node's optimizer-facing effects are complete. Third-party
+    /// nodes remain opaque by default even if they declare produced names;
+    /// declaring outputs alone must never opt a node into reordering.
+    #[inline]
+    fn effects_are_complete(&self) -> bool {
+        false
+    }
+
+    /// Interval names invalidated by this node. Built-in nodes that declare
+    /// their produced-name set preserve all other names by default. An
+    /// undeclared custom node remains an optimizer barrier.
+    #[inline]
+    fn invalidation_effect(&self) -> InvalidationEffect<'_> {
+        if self.effects_are_complete() {
+            InvalidationEffect::PreserveAll
+        } else {
+            InvalidationEffect::Opaque
+        }
+    }
+
+    /// Backward liveness transfer for this node. Nested control-flow nodes
+    /// override this hook and recursively validate their private graphs.
+    #[inline]
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        transfer_liveness(self.descriptor(), live_out)
+    }
+
+    /// Whether this node owns one or more nested graphs. Shared nested nodes
+    /// that cannot be mutably inspected during compilation remain barriers.
+    #[inline]
+    fn has_nested_graphs(&self) -> bool {
+        false
+    }
+
+    /// Recursively optimize privately owned nested graphs. The parent graph
+    /// aggregates these reports so optimization remains observable without
+    /// exposing control-flow internals.
+    #[inline]
+    fn optimize_nested_graphs(
+        &mut self,
+        _optimization: GraphOptimizationConfig,
+        _live_out: &[LabelOrAttr],
+    ) -> Vec<GraphOptimizationReport> {
+        Vec::new()
+    }
+
+    /// Strongest mutation this operation may perform.
+    #[inline]
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Record
+    }
+
+    /// Whether this operation may reject records.
+    #[inline]
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::MayReject
+    }
+
+    /// Coarse cost class for graph planning.
+    #[inline]
+    fn cost_class(&self) -> CostClass {
+        CostClass::Linear
+    }
+
+    /// Whether removing this node is provably equivalent for read contents,
+    /// filtering, termination, and externally visible statistics.
+    ///
+    /// The default is deliberately conservative. Implementations should
+    /// return true only for a configuration-specific identity operation.
+    #[inline]
+    fn is_semantic_noop(&self) -> bool {
+        false
+    }
+
+    /// Whether the complete node may be removed when none of its declared
+    /// outputs are live. Implementations must also prove that skipping the
+    /// operation cannot suppress an error or any externally visible effect.
+    #[inline]
+    fn removable_when_outputs_dead(&self) -> bool {
+        false
+    }
+
+    /// Whether this node rejects a useful fraction of records and is eligible
+    /// for conservative placement before independent work.
+    #[inline]
+    fn is_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether filtering is total for every record satisfying the declared
+    /// requirements. This is required to preserve error ordering exactly.
+    #[inline]
+    fn is_infallible_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether this operation is safe to move after an independent selective
+    /// filter. A true result proves it is non-rejecting, has no observations
+    /// on records that will be rejected, and cannot fail for those records.
+    #[inline]
+    fn can_move_after_selective_filter(&self) -> bool {
+        false
+    }
+
+    /// Whether this terminal output completely declares the names whose
+    /// values affect its externally emitted representation.
+    #[inline]
+    fn has_explicit_name_observation(&self) -> bool {
+        false
+    }
+
+    /// Return an exact signature when two adjacent identical nodes can be
+    /// replaced by one without changing reads, failures, or termination.
+    /// Event-producing trace implementations disable this pass globally.
+    #[inline]
+    fn adjacent_optimization_signature(&self) -> Option<AdjacentOptimizationSignature> {
+        None
+    }
+
+    /// Return the optimizer-facing operation descriptor without allocation.
+    #[inline]
+    fn descriptor(&self) -> OperationDescriptor<'_> {
+        OperationDescriptor {
+            name: self.name(),
+            requirements: self.required_names(),
+            produced: self.produced_names(),
+            invalidation: self.invalidation_effect(),
+            mutation: self.mutation_kind(),
+            rejection: self.rejection_behavior(),
+            cost: self.cost_class(),
+            stage: self.stage(),
+        }
+    }
+
     /// Identify where this node may execute in a staged pipeline.
     #[inline]
     fn stage(&self) -> NodeStage {
@@ -360,6 +965,19 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         true
     }
 
+    /// Expose a terminal projection to a prepared-output planner.
+    #[inline]
+    fn direct_read_projection(&self) -> Option<DirectReadProjection<'_>> {
+        None
+    }
+
+    /// Whether this output node can serialize terminal projections without
+    /// first materializing them into `Read`.
+    #[inline]
+    fn supports_direct_projection(&self) -> bool {
+        false
+    }
+
     /// Serialize one batch without performing output I/O. `recycled` is a
     /// previously committed payload from this same node when available.
     fn prepare_output(
@@ -373,6 +991,18 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         )))
     }
 
+    fn prepare_output_projected(
+        &self,
+        _reads: &[Read],
+        _projections: &[DirectReadProjection<'_>],
+        _recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        Err(Error::InvalidPipelineGraph(format!(
+            "output node {} does not support direct projection rendering",
+            self.name()
+        )))
+    }
+
     /// Commit an already serialized payload. Implementations clear buffers
     /// after successful writes so their capacities can be recycled.
     fn commit_output(&self, _prepared: &mut PreparedOutput) -> Result<()> {
@@ -380,6 +1010,30 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
             "output node {} does not support prepared output",
             self.name()
         )))
+    }
+
+    /// Finish externally visible work owned by this node.
+    ///
+    /// Graph runners invoke this exactly once after their workers have joined,
+    /// before reporting success. Output implementations must surface buffered
+    /// write and flush failures here rather than relying on `Drop`, where an
+    /// error cannot be returned. Nested control-flow nodes forward the hook to
+    /// their child graphs.
+    #[inline]
+    fn finish(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Flush and finalize only writers that already hold buffered data.
+    ///
+    /// Called instead of [`GraphNode::finish`] when an execution failed:
+    /// implementations must not create files or materialize constant
+    /// outputs, but must still surface flush and footer failures for data
+    /// that was already streamed. Nested control-flow nodes forward the
+    /// hook to their child graphs.
+    #[inline]
+    fn finish_existing(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Select optional runtime statistics for this node.
@@ -460,10 +1114,408 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
     }
 }
 
+fn push_unique(names: &mut Vec<LabelOrAttr>, name: LabelOrAttr) {
+    if !names.contains(&name) {
+        names.push(name);
+    }
+}
+
+fn produced_name_is_live(produced: &LabelOrAttr, live: &[LabelOrAttr]) -> bool {
+    live.iter().any(|needed| {
+        produced == needed
+            || matches!(
+                (produced, needed),
+                (LabelOrAttr::Label(label), LabelOrAttr::Attr(attr))
+                    if label.str_type == attr.str_type && label.label == attr.label
+            )
+    })
+}
+
+fn invalidates_requirement(
+    invalidation: InvalidationEffect<'_>,
+    requirement: &LabelOrAttr,
+) -> bool {
+    match invalidation {
+        InvalidationEffect::PreserveAll => false,
+        InvalidationEffect::Names(names) => names.contains(requirement),
+        InvalidationEffect::Lane(lane) => requirement.interval_str_type() == Some(lane),
+        InvalidationEffect::AllIntervals | InvalidationEffect::Opaque => true,
+    }
+}
+
+fn can_place_filter_before<T: Trace>(
+    predecessor: &Arc<dyn GraphNode<T>>,
+    filter: &Arc<dyn GraphNode<T>>,
+) -> bool {
+    if !predecessor.can_move_after_selective_filter()
+        || !filter.is_selective_filter()
+        || !filter.is_infallible_selective_filter()
+    {
+        return false;
+    }
+    let predecessor = predecessor.descriptor();
+    let filter = filter.descriptor();
+    if predecessor.stage != NodeStage::Transform
+        || filter.stage != NodeStage::Transform
+        || predecessor.rejection != RejectionBehavior::Never
+    {
+        return false;
+    }
+    if filter
+        .requirements
+        .iter()
+        .any(|required| invalidates_requirement(predecessor.invalidation, required))
+    {
+        return false;
+    }
+    if predecessor.produced.is_none()
+        || predecessor.produced.unwrap_or(&[]).iter().any(|produced| {
+            filter
+                .requirements
+                .iter()
+                .any(|required| produced_name_is_live(produced, std::slice::from_ref(required)))
+        })
+    {
+        return false;
+    }
+    if filter.produced.unwrap_or(&[]).iter().any(|produced| {
+        predecessor
+            .requirements
+            .iter()
+            .any(|required| produced_name_is_live(produced, std::slice::from_ref(required)))
+    }) {
+        return false;
+    }
+    true
+}
+
+fn transfer_liveness(
+    descriptor: OperationDescriptor<'_>,
+    live_out: &[LabelOrAttr],
+) -> Result<Vec<LabelOrAttr>> {
+    let produced = descriptor.produced.unwrap_or(&[]);
+    let mut live_across = live_out
+        .iter()
+        .filter(|name| !produced.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let invalidated = match descriptor.invalidation {
+        InvalidationEffect::PreserveAll | InvalidationEffect::Opaque => Vec::new(),
+        InvalidationEffect::Names(names) => live_across
+            .iter()
+            .filter(|name| names.contains(name))
+            .cloned()
+            .collect(),
+        InvalidationEffect::Lane(lane) => live_across
+            .iter()
+            .filter(|name| name.interval_str_type() == Some(lane))
+            .cloned()
+            .collect(),
+        InvalidationEffect::AllIntervals => live_across.clone(),
+    };
+    if !invalidated.is_empty() {
+        return Err(Error::InvalidGraph(format!(
+            "operation {} invalidates names still required by its continuation: {:?}",
+            descriptor.name, invalidated
+        )));
+    }
+
+    for requirement in descriptor.requirements {
+        push_unique(&mut live_across, requirement.clone());
+    }
+    Ok(live_across)
+}
+
 impl<T: Trace> Default for Graph<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl<T: Trace> Default for GraphBuilder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Trace> GraphBuilder<T> {
+    pub fn new() -> Self {
+        Self {
+            graph: Graph::new(),
+        }
+    }
+
+    /// Add an operation while the graph is under construction.
+    pub fn add<G: GraphNode<T> + 'static>(&mut self, node: G) -> Arc<G> {
+        self.graph.add(node)
+    }
+
+    pub fn set_statistics_level(&self, level: StatisticsLevel) {
+        self.graph.set_statistics_level(level);
+    }
+
+    pub fn set_missing_input_policy(&self, policy: MissingInputPolicy) {
+        self.graph.set_missing_input_policy(policy);
+    }
+
+    pub fn with_missing_input_policy(self, policy: MissingInputPolicy) -> Self {
+        self.set_missing_input_policy(policy);
+        self
+    }
+
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.graph.descriptors()
+    }
+
+    /// Validate and freeze graph structure for execution.
+    pub fn compile(self) -> Result<CompiledGraph<T>> {
+        self.compile_with(GraphOptimizationConfig::default())
+    }
+
+    /// Validate and freeze graph structure with explicit optimization policy.
+    pub fn compile_with(self, optimization: GraphOptimizationConfig) -> Result<CompiledGraph<T>> {
+        self.graph.compile_with(optimization)
+    }
+}
+
+impl<T: Trace> CompiledGraph<T> {
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.graph.descriptors()
+    }
+
+    pub fn optimization_report(&self) -> &GraphOptimizationReport {
+        &self.optimization_report
+    }
+
+    /// Statistics are immutable after compilation so proof-gated passes
+    /// cannot become observable after they have rewritten the graph.
+    pub fn statistics_level(&self) -> StatisticsLevel {
+        self.graph.statistics_level()
+    }
+
+    pub fn missing_input_policy(&self) -> MissingInputPolicy {
+        self.graph.missing_input_policy()
+    }
+
+    pub fn match_distance_counts(&self) -> Vec<MatchDistanceCounts> {
+        self.graph.match_distance_counts()
+    }
+
+    pub fn input_stats(&self) -> Option<InputStats> {
+        self.graph.input_stats()
+    }
+
+    pub fn failed_reads(&self) -> usize {
+        self.graph.failed_reads()
+    }
+
+    pub fn final_output_reads(&self) -> Option<usize> {
+        self.graph.final_output_reads()
+    }
+
+    pub fn run(&self) -> Result<()> {
+        self.graph.run()
+    }
+
+    pub fn run_trace(&self, trace_path: impl AsRef<Path>) -> Result<()> {
+        self.graph.run_trace(trace_path)
+    }
+
+    pub fn run_with_threads(&self, threads: usize) {
+        self.graph.run_with_threads(threads)
+    }
+
+    pub fn run_with_threads_trace(&self, threads: usize, trace_path: impl AsRef<Path>) {
+        self.graph.run_with_threads_trace(threads, trace_path)
+    }
+
+    pub fn try_run_with_threads(&self, threads: usize) -> Result<()> {
+        self.graph.try_run_with_threads(threads)
+    }
+
+    pub fn try_run_with_threads_trace(
+        &self,
+        threads: usize,
+        trace_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.graph.try_run_with_threads_trace(threads, trace_path)
+    }
+
+    pub fn try_run_pipeline(&self, config: PipelineConfig) -> Result<PipelineReport> {
+        self.graph
+            .try_run_pipeline(self.effective_pipeline_config(config))
+    }
+
+    pub fn try_run_pipeline_trace(
+        &self,
+        config: PipelineConfig,
+        trace_path: impl AsRef<Path>,
+    ) -> Result<PipelineReport> {
+        self.graph
+            .try_run_pipeline_trace(self.effective_pipeline_config(config), trace_path)
+    }
+
+    pub fn run_one(
+        &self,
+        reads: Option<Vec<Read>>,
+        trace: &T,
+    ) -> Result<(Option<Vec<Read>>, bool)> {
+        self.graph.run_one(reads, trace)
+    }
+
+    pub fn try_run_one(
+        &self,
+        reads: Option<Vec<Read>>,
+        trace: &T,
+    ) -> Result<(Option<Vec<Read>>, bool, bool)> {
+        self.graph.try_run_one(reads, trace)
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
+    fn effective_pipeline_config(&self, mut config: PipelineConfig) -> PipelineConfig {
+        config.direct_output_rendering &= self.optimization_report.enabled
+            && self
+                .optimization_report
+                .config
+                .terminal_projection_output_fusion
+            && self.optimization_report.terminal_projection_candidates > 0;
+        config
+    }
+
+    /// Produce a deterministic execution plan without starting any workers.
+    pub fn plan_execution(&self, request: ExecutionRequest) -> Result<ExecutionPlan> {
+        if request.pipeline.workers == 0 {
+            return Err(Error::InvalidThreadCount(0));
+        }
+
+        let mut costs = GraphCostSummary::default();
+        for descriptor in self.descriptors() {
+            match descriptor.cost {
+                CostClass::Constant => costs.constant += 1,
+                CostClass::Linear => costs.linear += 1,
+                CostClass::Search => costs.search += 1,
+                CostClass::Alignment => costs.alignment += 1,
+                CostClass::Io => costs.io += 1,
+            }
+            if descriptor.stage == NodeStage::Transform && descriptor.produced.is_none() {
+                costs.opaque += 1;
+            }
+        }
+
+        let (mut pipeline, batch_planning) =
+            plan_batch_configuration(request.pipeline, request.batch_planning, costs);
+        let mut reason_codes = Vec::new();
+        let backend = match request.mode {
+            ExecutionMode::WholeGraph => {
+                reason_codes.push("forced_whole_graph");
+                ExecutionBackend::WholeGraph
+            }
+            ExecutionMode::Pipeline => {
+                reason_codes.push("forced_pipeline");
+                match pipeline.input_mode {
+                    PipelineInputMode::WorkerLocal => ExecutionBackend::WorkerLocalPipeline,
+                    PipelineInputMode::DedicatedReader => ExecutionBackend::DedicatedReaderPipeline,
+                }
+            }
+            ExecutionMode::Auto if pipeline.preserve_order => {
+                reason_codes.push("ordered_output_requires_pipeline");
+                match pipeline.input_mode {
+                    PipelineInputMode::WorkerLocal => ExecutionBackend::WorkerLocalPipeline,
+                    PipelineInputMode::DedicatedReader => ExecutionBackend::DedicatedReaderPipeline,
+                }
+            }
+            ExecutionMode::Auto => {
+                // Preserve the measured low-overhead default until the
+                // representative benchmark matrix establishes a stable
+                // crossover for descriptor-driven staged execution.
+                pipeline.input_mode = PipelineInputMode::WorkerLocal;
+                reason_codes.push("conservative_low_overhead_whole_graph");
+                ExecutionBackend::WholeGraph
+            }
+        };
+
+        if costs.opaque > 0 {
+            reason_codes.push("opaque_nodes_block_reordering");
+        }
+        if costs.alignment > 0 {
+            reason_codes.push("graph_contains_alignment");
+        } else if costs.search > 0 {
+            reason_codes.push("graph_contains_search");
+        }
+
+        let pipeline_backend = backend != ExecutionBackend::WholeGraph;
+        let output_start = self.graph.pipeline_output_start().ok();
+        if pipeline_backend && output_start.is_none() {
+            return Err(Error::InvalidPipelineGraph(
+                "planned pipeline requires one input stage followed by an output stage".to_owned(),
+            ));
+        }
+        if pipeline_backend {
+            self.graph.validate_pipeline_config(pipeline)?;
+        }
+        let prepared_output = output_start.is_some_and(|output_start| {
+            let outputs = &self.graph.nodes[output_start..];
+            outputs.iter().all(|node| node.supports_prepared_output())
+                && outputs.iter().any(|node| node.produces_prepared_output())
+        });
+        if prepared_output {
+            reason_codes.push("prepared_output_available");
+        }
+        let direct_output_rendering = pipeline_backend
+            && prepared_output
+            && pipeline.direct_output_rendering
+            && pipeline.workers == 1
+            && self.optimization_report.terminal_projection_candidates > 0;
+        if direct_output_rendering {
+            reason_codes.push("single_worker_direct_terminal_rendering");
+        }
+
+        Ok(ExecutionPlan {
+            requested_mode: request.mode,
+            backend,
+            pipeline,
+            batch_planning,
+            costs,
+            prepared_output,
+            direct_output_rendering,
+            reason_codes,
+        })
+    }
+
+    /// Plan and execute the graph, returning the decision with runtime data.
+    pub fn try_run_planned(&self, request: ExecutionRequest) -> Result<PlannedExecutionReport> {
+        let plan = self.plan_execution(request)?;
+        let pipeline = match plan.backend {
+            ExecutionBackend::WholeGraph => {
+                self.graph.try_run_with_threads(plan.pipeline.workers)?;
+                None
+            }
+            ExecutionBackend::WorkerLocalPipeline => {
+                let mut config = plan.pipeline;
+                config.input_mode = PipelineInputMode::WorkerLocal;
+                config.direct_output_rendering = plan.direct_output_rendering;
+                Some(self.graph.try_run_pipeline(config)?)
+            }
+            ExecutionBackend::DedicatedReaderPipeline => {
+                let mut config = plan.pipeline;
+                config.input_mode = PipelineInputMode::DedicatedReader;
+                config.direct_output_rendering = plan.direct_output_rendering;
+                Some(self.graph.try_run_pipeline(config)?)
+            }
+        };
+        Ok(PlannedExecutionReport { plan, pipeline })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequirementAction {
+    Run,
+    Skip,
+    RejectedAll,
 }
 
 impl<T: Trace> Graph<T> {
@@ -472,7 +1524,312 @@ impl<T: Trace> Graph<T> {
         Self {
             nodes: Vec::new(),
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
+            missing_input_policy: AtomicU8::new(MissingInputPolicy::Skip as u8),
+            execution_state: AtomicU8::new(GRAPH_READY),
         }
+    }
+
+    /// Claim this graph for a complete top-level execution.
+    fn begin_execution(&self) -> Result<()> {
+        match self.execution_state.compare_exchange(
+            GRAPH_READY,
+            GRAPH_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(GRAPH_RUNNING) => Err(Error::GraphAlreadyRunning),
+            Err(_) => Err(Error::GraphAlreadyFinished),
+        }
+    }
+
+    /// Start or continue an explicitly incremental execution.
+    ///
+    /// Top-level runners claim the graph once and may then call `run_one`
+    /// concurrently. Public callers can also drive a graph batch by batch,
+    /// but must call `finish` when the stream is complete.
+    fn begin_or_continue_execution(&self) -> Result<()> {
+        // Hot path: `run_one` calls this per batch, and nested graphs inside
+        // `TryOp`/`WhileOp` call it once per read across every worker. A
+        // failed `compare_exchange` still takes the cacheline exclusively,
+        // so the already-running common case must be a plain load.
+        match self.execution_state.load(Ordering::Relaxed) {
+            GRAPH_RUNNING => return Ok(()),
+            GRAPH_READY => {}
+            _ => return Err(Error::GraphAlreadyFinished),
+        }
+        match self.execution_state.compare_exchange(
+            GRAPH_READY,
+            GRAPH_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(GRAPH_RUNNING) => Ok(()),
+            Err(_) => Err(Error::GraphAlreadyFinished),
+        }
+    }
+
+    /// Validate and freeze a graph built through the legacy mutable API.
+    ///
+    /// New code should prefer [`GraphBuilder`] so construction and execution
+    /// are separate in the type system.
+    pub fn compile(self) -> Result<CompiledGraph<T>> {
+        self.compile_with(GraphOptimizationConfig::default())
+    }
+
+    /// Validate and freeze a graph with explicit optimization policy.
+    pub fn compile_with(
+        mut self,
+        optimization: GraphOptimizationConfig,
+    ) -> Result<CompiledGraph<T>> {
+        self.validate_for_compilation()?;
+        let optimization_report = self.optimize_for_compilation_from(optimization, &[]);
+        self.validate_for_compilation()?;
+        Ok(CompiledGraph {
+            graph: self,
+            optimization_report,
+        })
+    }
+
+    fn optimize_for_compilation_from(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
+    ) -> GraphOptimizationReport {
+        let local_original_operations = self.nodes.len();
+        let mut shared_nested_barriers = 0usize;
+        let mut nested_reports = Vec::new();
+        let mut continuation_liveness = vec![Vec::new(); self.nodes.len()];
+        let mut live = live_out.to_vec();
+        for (index, node) in self.nodes.iter().enumerate().rev() {
+            continuation_liveness[index] = live.clone();
+            live = node
+                .liveness_transfer(&live)
+                .expect("graph liveness was validated before optimization");
+        }
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if let Some(node) = Arc::get_mut(node) {
+                nested_reports.extend(
+                    node.optimize_nested_graphs(optimization, &continuation_liveness[index]),
+                );
+            } else if node.has_nested_graphs() {
+                shared_nested_barriers += 1;
+            }
+        }
+
+        let local_opaque_barriers = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.stage() == NodeStage::Transform
+                    && node.invalidation_effect() == InvalidationEffect::Opaque
+            })
+            .count();
+        let mut passes = Vec::new();
+
+        if optimization.enabled && optimization.semantic_noop_elimination && !T::RECORDS_EVENTS {
+            let before = self.nodes.len();
+            self.nodes.retain(|node| !node.is_semantic_noop());
+            passes.push(GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: before - self.nodes.len(),
+            });
+        } else {
+            passes.push(GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 0,
+            });
+        }
+
+        let mut dead_label_changes = 0usize;
+        let explicit_terminal_names = self
+            .nodes
+            .iter()
+            .position(|node| node.stage() == NodeStage::Output)
+            .is_some_and(|start| {
+                self.nodes[start..]
+                    .iter()
+                    .all(|node| node.has_explicit_name_observation())
+            });
+        if optimization.enabled
+            && optimization.dead_label_elimination
+            && !T::RECORDS_EVENTS
+            && self.statistics_level() == StatisticsLevel::Off
+            && (explicit_terminal_names || !live_out.is_empty())
+        {
+            let mut live = live_out.to_vec();
+            let mut remove = vec![false; self.nodes.len()];
+            for (index, node) in self.nodes.iter().enumerate().rev() {
+                let produced = node.produced_names().unwrap_or(&[]);
+                let outputs_are_dead = !produced.is_empty()
+                    && produced
+                        .iter()
+                        .all(|produced| !produced_name_is_live(produced, &live));
+                if outputs_are_dead && node.removable_when_outputs_dead() {
+                    remove[index] = true;
+                    dead_label_changes += 1;
+                } else {
+                    live = node
+                        .liveness_transfer(&live)
+                        .expect("graph liveness was validated before optimization");
+                }
+            }
+            let mut index = 0usize;
+            self.nodes.retain(|_| {
+                let retain = !remove[index];
+                index += 1;
+                retain
+            });
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "dead_label_elimination",
+            changed_nodes: dead_label_changes,
+        });
+
+        let mut filter_moves = 0usize;
+        if optimization.enabled
+            && optimization.early_selective_filter_placement
+            && !T::RECORDS_EVENTS
+            && self.statistics_level() == StatisticsLevel::Off
+        {
+            for index in 1..self.nodes.len() {
+                if !self.nodes[index].is_selective_filter() {
+                    continue;
+                }
+                let mut position = index;
+                while position > 0
+                    && can_place_filter_before(&self.nodes[position - 1], &self.nodes[position])
+                {
+                    self.nodes.swap(position - 1, position);
+                    filter_moves += 1;
+                    position -= 1;
+                }
+            }
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "early_selective_filter_placement",
+            changed_nodes: filter_moves,
+        });
+
+        let mut adjacent_changes = 0;
+        if optimization.enabled && optimization.adjacent_idempotent_fusion && !T::RECORDS_EVENTS {
+            let mut previous = None;
+            self.nodes.retain(|node| {
+                let signature = node.adjacent_optimization_signature();
+                let duplicate = signature.is_some() && signature == previous;
+                if duplicate {
+                    adjacent_changes += 1;
+                    false
+                } else {
+                    previous = signature;
+                    true
+                }
+            });
+        }
+        passes.push(GraphOptimizationPassReport {
+            pass: "adjacent_idempotent_fusion",
+            changed_nodes: adjacent_changes,
+        });
+
+        let local_terminal_projection_candidates =
+            if optimization.enabled && optimization.terminal_projection_output_fusion {
+                self.pipeline_output_start()
+                    .ok()
+                    .map(|output_start| self.direct_projection_suffix(output_start).1.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        passes.push(GraphOptimizationPassReport {
+            pass: "terminal_projection_output_fusion",
+            changed_nodes: usize::from(local_terminal_projection_candidates > 0),
+        });
+
+        for nested in &nested_reports {
+            for nested_pass in &nested.passes {
+                if let Some(pass) = passes.iter_mut().find(|pass| pass.pass == nested_pass.pass) {
+                    pass.changed_nodes += nested_pass.changed_nodes;
+                } else {
+                    passes.push(nested_pass.clone());
+                }
+            }
+        }
+
+        let original_operations = local_original_operations
+            + nested_reports
+                .iter()
+                .map(|report| report.original_operations)
+                .sum::<usize>();
+        let optimized_operations = self.nodes.len()
+            + nested_reports
+                .iter()
+                .map(|report| report.optimized_operations)
+                .sum::<usize>();
+        let opaque_barriers = local_opaque_barriers
+            + shared_nested_barriers
+            + nested_reports
+                .iter()
+                .map(|report| report.opaque_barriers)
+                .sum::<usize>();
+        let terminal_projection_candidates = local_terminal_projection_candidates
+            + nested_reports
+                .iter()
+                .map(|report| report.terminal_projection_candidates)
+                .sum::<usize>();
+
+        GraphOptimizationReport {
+            enabled: optimization.enabled,
+            config: optimization,
+            original_operations,
+            optimized_operations,
+            opaque_barriers,
+            shared_nested_graph_barriers: shared_nested_barriers
+                + nested_reports
+                    .iter()
+                    .map(|report| report.shared_nested_graph_barriers)
+                    .sum::<usize>(),
+            terminal_projection_candidates,
+            passes,
+        }
+    }
+
+    fn validate_for_compilation(&self) -> Result<()> {
+        let mut previous_stage = NodeStage::Input;
+        let mut input_count = 0usize;
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let descriptor = node.descriptor();
+            if descriptor.stage.order() < previous_stage.order() {
+                return Err(Error::InvalidGraph(format!(
+                    "operation {} ({}) is in the {:?} stage after the {:?} stage",
+                    index, descriptor.name, descriptor.stage, previous_stage
+                )));
+            }
+            if descriptor.stage == NodeStage::Input {
+                input_count += 1;
+                if index != 0 || input_count > 1 {
+                    return Err(Error::InvalidGraph(format!(
+                        "input operation {} ({}) must be the graph's only input-stage node and appear first",
+                        index, descriptor.name
+                    )));
+                }
+            }
+            previous_stage = descriptor.stage;
+        }
+
+        self.validate_liveness_from(&[])?;
+
+        Ok(())
+    }
+
+    /// Validate backward name liveness against an enclosing continuation and
+    /// return the names required at this graph's entry.
+    pub fn validate_liveness_from(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        let mut live = live_out.to_vec();
+        for node in self.nodes.iter().rev() {
+            live = node.liveness_transfer(&live)?;
+        }
+        Ok(live)
     }
 
     /// Add a read operation node to the graph and return the node.
@@ -505,6 +1862,81 @@ impl<T: Trace> Graph<T> {
         StatisticsLevel::from_u8(self.statistics_level.load(Ordering::Relaxed))
     }
 
+    /// Select how missing declared inputs are handled during execution.
+    pub fn set_missing_input_policy(&self, policy: MissingInputPolicy) {
+        self.missing_input_policy
+            .store(policy as u8, Ordering::Relaxed);
+    }
+
+    pub fn missing_input_policy(&self) -> MissingInputPolicy {
+        MissingInputPolicy::from_u8(self.missing_input_policy.load(Ordering::Relaxed))
+    }
+
+    /// Inspect operation effects without exposing the graph's mutable storage.
+    pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
+        self.nodes.iter().map(|node| node.descriptor())
+    }
+
+    #[inline]
+    fn resolve_missing_inputs(
+        &self,
+        node: &dyn GraphNode<T>,
+        curr: &mut Option<Vec<Read>>,
+    ) -> Result<RequirementAction> {
+        let requirements = node.required_names();
+        if requirements.is_empty() {
+            return Ok(RequirementAction::Run);
+        }
+
+        let policy = self.missing_input_policy();
+        if policy == MissingInputPolicy::Skip && trust_required_checks() {
+            return Ok(RequirementAction::Run);
+        }
+
+        let Some(reads) = curr.as_mut() else {
+            return Ok(RequirementAction::Run);
+        };
+
+        match policy {
+            MissingInputPolicy::Skip => {
+                // Compatibility mode deliberately retains the historical
+                // representative-read check.
+                if reads
+                    .first()
+                    .is_some_and(|read| !read.has_names(requirements))
+                {
+                    Ok(RequirementAction::Skip)
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+            MissingInputPolicy::Error => {
+                if let Some(read) = reads.iter().find(|read| !read.has_names(requirements)) {
+                    let missing = requirements
+                        .iter()
+                        .filter(|required| !read.has_names(std::slice::from_ref(*required)))
+                        .cloned()
+                        .collect();
+                    Err(Error::MissingRequiredInputs {
+                        node: node.name(),
+                        missing,
+                    })
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+            MissingInputPolicy::Reject => {
+                reads.retain(|read| read.has_names(requirements));
+                if reads.is_empty() {
+                    *curr = None;
+                    Ok(RequirementAction::RejectedAll)
+                } else {
+                    Ok(RequirementAction::Run)
+                }
+            }
+        }
+    }
+
     /// Run a graph until all reads processed.
     pub fn run(&self) -> Result<()> {
         self.run_trace(DEFAULT_TRACE_PATH)
@@ -519,7 +1951,9 @@ impl<T: Trace> Graph<T> {
     }
 
     fn run_trace_inner(&self, trace: &T) -> Result<()> {
-        self.run_trace_inner_until_cancelled(trace, None)
+        self.begin_execution()?;
+        let execution = self.run_trace_inner_until_cancelled(trace, None);
+        self.finish_after(execution)
     }
 
     fn run_trace_inner_until_cancelled(
@@ -582,9 +2016,10 @@ impl<T: Trace> Graph<T> {
         if threads == 0 {
             return Err(Error::InvalidThreadCount(threads));
         }
+        self.begin_execution()?;
 
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         thread::scope(|s| {
             let mut handles = Vec::with_capacity(threads);
             for _ in 0..threads {
@@ -593,7 +2028,7 @@ impl<T: Trace> Graph<T> {
                         self.run_trace_inner_until_cancelled(trace, Some(&cancelled))
                     {
                         cancelled.store(true, Ordering::Relaxed);
-                        failures.lock().unwrap().push(error.to_string());
+                        failures.lock().unwrap().push(error);
                     }
                 }));
             }
@@ -606,17 +2041,21 @@ impl<T: Trace> Graph<T> {
                         .map(|value| (*value).to_owned())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "worker panicked with a non-string payload".to_owned());
-                    failures.lock().unwrap().push(message);
+                    failures
+                        .lock()
+                        .unwrap()
+                        .push(Error::GraphExecution(message));
                 }
             }
         });
 
         let failures = failures.into_inner().unwrap();
-        if failures.is_empty() {
+        let execution = if failures.is_empty() {
             Ok(())
         } else {
-            Err(Error::GraphExecution(failures.join("; ")))
-        }
+            Err(aggregate_failures(failures))
+        };
+        self.finish_after(execution)
     }
 
     /// Run this graph with a bounded input, transform, and output pipeline.
@@ -631,13 +2070,15 @@ impl<T: Trace> Graph<T> {
         trace_path: impl AsRef<Path>,
     ) -> Result<PipelineReport> {
         let trace = T::new(trace_path);
-        let result = self.run_pipeline_inner(config, &trace);
+        let result = self
+            .validate_pipeline_config(config)
+            .and_then(|()| self.begin_execution())
+            .and_then(|()| self.finish_after(self.run_pipeline_inner(config, &trace)));
         trace.finish();
         result
     }
 
     fn run_pipeline_inner(&self, config: PipelineConfig, trace: &T) -> Result<PipelineReport> {
-        self.validate_pipeline_config(config)?;
         match config.input_mode {
             PipelineInputMode::WorkerLocal => self.run_locality_pipeline_inner(config, trace),
             PipelineInputMode::DedicatedReader => {
@@ -655,7 +2096,7 @@ impl<T: Trace> Graph<T> {
         self.nodes[0].set_batch_size(config.batch_size);
 
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -724,12 +2165,11 @@ impl<T: Trace> Graph<T> {
             drop(work_receiver);
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<Option<Vec<Read>>>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder = ReorderRing::<Option<Vec<Read>>>::new(if config.preserve_order {
+                config.max_in_flight_batches
+            } else {
+                0
+            });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     window.release();
@@ -743,9 +2183,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -756,12 +2196,7 @@ impl<T: Trace> Graph<T> {
                         if let Err(error) =
                             self.pipeline_write(output_start, trace, reads, &recycle_sender)
                         {
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         } else {
                             written_batches += 1;
                         }
@@ -779,12 +2214,7 @@ impl<T: Trace> Graph<T> {
                     if let Err(error) =
                         self.pipeline_write(output_start, trace, completed.reads, &recycle_sender)
                     {
-                        push_failure(
-                            &failures,
-                            format!("writer failed: {error}"),
-                            &cancelled,
-                            &window,
-                        );
+                        push_failure(&failures, error, &cancelled, &window);
                     } else {
                         written_batches += 1;
                     }
@@ -800,7 +2230,7 @@ impl<T: Trace> Graph<T> {
             if reader_handle.join().is_err() {
                 push_failure(
                     &failures,
-                    "reader panicked outside the pipeline guard".to_owned(),
+                    Error::GraphExecution("reader panicked outside the pipeline guard".to_owned()),
                     &cancelled,
                     &window,
                 );
@@ -809,7 +2239,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -821,7 +2253,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
 
         Ok(PipelineReport {
@@ -831,6 +2263,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: false,
+            direct_output_rendering: false,
             transform_worker_nanos: 0,
             prepare_output_worker_nanos: 0,
             commit_output_writer_nanos: 0,
@@ -863,9 +2296,16 @@ impl<T: Trace> Graph<T> {
         trace: &T,
         output_start: usize,
     ) -> Result<PipelineReport> {
+        let (transform_end, direct_projections) =
+            if config.direct_output_rendering && config.workers == 1 {
+                self.direct_projection_suffix(output_start)
+            } else {
+                (output_start, Vec::new())
+            };
+        let direct_output_rendering = !direct_projections.is_empty();
         self.nodes[0].set_batch_size(config.batch_size);
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -888,6 +2328,7 @@ impl<T: Trace> Graph<T> {
                 let worker_completed_batches = &completed_batches;
                 let worker_transform_nanos = &transform_nanos;
                 let worker_prepare_output_nanos = &prepare_output_nanos;
+                let worker_direct_projections = &direct_projections;
                 worker_handles.push(scope.spawn(move || {
                     let (output_recycle_sender, output_recycle_receiver) = unbounded();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -923,7 +2364,7 @@ impl<T: Trace> Graph<T> {
 
                             let transform_start = Instant::now();
                             let (reads, _) =
-                                match self.run_node_range(Some(reads), 1, output_start, trace) {
+                                match self.run_node_range(Some(reads), 1, transform_end, trace) {
                                     Ok(result) => result,
                                     Err(error) => {
                                         worker_window.release();
@@ -938,6 +2379,7 @@ impl<T: Trace> Graph<T> {
                             let outputs = match self.prepare_output_range(
                                 output_start,
                                 &reads,
+                                worker_direct_projections,
                                 recycled_outputs,
                                 trace,
                             ) {
@@ -983,12 +2425,12 @@ impl<T: Trace> Graph<T> {
             }
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<PreparedLocalCompletedItem>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder =
+                ReorderRing::<PreparedLocalCompletedItem>::new(if config.preserve_order {
+                    config.max_in_flight_batches
+                } else {
+                    0
+                });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     window.release();
@@ -1002,9 +2444,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -1021,12 +2463,7 @@ impl<T: Trace> Graph<T> {
                                 written_batches += 1;
                             }
                             Err(error) => {
-                                push_failure(
-                                    &failures,
-                                    format!("writer failed: {error}"),
-                                    &cancelled,
-                                    &window,
-                                );
+                                push_failure(&failures, error, &cancelled, &window);
                             }
                         }
                         window.release();
@@ -1049,12 +2486,7 @@ impl<T: Trace> Graph<T> {
                             written_batches += 1;
                         }
                         Err(error) => {
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         }
                     }
                     window.release();
@@ -1069,7 +2501,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -1081,7 +2515,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
         Ok(PipelineReport {
             input_batches: input_batches.load(Ordering::Relaxed),
@@ -1090,6 +2524,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: true,
+            direct_output_rendering,
             transform_worker_nanos: transform_nanos.load(Ordering::Relaxed),
             prepare_output_worker_nanos: prepare_output_nanos.load(Ordering::Relaxed),
             commit_output_writer_nanos: commit_output_nanos.load(Ordering::Relaxed),
@@ -1104,7 +2539,7 @@ impl<T: Trace> Graph<T> {
         let output_start = self.pipeline_output_start()?;
         self.nodes[0].set_batch_size(config.batch_size);
         let cancelled = AtomicBool::new(false);
-        let failures = Mutex::new(Vec::<String>::new());
+        let failures = Mutex::new(Vec::<Error>::new());
         let window = InFlightWindow::new(config.max_in_flight_batches);
         let input_batches = std::sync::atomic::AtomicUsize::new(0);
         let completed_batches = std::sync::atomic::AtomicUsize::new(0);
@@ -1194,12 +2629,11 @@ impl<T: Trace> Graph<T> {
             }
             drop(completed_sender);
 
-            let mut reorder = ReorderRing::<LocalCompletedItem>::new(
-                config
-                    .preserve_order
-                    .then_some(config.max_in_flight_batches)
-                    .unwrap_or(0),
-            );
+            let mut reorder = ReorderRing::<LocalCompletedItem>::new(if config.preserve_order {
+                config.max_in_flight_batches
+            } else {
+                0
+            });
             while let Ok(completed) = completed_receiver.recv() {
                 if cancelled.load(Ordering::Relaxed) {
                     let _ = completed.recycle_sender.send(None);
@@ -1214,9 +2648,9 @@ impl<T: Trace> Graph<T> {
                         window.release();
                         push_failure(
                             &failures,
-                            format!(
+                            Error::GraphExecution(format!(
                                 "writer received invalid or duplicate batch sequence {sequence}"
-                            ),
+                            )),
                             &cancelled,
                             &window,
                         );
@@ -1236,12 +2670,7 @@ impl<T: Trace> Graph<T> {
                             }
                             Err(error) => {
                                 let _ = completed.recycle_sender.send(None);
-                                push_failure(
-                                    &failures,
-                                    format!("writer failed: {error}"),
-                                    &cancelled,
-                                    &window,
-                                );
+                                push_failure(&failures, error, &cancelled, &window);
                             }
                         }
                         window.release();
@@ -1266,12 +2695,7 @@ impl<T: Trace> Graph<T> {
                         }
                         Err(error) => {
                             let _ = completed.recycle_sender.send(None);
-                            push_failure(
-                                &failures,
-                                format!("writer failed: {error}"),
-                                &cancelled,
-                                &window,
-                            );
+                            push_failure(&failures, error, &cancelled, &window);
                         }
                     }
                     window.release();
@@ -1286,7 +2710,9 @@ impl<T: Trace> Graph<T> {
                 if handle.join().is_err() {
                     push_failure(
                         &failures,
-                        "worker panicked outside the pipeline guard".to_owned(),
+                        Error::GraphExecution(
+                            "worker panicked outside the pipeline guard".to_owned(),
+                        ),
                         &cancelled,
                         &window,
                     );
@@ -1298,7 +2724,7 @@ impl<T: Trace> Graph<T> {
             .into_inner()
             .unwrap_or_else(|poison| poison.into_inner());
         if !failures.is_empty() {
-            return Err(Error::GraphExecution(failures.join("; ")));
+            return Err(aggregate_failures(failures));
         }
         Ok(PipelineReport {
             input_batches: input_batches.load(Ordering::Relaxed),
@@ -1307,6 +2733,7 @@ impl<T: Trace> Graph<T> {
             max_in_flight_batches_observed: window.max_observed(),
             max_reorder_batches_observed: max_reorder_batches,
             prepared_output: false,
+            direct_output_rendering: false,
             transform_worker_nanos: 0,
             prepare_output_worker_nanos: 0,
             commit_output_writer_nanos: 0,
@@ -1379,6 +2806,38 @@ impl<T: Trace> Graph<T> {
         Ok(output_start)
     }
 
+    fn direct_projection_suffix(
+        &self,
+        output_start: usize,
+    ) -> (usize, Vec<DirectReadProjection<'_>>) {
+        let output_nodes = &self.nodes[output_start..];
+        if output_nodes.len() != 1 || !output_nodes[0].supports_direct_projection() {
+            return (output_start, Vec::new());
+        }
+
+        let mut projection_start = output_start;
+        while projection_start > 1
+            && self.nodes[projection_start - 1]
+                .direct_read_projection()
+                .is_some()
+        {
+            projection_start -= 1;
+        }
+        let projections = self.nodes[projection_start..output_start]
+            .iter()
+            .filter_map(|node| node.direct_read_projection())
+            .collect::<Vec<_>>();
+        if projections.is_empty()
+            || projections
+                .iter()
+                .enumerate()
+                .any(|(index, projection)| projection.str_type != StrType::Seq((index + 1) as u8))
+        {
+            return (output_start, Vec::new());
+        }
+        (projection_start, projections)
+    }
+
     fn pipeline_read(
         &self,
         trace: &T,
@@ -1415,6 +2874,7 @@ impl<T: Trace> Graph<T> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pipeline_work(
         &self,
         output_start: usize,
@@ -1468,6 +2928,7 @@ impl<T: Trace> Graph<T> {
         &self,
         output_start: usize,
         reads: &Option<Vec<Read>>,
+        direct_projections: &[DirectReadProjection<'_>],
         recycled: Option<Vec<PreparedOutput>>,
         trace: &T,
     ) -> Result<Vec<PreparedOutput>> {
@@ -1477,7 +2938,11 @@ impl<T: Trace> Graph<T> {
         let mut outputs = Vec::with_capacity(self.nodes.len() - output_start);
         for node in &self.nodes[output_start..] {
             let trace_start = trace.start(reads);
-            let prepared = node.prepare_output(read_slice, recycled.next())?;
+            let prepared = if direct_projections.is_empty() {
+                node.prepare_output(read_slice, recycled.next())?
+            } else {
+                node.prepare_output_projected(read_slice, direct_projections, recycled.next())?
+            };
             trace.add(node.name(), trace_start, reads);
             outputs.push(prepared);
         }
@@ -1503,6 +2968,81 @@ impl<T: Trace> Graph<T> {
         Ok(())
     }
 
+    /// Claim finalization exactly once and record its outcome. A repeated
+    /// `finish` after success is an idempotent `Ok`; a repeated call after a
+    /// failed finalization returns the sticky [`Error::GraphFinalizationFailed`]
+    /// so no caller can observe a false success for data that never reached
+    /// its destination.
+    fn finalize_with(&self, finalize: impl Fn(&dyn GraphNode<T>) -> Result<()>) -> Result<()> {
+        loop {
+            let state = self.execution_state.load(Ordering::Acquire);
+            match state {
+                GRAPH_FINISHED => return Ok(()),
+                GRAPH_FINISH_FAILED => return Err(Error::GraphFinalizationFailed),
+                GRAPH_FINISHING => return Err(Error::GraphAlreadyRunning),
+                _ => {
+                    if self
+                        .execution_state
+                        .compare_exchange(
+                            state,
+                            GRAPH_FINISHING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let failures = self
+            .nodes
+            .iter()
+            .filter_map(|node| finalize(node.as_ref()).err())
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            self.execution_state
+                .store(GRAPH_FINISHED, Ordering::Release);
+            Ok(())
+        } else {
+            self.execution_state
+                .store(GRAPH_FINISH_FAILED, Ordering::Release);
+            Err(aggregate_failures(failures))
+        }
+    }
+
+    /// Finish every node, retaining all failures so one broken output cannot
+    /// hide a second broken output.
+    pub fn finish(&self) -> Result<()> {
+        self.finalize_with(|node| node.finish())
+    }
+
+    /// Flush and finalize writers that already hold buffered data without
+    /// creating files or materializing constant outputs. Used on failed
+    /// executions so finalization failures are reported instead of being
+    /// silently dropped in `Drop`.
+    pub fn finish_existing(&self) -> Result<()> {
+        self.finalize_with(|node| node.finish_existing())
+    }
+
+    fn finish_after<R>(&self, execution: Result<R>) -> Result<R> {
+        match execution {
+            Ok(value) => self.finish().map(|()| value),
+            Err(error) => {
+                // A failed execution is terminal and must not materialize
+                // constant outputs or truncate destinations that were never
+                // written. Writers that already hold data are still flushed
+                // and finalized so their failures surface alongside the
+                // execution error rather than vanishing in `Drop`.
+                match self.finish_existing() {
+                    Ok(()) => Err(error),
+                    Err(finish_error) => Err(aggregate_failures(vec![error, finish_error])),
+                }
+            }
+        }
+    }
+
     fn run_node_range(
         &self,
         mut curr: Option<Vec<Read>>,
@@ -1510,18 +3050,14 @@ impl<T: Trace> Graph<T> {
         end: usize,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool)> {
-        let trust = trust_required_checks();
         for node in &self.nodes[start..end] {
-            let Some(reads) = &curr else {
+            if curr.is_none() {
                 break;
-            };
-            if !trust
-                && !node.required_names().is_empty()
-                && reads
-                    .first()
-                    .is_some_and(|first| !first.has_names(node.required_names()))
-            {
-                continue;
+            }
+            match self.resolve_missing_inputs(node.as_ref(), &mut curr)? {
+                RequirementAction::Run => {}
+                RequirementAction::Skip => continue,
+                RequirementAction::RejectedAll => return Ok((None, false)),
             }
             let (next, done) = node.run(curr, trace)?;
             curr = next;
@@ -1585,7 +3121,7 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool)> {
-        let trust = trust_required_checks();
+        self.begin_or_continue_execution()?;
         for node in &self.nodes {
             // If there is no current read, only the input node can produce one.
             if curr.is_none() {
@@ -1600,15 +3136,11 @@ impl<T: Trace> Graph<T> {
                 continue;
             }
 
-            // Skip nodes whose requirements are not satisfied, unless trusted.
-            // Heuristic: Check the first read as a representative.
-            if !trust && !node.required_names().is_empty() {
-                if let Some(reads) = &curr {
-                    if let Some(first) = reads.first() {
-                        if !first.has_names(node.required_names()) {
-                            continue;
-                        }
-                    }
+            match self.resolve_missing_inputs(node.as_ref(), &mut curr)? {
+                RequirementAction::Run => {}
+                RequirementAction::Skip => continue,
+                RequirementAction::RejectedAll => {
+                    return Ok((None, false));
                 }
             }
 
@@ -1637,11 +3169,46 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool, bool)> {
+        self.begin_or_continue_execution()?;
+        let mut failed = false;
         for node in &self.nodes {
-            if let Some(reads) = &curr {
-                if let Some(first) = reads.first() {
-                    if !first.has_names(node.required_names()) {
-                        return Ok((curr, true, false));
+            if let Some(reads) = &mut curr {
+                let requirements = node.required_names();
+                if !requirements.is_empty() {
+                    match self.missing_input_policy() {
+                        MissingInputPolicy::Skip => {
+                            if reads
+                                .first()
+                                .is_some_and(|read| !read.has_names(requirements))
+                            {
+                                return Ok((curr, true, false));
+                            }
+                        }
+                        MissingInputPolicy::Error => {
+                            if let Some(read) =
+                                reads.iter().find(|read| !read.has_names(requirements))
+                            {
+                                let missing = requirements
+                                    .iter()
+                                    .filter(|required| {
+                                        !read.has_names(std::slice::from_ref(*required))
+                                    })
+                                    .cloned()
+                                    .collect();
+                                return Err(Error::MissingRequiredInputs {
+                                    node: node.name(),
+                                    missing,
+                                });
+                            }
+                        }
+                        MissingInputPolicy::Reject => {
+                            let before = reads.len();
+                            reads.retain(|read| read.has_names(requirements));
+                            failed |= reads.len() != before;
+                            if reads.is_empty() {
+                                return Ok((None, true, false));
+                            }
+                        }
                     }
                 }
             }
@@ -1650,20 +3217,29 @@ impl<T: Trace> Graph<T> {
             curr = c;
 
             if done {
-                return Ok((curr, false, done));
+                return Ok((curr, failed, done));
             }
             if curr.is_none() {
                 break;
             }
         }
 
-        Ok((curr, false, false))
+        Ok((curr, failed, false))
     }
 }
 
+fn aggregate_failures(errors: Vec<Error>) -> Error {
+    let summary = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::WorkerFailures { summary, errors }
+}
+
 fn push_failure(
-    failures: &Mutex<Vec<String>>,
-    message: String,
+    failures: &Mutex<Vec<Error>>,
+    error: Error,
     cancelled: &AtomicBool,
     window: &InFlightWindow,
 ) {
@@ -1672,24 +3248,19 @@ fn push_failure(
     failures
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .push(message);
+        .push(error);
 }
 
 fn record_thread_result(
     result: std::thread::Result<Result<()>>,
     cancelled: &AtomicBool,
     window: &InFlightWindow,
-    failures: &Mutex<Vec<String>>,
+    failures: &Mutex<Vec<Error>>,
     role: &str,
 ) {
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => push_failure(
-            failures,
-            format!("{role} failed: {error}"),
-            cancelled,
-            window,
-        ),
+        Ok(Err(error)) => push_failure(failures, error, cancelled, window),
         Err(payload) => {
             let message = payload
                 .downcast_ref::<&str>()
@@ -1698,7 +3269,7 @@ fn record_thread_result(
                 .unwrap_or_else(|| "non-string panic payload".to_owned());
             push_failure(
                 failures,
-                format!("{role} panicked: {message}"),
+                Error::GraphExecution(format!("{role} panicked: {message}")),
                 cancelled,
                 window,
             );
@@ -1874,7 +3445,25 @@ impl MatchType {
     }
 
     pub fn k(&self, len: usize) -> usize {
-        let k_from_edits = |len: usize, e: usize| (len - e).div_ceil(e + 1);
+        // Pigeonhole seeding is sound only when `e` is the maximum number of
+        // errors. If every position may differ, no positive-length exact seed
+        // is guaranteed and the caller must use exhaustive verification.
+        let k_from_edits = |len: usize, e: usize| {
+            if len == 0 || e >= len {
+                0
+            } else {
+                (len - e).div_ceil(e + 1)
+            }
+        };
+        let k_from_hamming_matches = |len: usize, minimum_matches: usize| {
+            if minimum_matches > len {
+                // An impossible threshold is intentionally left to exhaustive
+                // verification, which deterministically produces no match.
+                0
+            } else {
+                k_from_edits(len, len - minimum_matches)
+            }
+        };
         use MatchType::*;
         match self {
             Exact => len,
@@ -1882,30 +3471,34 @@ impl MatchType {
             ExactSuffix => len,
             ExactSearch => len,
             ExactBoundedMatch { .. } => len,
-            Hamming(t) => k_from_edits(len, t.get(len)),
-            HammingPrefix(t) => k_from_edits(len, t.get(len)),
-            HammingSuffix(t) => k_from_edits(len, t.get(len)),
-            HammingSearch(t) => k_from_edits(len, t.get(len)),
-            HammingBoundedMatch { threshold: t, .. } => k_from_edits(len, t.get(len)),
+            Hamming(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingPrefix(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingSuffix(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingSearch(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingBoundedMatch { threshold: t, .. } => k_from_hamming_matches(len, t.get(len)),
             Edit(t) => k_from_edits(len, t.get(len)),
             EditPrefix(t) => k_from_edits(len, t.get(len)),
             EditSuffix(t) => k_from_edits(len, t.get(len)),
             EditSearch(t) => k_from_edits(len, t.get(len)),
             EditBoundedMatch { threshold: t, .. } => k_from_edits(len, t.get(len)),
             GlobalAln(identity) => {
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             PrefixAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             SuffixAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             LocalAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
         }
     }
@@ -1933,7 +3526,7 @@ impl Threshold {
 
 #[cfg(test)]
 mod pipeline_config_tests {
-    use super::PipelineConfig;
+    use super::{MatchType, PipelineConfig, Threshold};
 
     #[test]
     fn defaults_keep_only_one_small_batch_per_worker_in_flight() {
@@ -1946,6 +3539,18 @@ mod pipeline_config_tests {
         assert_eq!(parallel.queue_capacity, 2);
         assert_eq!(parallel.max_in_flight_batches, 8);
         assert_eq!(parallel.batch_size, 256);
+    }
+
+    #[test]
+    fn hamming_seed_length_uses_mismatch_budget_not_minimum_matches() {
+        // At least 7 of 8 matching bases means at most one mismatch, which
+        // guarantees an exact seed of length ceil((8 - 1) / 2) = 4.
+        assert_eq!(MatchType::Hamming(Threshold::Count(7)).k(8), 4);
+        // A threshold that permits every base to differ has no guaranteed
+        // positive seed and must use exhaustive verification.
+        assert_eq!(MatchType::Hamming(Threshold::Count(0)).k(8), 0);
+        // Impossible and mixed-length thresholds never underflow.
+        assert_eq!(MatchType::Hamming(Threshold::Count(9)).k(8), 0);
     }
 }
 
@@ -1993,5 +3598,931 @@ mod reorder_ring_tests {
         pending.sort_unstable();
         assert_eq!(pending, vec![1, 3]);
         assert_eq!(ring.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod graph_api_tests {
+    use super::*;
+    use crate::patterns::Patterns;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    struct DeclaredOp {
+        required: Vec<LabelOrAttr>,
+        produced: Vec<LabelOrAttr>,
+    }
+
+    struct StagedOp(NodeStage);
+
+    struct DeclaredOutputOp {
+        required: Vec<LabelOrAttr>,
+    }
+
+    struct InfallibleFilterOp {
+        required: Vec<LabelOrAttr>,
+    }
+
+    impl InfallibleFilterOp {
+        fn new(required: impl Into<LabelOrAttr>) -> Self {
+            Self {
+                required: vec![required.into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for InfallibleFilterOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            let retained = reads
+                .into_iter()
+                .filter(|read| {
+                    read.substring(self.required[0].str_type(), self.required[0].label())
+                        .is_ok_and(|sequence| !sequence.is_empty())
+                })
+                .collect::<Vec<_>>();
+            Ok(((!retained.is_empty()).then_some(retained), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&[])
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::None
+        }
+
+        fn is_selective_filter(&self) -> bool {
+            true
+        }
+
+        fn is_infallible_selective_filter(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "InfallibleFilterOp"
+        }
+    }
+
+    impl DeclaredOutputOp {
+        fn new(required: impl Into<LabelOrAttr>) -> Self {
+            Self {
+                required: vec![required.into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for DeclaredOutputOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&[])
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::None
+        }
+
+        fn rejection_behavior(&self) -> RejectionBehavior {
+            RejectionBehavior::Never
+        }
+
+        fn stage(&self) -> NodeStage {
+            NodeStage::Output
+        }
+
+        fn has_explicit_name_observation(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "DeclaredOutputOp"
+        }
+    }
+
+    impl GraphNode<NoTrace> for StagedOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &[]
+        }
+
+        fn stage(&self) -> NodeStage {
+            self.0
+        }
+
+        fn name(&self) -> &'static str {
+            "StagedOp"
+        }
+    }
+
+    impl DeclaredOp {
+        fn new() -> Self {
+            Self {
+                required: vec![Label::new(b"seq1.*").unwrap().into()],
+                produced: vec![Label::new(b"seq1.result").unwrap().into()],
+            }
+        }
+    }
+
+    impl GraphNode<NoTrace> for DeclaredOp {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), false))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &self.required
+        }
+
+        fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+            Some(&self.produced)
+        }
+
+        fn effects_are_complete(&self) -> bool {
+            true
+        }
+
+        fn mutation_kind(&self) -> MutationKind {
+            MutationKind::Metadata
+        }
+
+        fn rejection_behavior(&self) -> RejectionBehavior {
+            RejectionBehavior::Never
+        }
+
+        fn cost_class(&self) -> CostClass {
+            CostClass::Constant
+        }
+
+        fn name(&self) -> &'static str {
+            "DeclaredOp"
+        }
+    }
+
+    fn valid_read(idx: usize) -> Read {
+        let mut read = Read::new();
+        read.add_fastq(1, b"read", b"A", b"I", Arc::new(Origin::Bytes), idx);
+        read
+    }
+
+    #[test]
+    fn descriptor_exposes_static_operation_effects() {
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(DeclaredOp::new());
+
+        let descriptor = graph.descriptors().next().unwrap();
+        assert_eq!(descriptor.name, "DeclaredOp");
+        assert_eq!(descriptor.requirements.len(), 1);
+        assert_eq!(descriptor.produced.unwrap().len(), 1);
+        assert_eq!(descriptor.invalidation, InvalidationEffect::PreserveAll);
+        assert_eq!(descriptor.mutation, MutationKind::Metadata);
+        assert_eq!(descriptor.rejection, RejectionBehavior::Never);
+        assert_eq!(descriptor.cost, CostClass::Constant);
+        assert_eq!(descriptor.stage, NodeStage::Transform);
+    }
+
+    #[test]
+    fn liveness_allows_terminal_projection_but_rejects_live_invalidated_labels() {
+        let wildcard = Label::new(b"seq1.*").unwrap();
+        let old = Label::new(b"seq1.old").unwrap();
+
+        let mut safe = GraphBuilder::<NoTrace>::new();
+        safe.add(ProjectOp::new([old.clone()]));
+        safe.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        assert!(safe.compile().is_ok());
+
+        let mut unsafe_graph = GraphBuilder::<NoTrace>::new();
+        unsafe_graph.add(ProjectOp::new([old.clone()]));
+        unsafe_graph.add(SetOp::new(old.clone(), Expr::from(old.clone())));
+        let error = unsafe_graph.compile().err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("invalidates names still required"));
+        assert!(error.to_string().contains("old"));
+
+        let projection = ProjectOp::new([old]);
+        assert_eq!(
+            <ProjectOp as GraphNode<NoTrace>>::invalidation_effect(&projection),
+            InvalidationEffect::Lane(StrType::Seq(1))
+        );
+        assert_eq!(
+            <ProjectOp as GraphNode<NoTrace>>::produced_names(&projection).unwrap(),
+            &[LabelOrAttr::Label(wildcard)]
+        );
+    }
+
+    #[test]
+    fn recursive_liveness_rejects_unsafe_projection_in_try_and_loop_graphs() {
+        let old = Label::new(b"seq1.old").unwrap();
+
+        let mut try_arm = Graph::<NoTrace>::new();
+        try_arm.add(ProjectOp::new([old.clone()]));
+        let catch_arm = Graph::<NoTrace>::new();
+        let mut enclosing_try = GraphBuilder::<NoTrace>::new();
+        enclosing_try.add(TryOp::new(try_arm, catch_arm).return_catch_output());
+        enclosing_try.add(SetOp::new(old.clone(), Expr::from(old.clone())));
+        assert!(enclosing_try
+            .compile()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalidates names still required"));
+
+        let mut loop_body = Graph::<NoTrace>::new();
+        loop_body.add(ProjectOp::new([old.clone()]));
+        let mut enclosing_loop = GraphBuilder::<NoTrace>::new();
+        enclosing_loop.add(WhileOp::new(
+            Expr::from(old.clone()).len().gt(0isize),
+            loop_body,
+        ));
+        assert!(enclosing_loop
+            .compile()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalidates names still required"));
+    }
+
+    #[test]
+    fn explicit_control_metadata_survives_projection_and_is_live_in_nested_graphs() {
+        let wildcard = Label::new(b"seq1.*").unwrap();
+        let orientation = lane_attr(1, b"ori");
+        let record_route = record_attr(b"route");
+
+        let mut nested = Graph::<NoTrace>::new();
+        nested.add(ProjectOp::new([wildcard.clone()]));
+        nested.add(RetainOp::new(
+            Expr::from(orientation.clone()).eq(b"fw".to_vec()),
+        ));
+        nested.add(RetainOp::new(
+            Expr::from(record_route.clone()).eq(b"keep".to_vec()),
+        ));
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(SetOp::new(orientation, b"fw".to_vec()));
+        builder.add(SetOp::new(record_route, b"keep".to_vec()));
+        builder.add(TryOp::new(nested, Graph::new()).return_catch_output());
+        let compiled = builder.compile().unwrap();
+        let output = compiled
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(output.len(), 1);
+    }
+
+    #[test]
+    fn missing_input_policies_are_explicit_and_per_read_when_strict() {
+        let trace = NoTrace;
+
+        let mut skip = Graph::<NoTrace>::new();
+        skip.add(DeclaredOp::new());
+        let (reads, _) = skip.run_one(Some(vec![Read::new()]), &trace).unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+
+        let mut reject = Graph::<NoTrace>::new();
+        reject.add(DeclaredOp::new());
+        reject.set_missing_input_policy(MissingInputPolicy::Reject);
+        let (reads, _) = reject
+            .run_one(Some(vec![Read::new(), valid_read(1)]), &trace)
+            .unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+
+        let mut strict = Graph::<NoTrace>::new();
+        strict.add(DeclaredOp::new());
+        strict.set_missing_input_policy(MissingInputPolicy::Error);
+        let error = strict
+            .run_one(Some(vec![valid_read(0), Read::new()]), &trace)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::MissingRequiredInputs {
+                node: "DeclaredOp",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn builder_compiles_to_a_validated_immutable_graph() {
+        let mut builder =
+            GraphBuilder::<NoTrace>::new().with_missing_input_policy(MissingInputPolicy::Error);
+        builder.add(DeclaredOp::new());
+        let compiled = builder.compile().unwrap();
+
+        assert_eq!(compiled.missing_input_policy(), MissingInputPolicy::Error);
+        assert_eq!(compiled.descriptors().len(), 1);
+        let (reads, _) = compiled
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap();
+        assert_eq!(reads.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compilation_reports_and_removes_only_proven_noops() {
+        let mut optimized = GraphBuilder::<NoTrace>::new();
+        optimized.add(RetainOp::new(true));
+        optimized.add(TrimOp::new(std::iter::empty::<Label>()));
+        optimized.add(DeclaredOp::new());
+        let optimized = optimized.compile().unwrap();
+
+        assert_eq!(
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(optimized.optimization_report().original_operations, 3);
+        assert_eq!(optimized.optimization_report().optimized_operations, 1);
+        assert_eq!(
+            optimized.optimization_report().passes[0],
+            GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 2,
+            }
+        );
+
+        let mut unoptimized = GraphBuilder::<NoTrace>::new();
+        unoptimized.add(RetainOp::new(true));
+        unoptimized.add(TrimOp::new(std::iter::empty::<Label>()));
+        unoptimized.add(DeclaredOp::new());
+        let unoptimized = unoptimized
+            .compile_with(GraphOptimizationConfig::disabled())
+            .unwrap();
+        assert_eq!(unoptimized.descriptors().len(), 3);
+        assert_eq!(unoptimized.optimization_report().optimized_operations, 3);
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn compilation_recursively_optimizes_nested_graphs_and_aggregates_the_report() {
+        let make_builder = || {
+            let mut try_graph = Graph::<NoTrace>::new();
+            try_graph.add(RetainOp::new(true));
+            try_graph.add(TrimOp::new(std::iter::empty::<Label>()));
+            let mut catch_graph = Graph::<NoTrace>::new();
+            catch_graph.add(RetainOp::new(true));
+            let mut builder = GraphBuilder::<NoTrace>::new();
+            builder.add(TryOp::new(try_graph, catch_graph).return_catch_output());
+            builder
+        };
+
+        let optimized = make_builder().compile().unwrap();
+        assert_eq!(optimized.optimization_report().original_operations, 4);
+        assert_eq!(optimized.optimization_report().optimized_operations, 1);
+        assert_eq!(
+            optimized.optimization_report().passes[0],
+            GraphOptimizationPassReport {
+                pass: "semantic_noop_elimination",
+                changed_nodes: 3,
+            }
+        );
+
+        let unoptimized = make_builder()
+            .compile_with(GraphOptimizationConfig::disabled())
+            .unwrap();
+        assert_eq!(unoptimized.optimization_report().original_operations, 4);
+        assert_eq!(unoptimized.optimization_report().optimized_operations, 4);
+    }
+
+    #[test]
+    fn compilation_folds_only_proven_adjacent_idempotent_operations() {
+        let target = Label::new(b"seq1.*").unwrap();
+
+        let mut optimized = GraphBuilder::<NoTrace>::new();
+        optimized.add(TrimOp::new([target.clone()]));
+        optimized.add(TrimOp::new([target.clone()]));
+        let optimized = optimized.compile().unwrap();
+        assert_eq!(
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[3],
+            GraphOptimizationPassReport {
+                pass: "adjacent_idempotent_fusion",
+                changed_nodes: 1,
+            }
+        );
+
+        let mut unoptimized = GraphBuilder::<NoTrace>::new();
+        unoptimized.add(TrimOp::new([target.clone()]));
+        unoptimized.add(TrimOp::new([target.clone()]));
+        let unoptimized = unoptimized
+            .compile_with(GraphOptimizationConfig::disabled())
+            .unwrap();
+        assert_eq!(unoptimized.descriptors().len(), 2);
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+
+        let mut traced = GraphBuilder::<TraceReads>::new();
+        traced.add(TrimOp::new([target.clone()]));
+        traced.add(TrimOp::new([target]));
+        let traced = traced.compile().unwrap();
+        assert_eq!(traced.descriptors().len(), 2);
+        assert_eq!(
+            traced.optimization_report().passes[3].changed_nodes,
+            0,
+            "trace-visible operation boundaries must not be folded"
+        );
+    }
+
+    #[test]
+    fn compilation_reports_terminal_projection_candidates() {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(NullOutputOp::new());
+        let compiled = builder.compile().unwrap();
+
+        assert_eq!(
+            compiled
+                .optimization_report()
+                .terminal_projection_candidates,
+            1
+        );
+        assert_eq!(
+            compiled.optimization_report().passes[4],
+            GraphOptimizationPassReport {
+                pass: "terminal_projection_output_fusion",
+                changed_nodes: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn dead_label_elimination_removes_only_proven_unobserved_metadata() {
+        let dead = record_attr(b"dead");
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        let dead_set = SetOp::new(dead.clone(), b"unused".to_vec());
+        assert!(<SetOp as GraphNode<NoTrace>>::removable_when_outputs_dead(
+            &dead_set
+        ));
+        builder.add(dead_set);
+        builder.add(NullOutputOp::new());
+        let optimized = builder.compile().unwrap();
+        assert_eq!(
+            optimized.descriptors().len(),
+            1,
+            "report={:?}, nodes={:?}",
+            optimized.optimization_report(),
+            optimized
+                .descriptors()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[1],
+            GraphOptimizationPassReport {
+                pass: "dead_label_elimination",
+                changed_nodes: 1,
+            }
+        );
+
+        let mut live_builder = GraphBuilder::<NoTrace>::new();
+        live_builder.add(SetOp::new(dead.clone(), b"retained".to_vec()));
+        live_builder.add(DeclaredOutputOp::new(dead));
+        let live = live_builder.compile().unwrap();
+        assert_eq!(live.descriptors().len(), 2);
+        assert_eq!(live.optimization_report().passes[1].changed_nodes, 0);
+    }
+
+    #[test]
+    fn early_filter_placement_is_independent_ablatable_and_byte_equivalent() {
+        let route = record_attr(b"route");
+        let whole = Label::new(b"seq1.*").unwrap();
+        let make_builder = || {
+            let mut builder = GraphBuilder::<NoTrace>::new();
+            builder.add(SetOp::new(route.clone(), b"kept".to_vec()));
+            builder.add(InfallibleFilterOp::new(whole.clone()));
+            builder.add(DeclaredOutputOp::new(route.clone()));
+            builder
+        };
+
+        let optimized = make_builder().compile().unwrap();
+        let optimized_names = optimized
+            .descriptors()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            optimized_names,
+            vec!["InfallibleFilterOp", "SetOp", "DeclaredOutputOp"]
+        );
+        assert_eq!(
+            optimized.optimization_report().passes[2],
+            GraphOptimizationPassReport {
+                pass: "early_selective_filter_placement",
+                changed_nodes: 1,
+            }
+        );
+
+        let config = GraphOptimizationConfig {
+            early_selective_filter_placement: false,
+            ..GraphOptimizationConfig::default()
+        };
+        let unoptimized = make_builder().compile_with(config).unwrap();
+        let unoptimized_names = unoptimized
+            .descriptors()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unoptimized_names,
+            vec!["SetOp", "InfallibleFilterOp", "DeclaredOutputOp"]
+        );
+
+        let optimized_read = optimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        let unoptimized_read = unoptimized
+            .run_one(Some(vec![valid_read(0)]), &NoTrace)
+            .unwrap()
+            .0
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            optimized_read.to_fastq(1).unwrap(),
+            unoptimized_read.to_fastq(1).unwrap()
+        );
+        assert_eq!(
+            optimized_read.record_data(route.attr),
+            unoptimized_read.record_data(route.attr)
+        );
+    }
+
+    #[test]
+    fn nested_continuation_liveness_prevents_dead_metadata_removal() {
+        let route = record_attr(b"route");
+        let mut arm = Graph::<NoTrace>::new();
+        arm.add(SetOp::new(route.clone(), b"nested".to_vec()));
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(TryOp::new(arm, Graph::new()).return_catch_output());
+        builder.add(DeclaredOutputOp::new(route));
+        let compiled = builder.compile().unwrap();
+        assert_eq!(compiled.optimization_report().passes[1].changed_nodes, 0);
+        assert_eq!(compiled.optimization_report().optimized_operations, 3);
+    }
+
+    #[test]
+    fn observable_statistics_disable_reordering_and_dead_label_elimination() {
+        let route = record_attr(b"route");
+        let whole = Label::new(b"seq1.*").unwrap();
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.set_statistics_level(StatisticsLevel::Detailed);
+        builder.add(SetOp::new(route, b"unused".to_vec()));
+        builder.add(InfallibleFilterOp::new(whole));
+        builder.add(NullOutputOp::new());
+        let compiled = builder.compile().unwrap();
+        assert_eq!(compiled.optimization_report().passes[1].changed_nodes, 0);
+        assert_eq!(compiled.optimization_report().passes[2].changed_nodes, 0);
+    }
+
+    proptest! {
+        #[test]
+        fn generated_graphs_preserve_live_labels_fastq_and_rejection(
+            dead_assignments in 0usize..8,
+            sequence in proptest::collection::vec(prop_oneof![Just(b'A'), Just(b'C'), Just(b'G'), Just(b'T')], 0..64),
+        ) {
+            let route = record_attr(b"route");
+            let whole = Label::new(b"seq1.*").unwrap();
+            let make_builder = || {
+                let mut builder = GraphBuilder::<NoTrace>::new();
+                for index in 0..dead_assignments {
+                    builder.add(SetOp::new(
+                        record_attr(format!("dead{index}")),
+                        b"unused".to_vec(),
+                    ));
+                }
+                builder.add(SetOp::new(route.clone(), b"live".to_vec()));
+                builder.add(InfallibleFilterOp::new(whole.clone()));
+                builder.add(DeclaredOutputOp::new(route.clone()));
+                builder
+            };
+
+            let optimized = make_builder().compile().unwrap();
+            let baseline = make_builder()
+                .compile_with(GraphOptimizationConfig::disabled())
+                .unwrap();
+            let make_read = || {
+                let mut read = Read::new();
+                read.add_fastq(
+                    1,
+                    b"generated",
+                    &sequence,
+                    &vec![b'I'; sequence.len()],
+                    Arc::new(Origin::Bytes),
+                    0,
+                );
+                read
+            };
+            let optimized_result = optimized.run_one(Some(vec![make_read()]), &NoTrace).unwrap().0;
+            let baseline_result = baseline.run_one(Some(vec![make_read()]), &NoTrace).unwrap().0;
+            prop_assert_eq!(optimized_result.is_some(), baseline_result.is_some());
+            if let (Some(mut optimized_reads), Some(mut baseline_reads)) =
+                (optimized_result, baseline_result)
+            {
+                let optimized_read = optimized_reads.pop().unwrap();
+                let baseline_read = baseline_reads.pop().unwrap();
+                prop_assert_eq!(
+                    optimized_read.to_fastq(1).unwrap(),
+                    baseline_read.to_fastq(1).unwrap()
+                );
+                prop_assert_eq!(
+                    optimized_read.record_data(route.attr),
+                    baseline_read.record_data(route.attr)
+                );
+            }
+        }
+    }
+
+    fn compiled_projected_fastq() -> CompiledGraph<NoTrace> {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        builder.compile().unwrap()
+    }
+
+    #[test]
+    fn execution_plans_are_deterministic_and_explain_decisions() {
+        let graph = compiled_projected_fastq();
+        let mut request = ExecutionRequest::new(1);
+        request.pipeline.preserve_order = true;
+
+        let first = graph.plan_execution(request).unwrap();
+        let second = graph.plan_execution(request).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.requested_mode, ExecutionMode::Auto);
+        assert_eq!(first.backend, ExecutionBackend::WorkerLocalPipeline);
+        assert!(first.prepared_output);
+        assert!(first.direct_output_rendering);
+        assert!(first
+            .reason_codes
+            .contains(&"ordered_output_requires_pipeline"));
+        assert!(first
+            .reason_codes
+            .contains(&"single_worker_direct_terminal_rendering"));
+
+        let report = graph.try_run_planned(request).unwrap();
+        assert_eq!(report.plan, first);
+        assert!(report.pipeline.unwrap().direct_output_rendering);
+    }
+
+    #[test]
+    fn disabling_optimizer_also_disables_runtime_terminal_fusion() {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        let graph = builder
+            .compile_with(GraphOptimizationConfig::disabled())
+            .unwrap();
+
+        let mut request = ExecutionRequest::new(1);
+        request.mode = ExecutionMode::Pipeline;
+        request.pipeline.preserve_order = true;
+        let plan = graph.plan_execution(request).unwrap();
+        assert!(!plan.direct_output_rendering);
+        let report = graph.try_run_planned(request).unwrap();
+        assert!(!report.pipeline.unwrap().direct_output_rendering);
+    }
+
+    #[test]
+    fn execution_planner_preserves_conservative_default_and_forced_backends() {
+        let graph = compiled_projected_fastq();
+        let automatic = graph.plan_execution(ExecutionRequest::new(4)).unwrap();
+        assert_eq!(automatic.backend, ExecutionBackend::WholeGraph);
+        assert!(automatic
+            .reason_codes
+            .contains(&"conservative_low_overhead_whole_graph"));
+        assert!(!automatic.direct_output_rendering);
+
+        let mut dedicated = ExecutionRequest::new(4);
+        dedicated.mode = ExecutionMode::Pipeline;
+        dedicated.pipeline.input_mode = PipelineInputMode::DedicatedReader;
+        let dedicated = graph.plan_execution(dedicated).unwrap();
+        assert_eq!(dedicated.requested_mode, ExecutionMode::Pipeline);
+        assert_eq!(dedicated.backend, ExecutionBackend::DedicatedReaderPipeline);
+        assert!(dedicated.reason_codes.contains(&"forced_pipeline"));
+    }
+
+    #[test]
+    fn batch_planner_is_deterministic_bounded_and_preserves_manual_overrides() {
+        let cases = [
+            (1, 1, 150, GraphCostSummary::default(), 256),
+            (2, 2, 300, GraphCostSummary::default(), 256),
+            (3, 3, 450, GraphCostSummary::default(), 256),
+            (1, 1, 10_000, GraphCostSummary::default(), 16),
+            (
+                1,
+                1,
+                150,
+                GraphCostSummary {
+                    alignment: 1,
+                    ..GraphCostSummary::default()
+                },
+                256,
+            ),
+        ];
+        for (input_lanes, output_lanes, bases, costs, expected) in cases {
+            let hints = BatchPlanningHints {
+                input_lanes,
+                output_lanes,
+                estimated_bases_per_fragment: bases,
+                ..BatchPlanningHints::default()
+            };
+            let first = plan_batch_configuration(PipelineConfig::new(4), hints, costs);
+            let second = plan_batch_configuration(PipelineConfig::new(4), hints, costs);
+            assert_eq!(first, second);
+            assert_eq!(first.0.batch_size, expected);
+            assert!(first.1.estimated_peak_live_bytes <= hints.memory_budget_bytes);
+        }
+
+        let pipeline = PipelineConfig {
+            workers: 4,
+            queue_capacity: 7,
+            max_in_flight_batches: 9,
+            batch_size: 777,
+            preserve_order: true,
+            direct_output_rendering: false,
+            input_mode: PipelineInputMode::DedicatedReader,
+        };
+        let hints = BatchPlanningHints {
+            automatic_batch_size: false,
+            automatic_queue_capacity: false,
+            automatic_max_in_flight: false,
+            ..BatchPlanningHints::default()
+        };
+        let (planned, report) = plan_batch_configuration(pipeline, hints, Default::default());
+        assert_eq!(planned, pipeline);
+        assert_eq!(report.batch_size, 777);
+        assert_eq!(report.queue_capacity, 7);
+        assert_eq!(report.max_in_flight_batches, 9);
+        assert!(report.reason_codes.contains(&"manual_batch_size"));
+        assert!(report.reason_codes.contains(&"manual_queue_capacity"));
+        assert!(report.reason_codes.contains(&"manual_in_flight_bound"));
+    }
+
+    #[test]
+    fn batch_planner_honors_memory_budget_after_fixed_compression_buffers() {
+        let hints = BatchPlanningHints {
+            input_lanes: 3,
+            output_lanes: 3,
+            estimated_bases_per_fragment: 30_000,
+            compressed_input: true,
+            compressed_output: true,
+            fixed_buffer_bytes: 8 * 1024 * 1024,
+            memory_budget_bytes: 16 * 1024 * 1024,
+            ..BatchPlanningHints::default()
+        };
+        let (_, report) =
+            plan_batch_configuration(PipelineConfig::new(8), hints, Default::default());
+        assert!(report.estimated_peak_live_bytes <= report.memory_budget_bytes);
+        assert!(report.memory_budget_satisfied);
+        assert!(report.reason_codes.contains(&"memory_budget_target"));
+        assert!(report.reason_codes.contains(&"long_reads_reduce_batch"));
+    }
+
+    #[test]
+    fn compilation_rejects_invalid_stage_ordering() {
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(StagedOp(NodeStage::Output));
+        builder.add(StagedOp(NodeStage::Transform));
+        assert!(matches!(
+            builder.compile().err().unwrap(),
+            Error::InvalidGraph(_)
+        ));
+
+        let mut duplicate_input = GraphBuilder::<NoTrace>::new();
+        duplicate_input.add(StagedOp(NodeStage::Input));
+        duplicate_input.add(StagedOp(NodeStage::Input));
+        assert!(matches!(
+            duplicate_input.compile().err().unwrap(),
+            Error::InvalidGraph(_)
+        ));
+    }
+
+    #[test]
+    fn built_in_descriptors_report_optimizer_relevant_effects() {
+        let cut = CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            4isize,
+        );
+        let cut = GraphNode::<NoTrace>::descriptor(&cut);
+        assert_eq!(cut.produced.unwrap().len(), 2);
+        assert_eq!(cut.mutation, MutationKind::Metadata);
+        assert_eq!(cut.rejection, RejectionBehavior::Never);
+
+        let patterns = Patterns::from_strs([b"ACGT"]).with_pattern_name(b"which");
+        let matcher = MatchAnyOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.hit").unwrap(),
+            patterns,
+            MatchType::Exact,
+        );
+        let matcher = GraphNode::<NoTrace>::descriptor(&matcher);
+        assert_eq!(matcher.produced.unwrap().len(), 2);
+        assert_eq!(matcher.mutation, MutationKind::Metadata);
+        assert_eq!(matcher.rejection, RejectionBehavior::Never);
+
+        let retain = RetainOp::new(false);
+        let retain = GraphNode::<NoTrace>::descriptor(&retain);
+        assert_eq!(retain.produced.unwrap().len(), 0);
+        assert_eq!(retain.mutation, MutationKind::None);
+        assert_eq!(retain.rejection, RejectionBehavior::MayReject);
+    }
+
+    #[test]
+    fn fallible_primitive_constructors_return_structured_errors() {
+        assert!(matches!(
+            ProjectOp::try_new(std::iter::empty::<Label>()),
+            Err(Error::InvalidOperation {
+                operation: "ProjectOp",
+                ..
+            })
+        ));
+        assert!(ProjectOp::try_with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(Label::new(b"seq2.*").unwrap())],
+        )
+        .is_err());
+        assert!(BernoulliOp::try_new(Attr::new(b"seq1.*.coin").unwrap(), 2.0, 7).is_err());
+        assert!(MatchRegexOp::try_new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.*.matched").unwrap(),
+            "[",
+        )
+        .is_err());
     }
 }

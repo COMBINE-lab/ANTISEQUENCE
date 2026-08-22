@@ -16,6 +16,12 @@ pub static DEFAULT_TRACE_PATH: &str = "ANTISEQUENCE.trace.json";
 pub trait Trace: Send + Sync {
     type S;
 
+    /// Whether operation boundaries are externally observable.
+    ///
+    /// Optimizers may fold operations only when this is false, unless a pass
+    /// can reproduce every original trace event.
+    const RECORDS_EVENTS: bool = true;
+
     fn new(file_path: impl AsRef<Path>) -> Self;
     fn start(&self, reads: &Option<Vec<Read>>) -> Self::S;
     fn add(&self, name: &str, start: Self::S, reads: &Option<Vec<Read>>);
@@ -29,6 +35,8 @@ pub struct TraceReads {
 
 impl Trace for TraceReads {
     type S = (Duration, Instant, Option<usize>);
+
+    const RECORDS_EVENTS: bool = true;
 
     fn new(file_path: impl AsRef<Path>) -> Self {
         let path = file_path.as_ref();
@@ -87,6 +95,8 @@ pub struct NoTrace;
 
 impl Trace for NoTrace {
     type S = ();
+
+    const RECORDS_EVENTS: bool = false;
 
     fn new(_file_path: impl AsRef<Path>) -> Self {
         Self

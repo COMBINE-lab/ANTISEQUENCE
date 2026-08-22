@@ -44,7 +44,7 @@ impl<const K: usize> SmallSearcher<K> {
         #[allow(unused)] patterns: impl Iterator<Item = (usize, &'a [u8])>,
     ) -> Result<Self, ()> {
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 const REPEAT: Aligned<64> = Aligned::<64>([0u8; 64]);
                 let mut pattern_luts = [REPEAT; K];
                 let mut pattern_idxs = Vec::new();
@@ -84,7 +84,7 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
         #[allow(unused)] mut candidate_fn: impl FnMut(SeedMatch),
     ) {
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 const L: usize = 32;
 
                 #[inline(always)]
@@ -98,7 +98,7 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
                         _mm256_set1_epi8(-1i8)
                     };
 
-                    for j in 0..K {
+                    for (j, pattern_lut) in pattern_luts.iter().enumerate() {
                         let mut chars = if REST {
                             read_rest_avx2(text.as_ptr().add(i + j), len)
                         } else {
@@ -109,14 +109,17 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
                             chars = _mm256_srli_epi16(chars, 1);
                         }
 
-                        let pattern_lut = _mm256_load_si256(pattern_luts[j].0.as_ptr() as _);
+                        let pattern_lut = _mm256_load_si256(pattern_lut.0.as_ptr() as _);
                         let curr_set = _mm256_shuffle_epi8(pattern_lut, _mm256_and_si256(chars, lo_4_mask));
                         set = _mm256_and_si256(set, curr_set);
                     }
 
                     set = _mm256_and_si256(set, load_mask);
-                    let nonzero = _mm256_cmpgt_epi8(set, _mm256_setzero_si256());
-                    let mut nonzero_mask = _mm256_movemask_epi8(nonzero) as u32;
+                    // Each byte is an unsigned bit set of matching pattern
+                    // seeds. A signed greater-than comparison loses values
+                    // with bit 7 set, so derive `!= 0` from equality instead.
+                    let zero = _mm256_cmpeq_epi8(set, _mm256_setzero_si256());
+                    let mut nonzero_mask = !(_mm256_movemask_epi8(zero) as u32);
 
                     if nonzero_mask > 0 {
                         let mut a = Aligned::<{ L }>([0u8; L]);
@@ -124,10 +127,13 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
 
                         while nonzero_mask > 0 {
                             let idx = nonzero_mask.trailing_zeros() as usize;
-                            let s = *a.0.as_ptr().add(idx) as usize;
-                            let hash_idx = s.trailing_zeros() as usize;
-                            let (pattern_idx, pattern_i) = *pattern_idxs.as_ptr().add(hash_idx);
-                            candidate_fn(SeedMatch { pattern_idx: pattern_idx as usize, pattern_i: pattern_i as usize, text_i: i + idx });
+                            let mut pattern_mask = *a.0.as_ptr().add(idx);
+                            while pattern_mask != 0 {
+                                let hash_idx = pattern_mask.trailing_zeros() as usize;
+                                let (pattern_idx, pattern_i) = *pattern_idxs.as_ptr().add(hash_idx);
+                                candidate_fn(SeedMatch { pattern_idx: pattern_idx as usize, pattern_i: pattern_i as usize, text_i: i + idx });
+                                pattern_mask &= pattern_mask - 1;
+                            }
 
                             nonzero_mask &= nonzero_mask - 1;
                         }
@@ -391,7 +397,7 @@ impl Filter {
         let mut zero_mask = 0u64;
 
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 let hashes = _mm256_loadu_si256(self.hashes.as_ptr().add(idx) as _);
                 let match_hash = _mm256_cmpeq_epi16(_mm256_set1_epi16(hash_hi as _), hashes);
                 let match_zero = _mm256_cmpeq_epi16(hashes, _mm256_setzero_si256());
@@ -426,7 +432,7 @@ pub struct SeedMatch {
 struct Aligned<const L: usize>([u8; L]);
 
 cfg_if! {
-    if #[cfg(target_feature = "avx2")] {
+    if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
         #[cfg(target_arch = "x86")]
         use std::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -469,7 +475,7 @@ cfg_if! {
 fn wyhash_byte(b: u8) -> u64 {
     #[cfg(feature = "seed-baseline")]
     {
-        return wyhash_byte_const(b);
+        wyhash_byte_const(b)
     }
     #[cfg(not(feature = "seed-baseline"))]
     WYHASH_BYTE_LOOKUP[b as usize]
@@ -540,5 +546,44 @@ mod tests {
             }
         }
         assert!(expected.is_subset(&observed));
+    }
+
+    #[cfg(any(
+        target_feature = "avx2",
+        all(target_arch = "x86_64", feature = "release-simd")
+    ))]
+    #[test]
+    fn small_searcher_emits_every_pattern_sharing_a_seed() {
+        let patterns = [b"AC".as_slice(), b"AC".as_slice()];
+        let searcher = SmallSearcher::<2>::new(patterns.iter().copied().enumerate()).unwrap();
+        let mut observed = BTreeSet::new();
+        searcher.search(b"AC", |seed| {
+            observed.insert(seed.pattern_idx);
+        });
+        assert_eq!(observed, BTreeSet::from([0, 1]));
+    }
+
+    #[cfg(any(
+        target_feature = "avx2",
+        all(target_arch = "x86_64", feature = "release-simd")
+    ))]
+    #[test]
+    fn small_searcher_emits_a_candidate_stored_in_bit_seven() {
+        let patterns = [
+            b"CC".as_slice(),
+            b"CG".as_slice(),
+            b"CT".as_slice(),
+            b"GC".as_slice(),
+            b"GG".as_slice(),
+            b"GT".as_slice(),
+            b"TC".as_slice(),
+            b"AA".as_slice(),
+        ];
+        let searcher = SmallSearcher::<2>::new(patterns.iter().copied().enumerate()).unwrap();
+        let mut observed = BTreeSet::new();
+        searcher.search(b"AA", |seed| {
+            observed.insert(seed.pattern_idx);
+        });
+        assert!(observed.contains(&7));
     }
 }

@@ -6,9 +6,28 @@ rust-version = "1.88"
 description = "A high-performance graph execution backend for sequencing-read preprocessing"
 license = "MIT"
 repository = "https://github.com/COMBINE-lab/ANTISEQUENCE"
+homepage = "https://github.com/COMBINE-lab/ANTISEQUENCE"
+documentation = "https://docs.rs/antisequence"
 readme = "README.md"
+include = [
+    "/src/**",
+    "/examples/**",
+    "/example_data/**",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CITATION.cff",
+    "/LICENSE",
+]
 keywords = ["bioinformatics", "fastq", "sequencing", "preprocessing"]
 categories = ["science"]
+
+[package.metadata.docs.rs]
+# docs.rs must not combine the mutually exclusive baseline and release backends.
+all-features = false
+features = ["accelerated-gzip"]
 
 [dependencies]
 needletail = "0.5"
@@ -17,9 +36,9 @@ rustc-hash = "1.1"
 hashbrown = "0.17"
 flate2 = { version = "1.0", features = ["zlib-rs"], default-features = false }
 gzp = { version = "2.0.2", default-features = false, features = ["deflate", "flate2"] }
-rapidgzip-core = "0.2.0"
+rapidgzip-core = { version = "0.2.0", optional = true }
 regex = "1.8"
-thiserror = "1.0"
+thiserror = "2.0"
 # 0.8.6 fixes RUSTSEC-2026-0097 while preserving the deterministic 0.8 API
 # and Xoshiro stream used by ambiguity-policy regression tests.
 rand = { version = "0.8.6", default-features = false }
@@ -39,7 +58,17 @@ mimalloc = { version = "0.1", optional = true }
 jemallocator = { version = "0.5", optional = true }
 
 [features]
-default = []
+# A library must not silently raise the CPU floor of downstream programs.
+# Baseline builds therefore use SSE2 on x86_64 and NEON on aarch64. Binary
+# applications that publish architecture-tuned artifacts should select
+# `release-simd`: AVX2 on x86_64 and NEON on aarch64.
+default = ["baseline-simd"]
+baseline-simd = ["dep:block-aligner-baseline"]
+release-simd = ["dep:block-aligner-release"]
+# Compatibility aliases retained for pre-release Git users.
+portable-simd = ["baseline-simd"]
+simd-avx2 = ["release-simd"]
+accelerated-gzip = ["dep:rapidgzip-core"]
 # Enable Microsoft mimalloc as global allocator
 mimalloc = ["dep:mimalloc"]
 # Enable jemalloc as global allocator
@@ -48,9 +77,14 @@ jemalloc = ["dep:jemallocator"]
 seed-baseline = []
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-block-aligner = { version = "0.5", features = ["simd_avx2"] }
+block-aligner-baseline = { package = "block-aligner", version = "0.5", optional = true, features = ["simd_sse2"] }
+block-aligner-release = { package = "block-aligner", version = "0.5", optional = true, features = ["simd_avx2"] }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-block-aligner = { version = "0.5", features = ["simd_neon"] }
+block-aligner-baseline = { package = "block-aligner", version = "0.5", optional = true, features = ["simd_neon"] }
+block-aligner-release = { package = "block-aligner", version = "0.5", optional = true, features = ["simd_neon"] }
+
+[dev-dependencies]
+proptest = "1.7"
 
 [profile.bench]
 opt-level = 3

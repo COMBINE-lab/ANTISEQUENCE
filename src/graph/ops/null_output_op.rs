@@ -21,7 +21,35 @@ impl<T: Trace> GraphNode<T> for NullOutputOp {
         NodeStage::Output
     }
 
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn cost_class(&self) -> CostClass {
+        CostClass::Constant
+    }
+
     fn supports_prepared_output(&self) -> bool {
+        true
+    }
+
+    fn has_explicit_name_observation(&self) -> bool {
+        true
+    }
+
+    fn supports_direct_projection(&self) -> bool {
         true
     }
 
@@ -32,6 +60,15 @@ impl<T: Trace> GraphNode<T> for NullOutputOp {
     fn prepare_output(
         &self,
         _reads: &[Read],
+        _recycled: Option<PreparedOutput>,
+    ) -> Result<PreparedOutput> {
+        Ok(PreparedOutput::Passthrough)
+    }
+
+    fn prepare_output_projected(
+        &self,
+        _reads: &[Read],
+        _projections: &[DirectReadProjection<'_>],
         _recycled: Option<PreparedOutput>,
     ) -> Result<PreparedOutput> {
         Ok(PreparedOutput::Passthrough)

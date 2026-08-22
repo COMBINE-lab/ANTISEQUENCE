@@ -23,6 +23,32 @@ impl TrimOp {
 }
 
 impl<T: Trace> GraphNode<T> for TrimOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Sequence
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn is_semantic_noop(&self) -> bool {
+        self.labels.is_empty()
+    }
+
+    fn adjacent_optimization_signature(&self) -> Option<AdjacentOptimizationSignature> {
+        Some(AdjacentOptimizationSignature::IdempotentTrim(
+            self.labels.clone(),
+        ))
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             self.labels

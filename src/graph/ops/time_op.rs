@@ -44,6 +44,32 @@ impl<T: Trace> GraphNode<T> for TimeOp<T> {
         &[]
     }
 
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        self.graph.validate_liveness_from(live_out)
+    }
+
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
+    ) -> Vec<GraphOptimizationReport> {
+        vec![self
+            .graph
+            .optimize_for_compilation_from(optimization, live_out)]
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        self.graph.finish_existing()
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

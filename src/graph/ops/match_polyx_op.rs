@@ -2,6 +2,7 @@ use crate::graph::*;
 
 pub struct MatchPolyXOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     label: Label,
     new_label1: Option<Label>,
     new_label2: Option<Label>,
@@ -22,11 +23,20 @@ impl MatchPolyXOp {
         transform_expr.check_size(1, 2, Self::NAME);
         transform_expr.check_same_str_type(Self::NAME);
 
+        let new_label1 = transform_expr.after_label(0, Self::NAME);
+        let new_label2 = transform_expr.after_label(1, Self::NAME);
+        let produced_names = new_label1
+            .iter()
+            .chain(new_label2.iter())
+            .cloned()
+            .map(LabelOrAttr::Label)
+            .collect();
         Self {
             required_names: vec![transform_expr.before(0).into()],
+            produced_names,
             label: transform_expr.before(0),
-            new_label1: transform_expr.after_label(0, Self::NAME),
-            new_label2: transform_expr.after_label(1, Self::NAME),
+            new_label1,
+            new_label2,
             x,
             end,
             identity,
@@ -35,6 +45,26 @@ impl MatchPolyXOp {
 }
 
 impl<T: Trace> GraphNode<T> for MatchPolyXOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn cost_class(&self) -> CostClass {
+        CostClass::Search
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             let string = read

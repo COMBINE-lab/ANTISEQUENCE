@@ -4,6 +4,9 @@
 //! keeps FASTQ generation and input cloning outside the measured interval, and
 //! emits machine-readable JSON for the reproducible benchmark harness.
 
+#![recursion_limit = "256"]
+
+use antisequence::expr::{attr, label, lane_attr, Expr};
 use antisequence::graph::*;
 use antisequence::*;
 use flate2::{write::GzEncoder, Compression};
@@ -30,6 +33,7 @@ struct Args {
     statistics_level: StatisticsLevel,
     mode: Mode,
     execution: Execution,
+    pipeline_input_mode: PipelineInputMode,
     queue_capacity: Option<usize>,
     max_in_flight_batches: Option<usize>,
     batch_size: Option<usize>,
@@ -46,10 +50,17 @@ struct Args {
     gzip_level: u32,
     gzip_threads: usize,
     gzip_block_size: usize,
+    terminal_projection: bool,
+    direct_output_rendering: bool,
+    graph_optimization: bool,
+    fork_reads: bool,
+    control_metadata: bool,
+    interval_metadata: bool,
 }
 
 #[derive(Clone, Copy)]
 enum Execution {
+    Auto,
     WholeGraphWorkers,
     PipelineUnordered,
     PipelineOrdered,
@@ -108,6 +119,7 @@ fn parse_args() -> Args {
         statistics_level: StatisticsLevel::Off,
         mode: Mode::Hamming,
         execution: Execution::WholeGraphWorkers,
+        pipeline_input_mode: PipelineInputMode::WorkerLocal,
         queue_capacity: None,
         max_in_flight_batches: None,
         batch_size: None,
@@ -124,6 +136,12 @@ fn parse_args() -> Args {
         gzip_level: 6,
         gzip_threads: 4,
         gzip_block_size: 128 * 1024,
+        terminal_projection: false,
+        direct_output_rendering: true,
+        graph_optimization: true,
+        fork_reads: false,
+        control_metadata: false,
+        interval_metadata: false,
     };
     let mut cli = std::env::args().skip(1);
     while let Some(flag) = cli.next() {
@@ -157,13 +175,24 @@ fn parse_args() -> Args {
             }
             "--execution" => {
                 args.execution = match cli.next().expect("--execution value").as_str() {
+                    "auto" => Execution::Auto,
                     "whole-graph" => Execution::WholeGraphWorkers,
                     "pipeline" => Execution::PipelineUnordered,
                     "pipeline-ordered" => Execution::PipelineOrdered,
                     value => panic!(
-                        "unknown execution {value:?}; expected whole-graph, pipeline, or pipeline-ordered"
+                        "unknown execution {value:?}; expected auto, whole-graph, pipeline, or pipeline-ordered"
                     ),
                 }
+            }
+            "--pipeline-input-mode" => {
+                args.pipeline_input_mode =
+                    match cli.next().expect("--pipeline-input-mode value").as_str() {
+                        "worker-local" => PipelineInputMode::WorkerLocal,
+                        "dedicated-reader" => PipelineInputMode::DedicatedReader,
+                        value => panic!(
+                            "unknown pipeline input mode {value:?}; expected worker-local or dedicated-reader"
+                        ),
+                    }
             }
             "--queue-capacity" => {
                 args.queue_capacity = Some(
@@ -296,6 +325,12 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("gzip block size")
             }
+            "--terminal-projection" => args.terminal_projection = true,
+            "--no-direct-output-rendering" => args.direct_output_rendering = false,
+            "--no-graph-optimization" => args.graph_optimization = false,
+            "--fork" => args.fork_reads = true,
+            "--control-metadata" => args.control_metadata = true,
+            "--interval-metadata" => args.interval_metadata = true,
             "--mode" => {
                 args.mode = match cli.next().expect("--mode value").as_str() {
                     "passthrough" => Mode::Passthrough,
@@ -315,7 +350,8 @@ fn parse_args() -> Args {
                      [--repetitions N] [--statistics] \
                      [--statistics-level off|basic|detailed] \
                      [--mode passthrough|hamming|seeded|edit-dp] \
-                     [--execution whole-graph|pipeline|pipeline-ordered] \
+                     [--execution auto|whole-graph|pipeline|pipeline-ordered] \
+                     [--pipeline-input-mode worker-local|dedicated-reader] \
                      [--queue-capacity N] [--max-in-flight-batches N] [--batch-size N] \
                      [--output null|plain|gzip|parallel-gzip|parallel-gzip-stream] \
                      [--gzip-threads N] [--gzip-block-size BYTES] [--edit-pattern-length N] \
@@ -324,7 +360,9 @@ fn parse_args() -> Args {
                      [--seed-patterns N] [--seed-pattern-length N] \
                      [--seed-text-length N] [--seed-scenario exact|no-match|repetitive] \
                      [--fastq-read-length N] [--fastq-entropy repeated|per-read] \
-                     [--gzip-level 0..9]"
+                     [--gzip-level 0..9] [--terminal-projection] \
+                     [--no-direct-output-rendering] [--no-graph-optimization] [--fork] \
+                     [--control-metadata|--interval-metadata]"
                 );
                 std::process::exit(0);
             }
@@ -334,10 +372,14 @@ fn parse_args() -> Args {
     assert!(args.reads > 0, "reads must be positive");
     assert!(args.threads > 0, "threads must be positive");
     assert!(args.repetitions > 0, "repetitions must be positive");
-    assert!(args.queue_capacity.map_or(true, |value| value > 0));
-    assert!(args.max_in_flight_batches.map_or(true, |value| value > 0));
-    assert!(args.batch_size.map_or(true, |value| value > 0));
-    assert!(args.fastq_read_length.map_or(true, |value| value > 0));
+    assert!(
+        !(args.control_metadata && args.interval_metadata),
+        "choose at most one metadata benchmark scope"
+    );
+    assert!(args.queue_capacity.is_none_or(|value| value > 0));
+    assert!(args.max_in_flight_batches.is_none_or(|value| value > 0));
+    assert!(args.batch_size.is_none_or(|value| value > 0));
+    assert!(args.fastq_read_length.is_none_or(|value| value > 0));
     assert!(args.gzip_level <= 9, "gzip level must be in 0..=9");
     assert!(args.gzip_threads > 0, "gzip threads must be positive");
     assert!(
@@ -493,6 +535,29 @@ fn build_graph(input: Vec<u8>, args: &Args) -> (Graph, Arc<AtomicU64>) {
             ));
         }
     }
+    if args.terminal_projection {
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"ACGTACGTACGTACGT".to_vec()),
+                ProjectPart::Label(label("seq1.*")),
+            ],
+        ));
+    }
+    if args.fork_reads {
+        let mut branch = Graph::new();
+        branch.add(NullOutputOp::new());
+        graph.add(ForkOp::new(branch));
+    }
+    if args.control_metadata {
+        let route = lane_attr(1, b"route");
+        graph.add(SetOp::new(route.clone(), b"keep".to_vec()));
+        graph.add(RetainOp::new(Expr::from(route).eq(b"keep".to_vec())));
+    } else if args.interval_metadata {
+        let route = attr(b"seq1.*.route");
+        graph.add(SetOp::new(route.clone(), b"keep".to_vec()));
+        graph.add(RetainOp::new(Expr::from(route).eq(b"keep".to_vec())));
+    }
     graph.set_statistics_level(args.statistics_level);
     match args.output {
         OutputMode::Null => {
@@ -540,33 +605,53 @@ fn main() {
     let mut seconds = Vec::with_capacity(args.repetitions);
     let mut statistics_aggregation_seconds = Vec::with_capacity(args.repetitions);
     let mut pipeline_reports = Vec::with_capacity(args.repetitions);
+    let mut execution_plans = Vec::with_capacity(args.repetitions);
+    let mut optimization_reports = Vec::with_capacity(args.repetitions);
     let mut output_byte_counts = Vec::with_capacity(args.repetitions);
 
     for _ in 0..args.repetitions {
         let build_start = Instant::now();
         let (graph, output_bytes) = build_graph(input.clone(), &args);
+        let graph = graph
+            .compile_with(GraphOptimizationConfig {
+                enabled: args.graph_optimization,
+                ..GraphOptimizationConfig::default()
+            })
+            .expect("compile benchmark graph");
         graph_build_seconds.push(build_start.elapsed().as_secs_f64());
         let start = Instant::now();
-        let report = match args.execution {
-            Execution::WholeGraphWorkers => {
-                graph.try_run_with_threads(args.threads).expect("graph run");
-                None
-            }
-            Execution::PipelineUnordered | Execution::PipelineOrdered => {
-                let mut config = PipelineConfig::new(args.threads);
-                config.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
-                if let Some(queue_capacity) = args.queue_capacity {
-                    config.queue_capacity = queue_capacity;
-                }
-                if let Some(max_in_flight_batches) = args.max_in_flight_batches {
-                    config.max_in_flight_batches = max_in_flight_batches;
-                }
-                if let Some(batch_size) = args.batch_size {
-                    config.batch_size = batch_size;
-                }
-                Some(graph.try_run_pipeline(config).expect("pipeline run"))
-            }
+        let mut request = ExecutionRequest::new(args.threads);
+        request.mode = match args.execution {
+            Execution::Auto => ExecutionMode::Auto,
+            Execution::WholeGraphWorkers => ExecutionMode::WholeGraph,
+            Execution::PipelineUnordered | Execution::PipelineOrdered => ExecutionMode::Pipeline,
         };
+        request.pipeline.preserve_order = matches!(args.execution, Execution::PipelineOrdered);
+        request.pipeline.direct_output_rendering = args.direct_output_rendering;
+        request.pipeline.input_mode = args.pipeline_input_mode;
+        request.batch_planning.automatic_queue_capacity = args.queue_capacity.is_none();
+        request.batch_planning.automatic_max_in_flight = args.max_in_flight_batches.is_none();
+        request.batch_planning.automatic_batch_size = args.batch_size.is_none();
+        request.batch_planning.estimated_bases_per_fragment = args.fastq_read_length.unwrap_or(150);
+        request.batch_planning.compressed_output = matches!(
+            args.output,
+            OutputMode::Gzip | OutputMode::ParallelGzip | OutputMode::ParallelGzipStream
+        );
+        if let Some(queue_capacity) = args.queue_capacity {
+            request.pipeline.queue_capacity = queue_capacity;
+        }
+        if let Some(max_in_flight_batches) = args.max_in_flight_batches {
+            request.pipeline.max_in_flight_batches = max_in_flight_batches;
+        }
+        if let Some(batch_size) = args.batch_size {
+            request.pipeline.batch_size = batch_size;
+        }
+        let planned = graph
+            .try_run_planned(request)
+            .expect("planned benchmark run");
+        let report = planned.pipeline;
+        let plan = planned.plan;
+        let optimization_report = graph.optimization_report().clone();
         let aggregation_start = Instant::now();
         if args.statistics_level.is_enabled() {
             std::hint::black_box((
@@ -583,6 +668,8 @@ fn main() {
         seconds.push(start.elapsed().as_secs_f64());
         output_byte_counts.push(output_bytes.load(Ordering::Relaxed));
         pipeline_reports.push(report);
+        execution_plans.push(plan);
+        optimization_reports.push(optimization_report);
     }
 
     let mean_seconds = seconds.iter().sum::<f64>() / seconds.len() as f64;
@@ -595,6 +682,7 @@ fn main() {
         Mode::EditDp => "edit-dp",
     };
     let execution = match args.execution {
+        Execution::Auto => "auto",
         Execution::WholeGraphWorkers => "whole-graph",
         Execution::PipelineUnordered => "pipeline",
         Execution::PipelineOrdered => "pipeline-ordered",
@@ -636,6 +724,10 @@ fn main() {
             "mode": mode,
             "edit_backend": edit_backend,
             "execution": execution,
+            "pipeline_input_mode": match args.pipeline_input_mode {
+                PipelineInputMode::WorkerLocal => "worker-local",
+                PipelineInputMode::DedicatedReader => "dedicated-reader",
+            },
             "output": output,
             "edit_pattern_length": args.edit_pattern_length,
             "edit_max_edits": args.edit_max_edits,
@@ -653,6 +745,12 @@ fn main() {
             "gzip_level": args.gzip_level,
             "gzip_threads": args.gzip_threads,
             "gzip_block_size": args.gzip_block_size,
+            "terminal_projection": args.terminal_projection,
+            "direct_output_rendering": args.direct_output_rendering,
+            "graph_optimization": args.graph_optimization,
+            "fork_reads": args.fork_reads,
+            "control_metadata": args.control_metadata,
+            "interval_metadata": args.interval_metadata,
             "reads": args.reads,
             "threads": args.threads,
             "queue_capacity": args.queue_capacity.unwrap_or(default_pipeline_config.queue_capacity),
@@ -668,6 +766,8 @@ fn main() {
             "mean_graph_build_seconds": mean_graph_build_seconds,
             "mean_reads_per_second": args.reads as f64 / mean_seconds,
             "pipeline_reports": pipeline_reports,
+            "execution_plans": execution_plans,
+            "optimization_reports": optimization_reports,
         }))
         .expect("serialize benchmark result")
     );

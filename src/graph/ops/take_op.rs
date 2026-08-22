@@ -14,6 +14,18 @@ impl<B: RangeBounds<usize> + Send + Sync> TakeOp<B> {
 }
 
 impl<B: RangeBounds<usize> + Send + Sync, T: Trace> GraphNode<T> for TakeOp<B> {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&[])
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::None
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let last_idx_in_batch = reads.last().map(|r| r.first_idx());
 

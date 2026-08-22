@@ -1,4 +1,3 @@
 /target
-/Cargo.lock
 /example_output
 *.trace.json

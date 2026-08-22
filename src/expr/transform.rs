@@ -26,32 +26,59 @@ impl TransformExpr {
     }
 
     pub fn check_size(&self, before_size: usize, after_size: usize, context: &'static str) {
-        assert_eq!(
-            before_size,
-            self.before.len(),
-            "Number of labels before the \"->\" must be {}, only found {} labels for {}",
-            before_size,
-            self.before.len(),
-            context
-        );
-        assert_eq!(after_size, self.after.len(), "Number of labels or attributes after the \"->\" must be {}, only found {} labels or attributes for {}", after_size, self.after.len(), context);
+        self.try_check_size(before_size, after_size, context)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    pub fn try_check_size(
+        &self,
+        before_size: usize,
+        after_size: usize,
+        context: &'static str,
+    ) -> Result<()> {
+        if self.before.len() != before_size || self.after.len() != after_size {
+            return Err(Error::InvalidOperation {
+                operation: context,
+                reason: format!(
+                    "expected {before_size} input label(s) and {after_size} output name(s), found {} and {}",
+                    self.before.len(),
+                    self.after.len()
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub fn check_same_str_type(&self, context: &'static str) {
-        let str_type = self.before[0].str_type;
-        assert!(
-            self.before.iter().all(|l| l.str_type == str_type),
-            "String types before the \"->\" must be the same for {}",
-            context
-        );
-        assert!(
-            self.after.iter().all(|label_or_attr| label_or_attr
-                .as_ref()
-                .map(|l| l.str_type() == str_type)
-                .unwrap_or(true)),
-            "String types after the \"->\" must be the same for {}",
-            context
-        );
+        self.try_check_same_str_type(context)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    pub fn try_check_same_str_type(&self, context: &'static str) -> Result<()> {
+        let Some(first) = self.before.first() else {
+            return Err(Error::InvalidOperation {
+                operation: context,
+                reason: "transform expression has no input labels".to_owned(),
+            });
+        };
+        let str_type = first.str_type;
+        if !self.before.iter().all(|label| label.str_type == str_type) {
+            return Err(Error::InvalidOperation {
+                operation: context,
+                reason: "input labels belong to different FASTQ lanes".to_owned(),
+            });
+        }
+        if !self.after.iter().all(|name| {
+            name.as_ref()
+                .map(|name| name.str_type() == str_type)
+                .unwrap_or(true)
+        }) {
+            return Err(Error::InvalidOperation {
+                operation: context,
+                reason: "output names do not belong to the input FASTQ lane".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub fn before(&self, i: usize) -> Label {
@@ -59,19 +86,47 @@ impl TransformExpr {
     }
 
     pub fn after_label(&self, i: usize, context: &'static str) -> Option<Label> {
-        self.after[i].clone().map(|a| if let LabelOrAttr::Label(l) = a {
-            l
-        } else {
-            panic!("Expected type.label after the \"->\" in the transform expression for {context}")
-        })
+        self.try_after_label(i, context)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_after_label(&self, i: usize, context: &'static str) -> Result<Option<Label>> {
+        match self.after.get(i).cloned() {
+            Some(Some(LabelOrAttr::Label(label))) => Ok(Some(label)),
+            Some(Some(
+                LabelOrAttr::Attr(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_),
+            )) => Err(Error::InvalidOperation {
+                operation: context,
+                reason: format!("output {i} must be a label, not an attribute"),
+            }),
+            Some(None) => Ok(None),
+            None => Err(Error::InvalidOperation {
+                operation: context,
+                reason: format!("output index {i} is out of bounds"),
+            }),
+        }
     }
 
     pub fn after_attr(&self, i: usize, context: &'static str) -> Option<Attr> {
-        self.after[i].clone().map(|a| if let LabelOrAttr::Attr(a) = a {
-            a
-        } else {
-            panic!("Expected type.label.attr after the \"->\" in the transform expression for {context}")
-        })
+        self.try_after_attr(i, context)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_after_attr(&self, i: usize, context: &'static str) -> Result<Option<Attr>> {
+        match self.after.get(i).cloned() {
+            Some(Some(LabelOrAttr::Attr(attr))) => Ok(Some(attr)),
+            Some(Some(
+                LabelOrAttr::Label(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_),
+            )) => Err(Error::InvalidOperation {
+                operation: context,
+                reason: format!("output {i} must be an attribute, not a label"),
+            }),
+            Some(None) => Ok(None),
+            None => Err(Error::InvalidOperation {
+                operation: context,
+                reason: format!("output index {i} is out of bounds"),
+            }),
+        }
     }
 }
 

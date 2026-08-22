@@ -2,13 +2,13 @@ use std::borrow::Cow;
 use std::marker::{Send, Sync};
 use std::ops::{Add, Bound, Div, Mul, Not, RangeBounds, Sub};
 
-use crate::errors::NameError;
+use crate::errors::{Name, NameError};
 use crate::expr::*;
 use crate::read::*;
 
 const UNKNOWN_QUAL: u8 = b'I';
 
-static NUC: [u8; 4] = [b'A', b'C', b'G', b'T'];
+static NUC: [u8; 4] = *b"ACGT";
 static COMP_LUT: [u8; 256] = {
     let mut l = [0u8; 256];
     let mut i = 0;
@@ -164,6 +164,11 @@ impl Expr {
         self.node.required_names()
     }
 
+    #[inline]
+    fn is_read_dependent(&self) -> bool {
+        self.node.is_read_dependent()
+    }
+
     /// Apply optimization passes.
     ///
     /// Returns whether the result is just a constant.
@@ -172,7 +177,7 @@ impl Expr {
     }
 
     fn propagate_const(&mut self) -> bool {
-        if !self.required_names().is_empty() {
+        if self.is_read_dependent() {
             return false;
         }
 
@@ -248,6 +253,23 @@ pub trait ExprNode {
         use_qual: bool,
     ) -> std::result::Result<EvalData<'a>, NameError>;
     fn required_names(&self) -> Vec<LabelOrAttr>;
+
+    /// Whether evaluation may inspect any part of the current read.
+    ///
+    /// This is deliberately separate from `required_names`: existence tests
+    /// have no required input but are still data-dependent. Custom expression
+    /// nodes default to dependent so constant folding remains conservative.
+    fn is_read_dependent(&self) -> bool {
+        true
+    }
+}
+
+fn range_is_read_dependent(range: &(Bound<Expr>, Bound<Expr>)) -> bool {
+    let bound_is_dependent = |bound: &Bound<Expr>| match bound {
+        Bound::Included(expr) | Bound::Excluded(expr) => expr.is_read_dependent(),
+        Bound::Unbounded => false,
+    };
+    bound_is_dependent(&range.0) || bound_is_dependent(&range.1)
 }
 
 macro_rules! bool_binary_ops {
@@ -277,6 +299,10 @@ macro_rules! bool_binary_ops {
                 let mut res = self.left.required_names();
                 res.append(&mut self.right.required_names());
                 res
+            }
+
+            fn is_read_dependent(&self) -> bool {
+                self.left.is_read_dependent() || self.right.is_read_dependent()
             }
         }
     };
@@ -318,6 +344,10 @@ macro_rules! num_binary_ops {
                 res.append(&mut self.right.required_names());
                 res
             }
+
+            fn is_read_dependent(&self) -> bool {
+                self.left.is_read_dependent() || self.right.is_read_dependent()
+            }
         }
     };
 }
@@ -348,6 +378,10 @@ impl ExprNode for NotNode {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.boolean.required_names()
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.boolean.is_read_dependent()
     }
 }
 
@@ -381,6 +415,10 @@ impl ExprNode for EqNode {
         let mut res = self.left.required_names();
         res.append(&mut self.right.required_names());
         res
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.left.is_read_dependent() || self.right.is_read_dependent()
     }
 }
 
@@ -438,6 +476,10 @@ impl ExprNode for NormalizeNode {
             .map(|e| res.append(&mut e.required_names()));
         res
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent() || range_is_read_dependent(&self.range)
+    }
 }
 
 struct PadNode {
@@ -490,6 +532,12 @@ impl ExprNode for PadNode {
         res.append(&mut self.len.required_names());
         res
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent()
+            || self.pad_char.is_read_dependent()
+            || self.len.is_read_dependent()
+    }
 }
 
 struct RevCompNode {
@@ -517,6 +565,10 @@ impl ExprNode for RevCompNode {
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.string.required_names()
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent()
+    }
 }
 
 struct RevNode {
@@ -537,6 +589,10 @@ impl ExprNode for RevNode {
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.string.required_names()
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent()
+    }
 }
 
 struct LenNode {
@@ -555,6 +611,10 @@ impl ExprNode for LenNode {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.string.required_names()
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent()
     }
 }
 
@@ -583,6 +643,10 @@ impl ExprNode for IntNode {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.convert.required_names()
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.convert.is_read_dependent()
     }
 }
 
@@ -614,6 +678,10 @@ impl ExprNode for FloatNode {
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.convert.required_names()
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.convert.is_read_dependent()
+    }
 }
 
 struct BytesNode {
@@ -638,6 +706,10 @@ impl ExprNode for BytesNode {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.convert.required_names()
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.convert.is_read_dependent()
     }
 }
 
@@ -665,6 +737,10 @@ impl ExprNode for RepeatNode {
         let mut res = self.string.required_names();
         res.append(&mut self.times.required_names());
         res
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent() || self.times.is_read_dependent()
     }
 }
 
@@ -695,6 +771,10 @@ impl ExprNode for ConcatNode {
         let mut res = self.left.required_names();
         res.append(&mut self.right.required_names());
         res
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.left.is_read_dependent() || self.right.is_read_dependent()
     }
 }
 
@@ -735,6 +815,10 @@ impl ExprNode for ConcatAllNode {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         self.nodes.iter().flat_map(|n| n.required_names()).collect()
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.nodes.iter().any(Expr::is_read_dependent)
     }
 }
 
@@ -780,6 +864,10 @@ impl ExprNode for SliceNode {
             .map(|e| res.append(&mut e.required_names()));
         res
     }
+
+    fn is_read_dependent(&self) -> bool {
+        self.string.is_read_dependent() || range_is_read_dependent(&self.range)
+    }
 }
 
 struct InBoundsNode {
@@ -807,6 +895,10 @@ impl ExprNode for InBoundsNode {
             .end_bound()
             .map(|e| res.append(&mut e.required_names()));
         res
+    }
+
+    fn is_read_dependent(&self) -> bool {
+        self.num.is_read_dependent() || range_is_read_dependent(&self.range)
     }
 }
 
@@ -865,6 +957,53 @@ impl ExprNode for Attr {
 
     fn required_names(&self) -> Vec<LabelOrAttr> {
         vec![LabelOrAttr::Attr(self.clone())]
+    }
+}
+
+fn control_data_eval<'a>(data: &'a Data, use_qual: bool) -> EvalData<'a> {
+    if use_qual {
+        if let Some(bytes) = data.as_bytes() {
+            return EvalData::Bytes(Cow::Owned(vec![UNKNOWN_QUAL; bytes.len()]));
+        }
+    }
+    match data {
+        Data::Bool(value) => EvalData::Bool(*value),
+        Data::Int(value) => EvalData::Int(*value),
+        Data::Float(value) => EvalData::Float(*value),
+        Data::InlineBytes(value) => EvalData::Bytes(Cow::Borrowed(value.as_bytes())),
+        Data::Bytes(value) => EvalData::Bytes(Cow::Borrowed(value)),
+    }
+}
+
+impl ExprNode for RecordAttr {
+    fn eval<'a>(
+        &'a self,
+        read: &'a Read,
+        use_qual: bool,
+    ) -> std::result::Result<EvalData<'a>, NameError> {
+        read.record_data(self.attr)
+            .map(|data| control_data_eval(data, use_qual))
+            .ok_or(NameError::NotInRead(Name::Attr(self.attr)))
+    }
+
+    fn required_names(&self) -> Vec<LabelOrAttr> {
+        vec![LabelOrAttr::RecordAttr(self.clone())]
+    }
+}
+
+impl ExprNode for LaneAttr {
+    fn eval<'a>(
+        &'a self,
+        read: &'a Read,
+        use_qual: bool,
+    ) -> std::result::Result<EvalData<'a>, NameError> {
+        read.lane_data(self.lane, self.attr)
+            .map(|data| control_data_eval(data, use_qual))
+            .ok_or(NameError::NotInRead(Name::Attr(self.attr)))
+    }
+
+    fn required_names(&self) -> Vec<LabelOrAttr> {
+        vec![LabelOrAttr::LaneAttr(self.clone())]
     }
 }
 
@@ -949,6 +1088,10 @@ impl ExprNode for Data {
     fn required_names(&self) -> Vec<LabelOrAttr> {
         Vec::new()
     }
+
+    fn is_read_dependent(&self) -> bool {
+        false
+    }
 }
 
 macro_rules! impl_expr_node_slice {
@@ -971,6 +1114,10 @@ macro_rules! impl_expr_node_slice {
             fn required_names(&self) -> Vec<LabelOrAttr> {
                 Vec::new()
             }
+
+            fn is_read_dependent(&self) -> bool {
+                false
+            }
         }
     };
 }
@@ -988,6 +1135,10 @@ macro_rules! impl_expr_node {
 
             fn required_names(&self) -> Vec<LabelOrAttr> {
                 Vec::new()
+            }
+
+            fn is_read_dependent(&self) -> bool {
+                false
             }
         }
     };
@@ -1490,6 +1641,15 @@ mod tests {
     fn test_optimize_with_label_not_constant() {
         let mut e = Expr::from(label("seq1.test"));
         assert!(!e.optimize());
+    }
+
+    #[test]
+    fn test_optimize_existence_checks_remain_read_dependent() {
+        let mut label_check = label_exists("seq1.test");
+        assert!(!label_check.optimize());
+
+        let mut attr_check = !attr_exists("seq1.test.attr");
+        assert!(!attr_check.optimize());
     }
 
     #[test]

@@ -16,16 +16,17 @@ usage() {
 Usage:
   ./scripts/bump_and_publish.sh <version> [--publish] [--dry-run] [--skip-tests]
 
-Validates the crate, updates Cargo.toml when <version> differs from the current
-version, commits the bump, creates and pushes v<version>, and optionally
-publishes the library to crates.io. Passing the current version is supported
-for the first release and creates the tag without a version-bump commit.
+Validates the crate, updates Cargo.toml and Cargo.lock when <version> differs
+from the current version, commits and pushes the bump, optionally publishes the
+library to crates.io, and only then creates and pushes v<version>. Passing the
+current version is supported for the first release and creates the tag without
+a version-bump commit.
 
 Options:
-  --publish     Publish the crate to crates.io after pushing the commit and tag
+  --publish     Publish the crate to crates.io before creating the public tag
   --dry-run     Validate packaging and print release actions without modifying,
                 committing, tagging, pushing, or publishing
-  --skip-tests  Skip cargo test --all-targets (use only after running it yourself)
+  --skip-tests  Skip the locked all-target test gate (use only after running it yourself)
   -h, --help    Show this help message
 EOF
 }
@@ -74,8 +75,10 @@ REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPOSITORY_ROOT"
 
 MANIFEST="Cargo.toml"
+LOCKFILE="Cargo.lock"
 TAG="v${VERSION}"
 MANIFEST_BACKUP=""
+LOCKFILE_BACKUP=""
 MANIFEST_UPDATED=false
 COMMIT_CREATED=false
 
@@ -83,14 +86,17 @@ cleanup() {
     local status=$?
     if [[ "$status" -ne 0 && "$DRY_RUN" == false && "$MANIFEST_UPDATED" == true && "$COMMIT_CREATED" == false ]]; then
         [[ -n "$MANIFEST_BACKUP" && -f "$MANIFEST_BACKUP" ]] && cp "$MANIFEST_BACKUP" "$MANIFEST"
-        echo "restored $MANIFEST after failure" >&2
+        [[ -n "$LOCKFILE_BACKUP" && -f "$LOCKFILE_BACKUP" ]] && cp "$LOCKFILE_BACKUP" "$LOCKFILE"
+        echo "restored $MANIFEST and $LOCKFILE after failure" >&2
     fi
     [[ -n "$MANIFEST_BACKUP" && -f "$MANIFEST_BACKUP" ]] && rm -f "$MANIFEST_BACKUP"
+    [[ -n "$LOCKFILE_BACKUP" && -f "$LOCKFILE_BACKUP" ]] && rm -f "$LOCKFILE_BACKUP"
     return "$status"
 }
 trap cleanup EXIT
 
 [[ -f "$MANIFEST" ]] || die "not found: $MANIFEST"
+[[ -f "$LOCKFILE" ]] || die "not found: $LOCKFILE"
 CURRENT_VERSION="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' "$MANIFEST" | head -1)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not determine package version"
 
@@ -103,6 +109,10 @@ fi
 ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
 [[ "$ORIGIN_URL" == "https://github.com/COMBINE-lab/ANTISEQUENCE.git" || "$ORIGIN_URL" == "git@github.com:COMBINE-lab/ANTISEQUENCE.git" ]] || \
     die "origin is not the COMBINE-lab/ANTISEQUENCE GitHub repository"
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "$CURRENT_BRANCH" != "main" && "$DRY_RUN" == false ]]; then
+    die "releases must be tagged from main (currently on $CURRENT_BRANCH); merge the reviewed branch first, or use --dry-run to validate from here"
+fi
 
 echo "Current version : $CURRENT_VERSION"
 echo "Release version : $VERSION"
@@ -114,8 +124,8 @@ echo
 echo "Preflight: cargo fmt --all --check"
 cargo fmt --all --check
 if [[ "$SKIP_TESTS" == false ]]; then
-    echo "Preflight: cargo test --all-targets"
-    cargo test --all-targets
+    echo "Preflight: cargo test --locked --all-targets --features accelerated-gzip"
+    cargo test --locked --all-targets --features accelerated-gzip
 else
     echo "Preflight: skipping tests (--skip-tests)"
 fi
@@ -124,10 +134,14 @@ if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
     echo "Updating package version: $CURRENT_VERSION -> $VERSION"
     if [[ "$DRY_RUN" == false ]]; then
         MANIFEST_BACKUP="$(mktemp "${TMPDIR:-/tmp}/antisequence-Cargo.toml.XXXXXX")"
+        LOCKFILE_BACKUP="$(mktemp "${TMPDIR:-/tmp}/antisequence-Cargo.lock.XXXXXX")"
         cp "$MANIFEST" "$MANIFEST_BACKUP"
+        cp "$LOCKFILE" "$LOCKFILE_BACKUP"
         sed -i.bak "/^\[package\]/,/^\[/{s/^version = \".*\"/version = \"${VERSION}\"/}" "$MANIFEST"
         rm -f "${MANIFEST}.bak"
         MANIFEST_UPDATED=true
+
+        cargo check --features accelerated-gzip
 
         UPDATED_VERSION="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' "$MANIFEST" | head -1)"
         [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "package version update failed"
@@ -138,11 +152,11 @@ else
     echo "Package is already at $VERSION; no version-bump commit is needed"
 fi
 
-echo "Preflight: cargo publish --dry-run"
+echo "Preflight: cargo publish --dry-run --locked"
 if [[ "$DRY_RUN" == true && "$CURRENT_VERSION" != "$VERSION" ]]; then
     echo "Dry-run validates the current package contents; the version rewrite is only printed"
 fi
-cargo publish --dry-run --allow-dirty
+cargo publish --dry-run --locked --allow-dirty
 
 if [[ "$DRY_RUN" == true ]]; then
     echo
@@ -151,20 +165,21 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 if [[ "$MANIFEST_UPDATED" == true ]]; then
-    run git add "$MANIFEST"
+    run git add "$MANIFEST" "$LOCKFILE"
     run git commit -m "chore(release): bump ANTISEQUENCE to v${VERSION}"
     COMMIT_CREATED=true
 fi
 
-run git tag -a "$TAG" -m "Release ${VERSION}"
 run git push origin HEAD
-run git push origin "$TAG"
 
 if [[ "$PUBLISH" == true ]]; then
-    run cargo publish
+    run cargo publish --locked
 else
     echo "Skipping crates.io publication; pass --publish to publish v${VERSION}"
 fi
+
+run git tag -a "$TAG" -m "Release ${VERSION}"
+run git push origin "$TAG"
 
 echo
 echo "ANTISEQUENCE release preparation complete for v${VERSION}"

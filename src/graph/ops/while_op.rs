@@ -25,7 +25,7 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(mut current_batch) = reads else {
-            panic!("Expected some reads!")
+            return Err(Error::MissingNodeInput(self.name()));
         };
 
         let mut final_results = Vec::with_capacity(current_batch.len());
@@ -83,6 +83,68 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
 
     fn required_names(&self) -> &[LabelOrAttr] {
         &self.required_names
+    }
+
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // A loop body's output feeds both the next condition evaluation and
+        // the eventual continuation. Iterate to the finite name-set fixed
+        // point so nested loops are checked recursively.
+        let mut live = live_out.to_vec();
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        loop {
+            let before = live.len();
+            for name in self.graph.validate_liveness_from(&live)? {
+                if !live.contains(&name) {
+                    live.push(name);
+                }
+            }
+            if live.len() == before {
+                return Ok(live);
+            }
+        }
+    }
+
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
+    ) -> Vec<GraphOptimizationReport> {
+        let mut body_live = live_out.to_vec();
+        for name in &self.required_names {
+            push_unique(&mut body_live, name.clone());
+        }
+        loop {
+            let before = body_live.len();
+            for name in self
+                .graph
+                .validate_liveness_from(&body_live)
+                .expect("loop liveness was validated before optimization")
+            {
+                push_unique(&mut body_live, name);
+            }
+            if body_live.len() == before {
+                break;
+            }
+        }
+        vec![self
+            .graph
+            .optimize_for_compilation_from(optimization, &body_live)]
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        self.graph.finish_existing()
     }
 
     fn name(&self) -> &'static str {

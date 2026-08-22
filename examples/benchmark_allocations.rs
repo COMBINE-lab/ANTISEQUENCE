@@ -8,6 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg_attr(any(feature = "mimalloc", feature = "jemalloc"), allow(dead_code))]
 struct CountingAllocator;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -42,6 +43,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+#[cfg(not(any(feature = "mimalloc", feature = "jemalloc")))]
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 

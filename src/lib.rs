@@ -10,15 +10,36 @@
 //! * Debugging sequencing pipelines
 //!
 //! ## Computation graph API
-//! To use ANTISEQUENCE, you first specify *operations* (read from fastq, trim reads, output to fastq, etc.)
-//! and add them to a [`Graph`]. Then, you run the graph, which executes all the operations on each
-//! read.
+//! To use ANTISEQUENCE, first add *operations* (read from FASTQ, transform,
+//! filter, output, and so on) to a [`GraphBuilder`](crate::graph::GraphBuilder).
+//! Compiling it produces a structurally immutable
+//! [`CompiledGraph`](crate::graph::CompiledGraph) for execution.
+//! [`Graph`](crate::graph::Graph) is retained as the legacy mutable
+//! construction API.
 //!
 //! See [`graph`] for all supported operations.
 //!
-//! Each operation in a graph contains a set of dependencies, which are labels and attributes
-//! that the operation requires to be present in the read. If the dependencies are not present,
-//! then the operation will be skipped.
+//! ```no_run
+//! use antisequence::graph::{GraphBuilder, InputFastqOp, NullOutputOp};
+//! use antisequence::trace::NoTrace;
+//! use std::io::Cursor;
+//!
+//! # fn main() -> Result<(), antisequence::errors::Error> {
+//! let input = b"@read\nACGT\n+\nIIII\n";
+//! let mut builder = GraphBuilder::<NoTrace>::new();
+//! builder.add(InputFastqOp::from_reader(Cursor::new(input))?);
+//! builder.add(NullOutputOp::new());
+//! let graph = builder.compile()?;
+//! graph.run()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Each operation declares its requirements and effects through an
+//! allocation-free [`OperationDescriptor`](crate::graph::OperationDescriptor).
+//! Missing requirements use an explicit
+//! [`MissingInputPolicy`](crate::graph::MissingInputPolicy): strict error,
+//! per-read rejection, or compatibility skip.
 //!
 //! ## Reads
 //! Here's an example fastq record:
@@ -99,9 +120,64 @@ cfg_if::cfg_if! {
     }
 }
 
+/// SIMD implementation compiled into ANTISEQUENCE's alignment backend.
+///
+/// This is build provenance, not the per-operation matcher-plan family. Binary
+/// applications should expose it in their version and run reports so release
+/// builds cannot silently fall back to a lower-width backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledSimdBackend {
+    X86Sse2,
+    X86Avx2,
+    Aarch64Neon,
+}
+
+impl CompiledSimdBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86Sse2 => "x86-sse2",
+            Self::X86Avx2 => "x86-avx2",
+            Self::Aarch64Neon => "aarch64-neon",
+        }
+    }
+
+    pub const fn cpu_requirement(self) -> &'static str {
+        match self {
+            Self::X86Sse2 => "x86-64-v1 (SSE2)",
+            Self::X86Avx2 => "x86_64 with AVX2",
+            Self::Aarch64Neon => "AArch64 (NEON)",
+        }
+    }
+}
+
+impl std::fmt::Display for CompiledSimdBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Return the alignment SIMD backend selected by Cargo features for this build.
+pub const fn compiled_simd_backend() -> CompiledSimdBackend {
+    #[cfg(all(target_arch = "x86_64", feature = "release-simd"))]
+    {
+        return CompiledSimdBackend::X86Avx2;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "baseline-simd"))]
+    {
+        return CompiledSimdBackend::X86Sse2;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return CompiledSimdBackend::Aarch64Neon;
+    }
+    #[allow(unreachable_code)]
+    CompiledSimdBackend::X86Sse2
+}
+
 pub mod errors;
 pub mod expr;
 pub mod graph;
+pub mod matcher;
 mod patterns;
 mod read;
 pub mod trace;
@@ -116,11 +192,26 @@ pub use crate::patterns::*;
 pub use crate::read::*;
 
 #[cfg(test)]
+mod simd_build_tests {
+    use super::{compiled_simd_backend, CompiledSimdBackend};
+
+    #[test]
+    fn compiled_backend_matches_selected_feature() {
+        #[cfg(all(target_arch = "x86_64", feature = "baseline-simd"))]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::X86Sse2);
+        #[cfg(all(target_arch = "x86_64", feature = "release-simd"))]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::X86Avx2);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::Aarch64Neon);
+    }
+}
+
+#[cfg(test)]
 mod pipeline_tests {
     use crate::expr::*;
     use crate::graph::*;
     use crate::inline_string::InlineString;
-    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns};
+    use crate::patterns::{AmbiguityPolicy, Pattern, Patterns, PositionAmbiguityPolicy};
     use crate::read::*;
     use crate::trace::NoTrace;
     use std::io::{Cursor, Write};
@@ -145,6 +236,152 @@ mod pipeline_tests {
         TransformExpr::from_bytes(s).unwrap()
     }
 
+    fn run_literal_match(
+        text: &[u8],
+        patterns: &[Vec<u8>],
+        match_type: MatchType,
+        statistics: StatisticsLevel,
+    ) -> (crate::matcher::MatcherBackend, Option<(usize, usize)>) {
+        let mut fastq = b"@read\n".to_vec();
+        fastq.extend_from_slice(text);
+        fastq.extend_from_slice(b"\n+\n");
+        fastq.extend(std::iter::repeat_n(b'I', text.len()));
+        fastq.push(b'\n');
+
+        let spec = crate::matcher::MatchSpec::from(match_type);
+        let transform = match spec.scope {
+            crate::matcher::MatchScope::Search | crate::matcher::MatchScope::Bounded { .. } => {
+                "seq1.* -> seq1.before, seq1.hit, seq1.after"
+            }
+            _ => "seq1.* -> seq1.hit",
+        };
+        let mut graph = Graph::<NoTrace>::new();
+        graph.set_statistics_level(statistics);
+        graph.add(InputFastqOp::from_reader(Cursor::new(fastq)).unwrap());
+        let matcher = graph.add(MatchAnyOp::new(
+            te(transform),
+            Patterns::from_strs(patterns),
+            match_type,
+        ));
+        let backend = matcher.matcher_plan().backend;
+        let (reads, _) = graph.run_one(None, &NoTrace).unwrap();
+        let candidate = reads.unwrap()[0]
+            .mapping(StrType::Seq(1), InlineString::new(b"hit"))
+            .ok()
+            .map(|mapping| (mapping.start, mapping.start + mapping.len));
+        (backend, candidate)
+    }
+
+    #[test]
+    fn literal_matcher_backends_agree_with_the_reference_matcher() {
+        use crate::matcher::{reference_match, MatchSpec, MatcherBackend};
+
+        let long_pattern = vec![b'A'; 70];
+        let mut long_query = long_pattern.clone();
+        long_query[35] = b'C';
+        let cases = vec![
+            (
+                b"ACGT".to_vec(),
+                vec![b"ACGT".to_vec()],
+                Exact,
+                MatcherBackend::DirectExact,
+            ),
+            (
+                b"GGACGTCC".to_vec(),
+                vec![b"ACGT".to_vec()],
+                ExactSearch,
+                MatcherBackend::ExactSearch,
+            ),
+            (
+                b"ACGN".to_vec(),
+                vec![b"ACGT".to_vec(), b"TTTT".to_vec()],
+                Hamming(Count(3)),
+                MatcherBackend::HammingLookup,
+            ),
+            (
+                b"GGCCGGTT".to_vec(),
+                vec![
+                    b"AAAA".to_vec(),
+                    b"CCCC".to_vec(),
+                    b"CCGG".to_vec(),
+                    b"TTTT".to_vec(),
+                ],
+                ExactSearch,
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGTAA".to_vec(),
+                vec![
+                    b"AAAAAAAAAA".to_vec(),
+                    b"CCCCCCCCCC".to_vec(),
+                    b"ACGTACGTAT".to_vec(),
+                    b"TTTTTTTTTT".to_vec(),
+                ],
+                Hamming(Count(9)),
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGT".to_vec(),
+                vec![
+                    b"AAAAAAAA".to_vec(),
+                    b"CCCCCCCC".to_vec(),
+                    b"ACGTACGA".to_vec(),
+                    b"TTTTTTTT".to_vec(),
+                ],
+                Edit(Count(1)),
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGTAA".to_vec(),
+                vec![b"ACGTACGTAT".to_vec(), b"TTTTTTTTTT".to_vec()],
+                Hamming(Count(9)),
+                MatcherBackend::ExhaustiveHamming,
+            ),
+            (
+                b"ACGTACGTACGTACGA".to_vec(),
+                vec![b"ACGTACGTACGTACGT".to_vec()],
+                Edit(Count(1)),
+                MatcherBackend::Myers64,
+            ),
+            (
+                long_query,
+                vec![long_pattern],
+                Edit(Count(1)),
+                MatcherBackend::MyersLong,
+            ),
+        ];
+
+        for (text, patterns, match_type, expected_backend) in cases {
+            let pattern_refs = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let reference = reference_match(&text, &pattern_refs, MatchSpec::from(match_type))
+                .expect("reference-supported literal matcher case");
+            assert_eq!(reference.len(), 1, "test case must have one best candidate");
+            let expected = Some((reference[0].start, reference[0].end));
+            let (backend, observed) =
+                run_literal_match(&text, &patterns, match_type, StatisticsLevel::Off);
+            assert_eq!(backend, expected_backend);
+            assert_eq!(observed, expected, "backend {backend:?} diverged");
+        }
+    }
+
+    #[test]
+    fn detailed_statistics_do_not_change_match_coordinates() {
+        let patterns = vec![b"AAAA".to_vec()];
+        let without = run_literal_match(
+            b"AAATAAAT",
+            &patterns,
+            EditSearch(Count(1)),
+            StatisticsLevel::Off,
+        );
+        let with = run_literal_match(
+            b"AAATAAAT",
+            &patterns,
+            EditSearch(Count(1)),
+            StatisticsLevel::Detailed,
+        );
+        assert_eq!(without, with);
+    }
+
     #[test]
     fn test_graph_basic_pipeline() {
         let fq = fastq_bytes(&[
@@ -166,6 +403,38 @@ mod pipeline_tests {
         assert!(output.contains("ACGTACGT"));
         assert!(output.contains("TGCATGCA"));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn zero_record_runs_materialize_valid_constant_outputs() {
+        for (parallel_members, suffix) in
+            [(false, "fastq"), (false, "fastq.gz"), (true, "fastq.gz")]
+        {
+            let path = std::env::temp_dir().join(format!(
+                "antisequence-empty-output-{}-{parallel_members}.{suffix}",
+                std::process::id()
+            ));
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(Vec::<u8>::new())).unwrap());
+            graph.add(
+                OutputFastqFileOp::from_file(path.to_string_lossy().into_owned())
+                    .with_parallel_gzip_members(parallel_members),
+            );
+            graph.run().unwrap();
+            assert!(path.is_file());
+            if suffix.ends_with(".gz") {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(&path).unwrap()),
+                    &mut decoded,
+                )
+                .unwrap();
+                assert!(decoded.is_empty());
+            } else {
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            }
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]
@@ -313,6 +582,63 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn unequal_lane_record_counts_error_in_both_directions() {
+        // Lane 0 running out first must not silently drop trailing lane-1
+        // records; both orders are hard errors.
+        let short = fastq_bytes(&[("read1", "AAAA", "IIII")]);
+        let long = fastq_bytes(&[
+            ("read1", "CCCC", "IIII"),
+            ("read2", "GGGG", "IIII"),
+            ("read3", "TTTT", "IIII"),
+        ]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(
+            InputFastqOp::from_readers(vec![Cursor::new(short.clone()), Cursor::new(long.clone())])
+                .unwrap(),
+        );
+        assert!(g.run().is_err());
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_readers(vec![Cursor::new(long), Cursor::new(short)]).unwrap());
+        assert!(g.run().is_err());
+    }
+
+    #[test]
+    fn bounded_match_tolerates_reads_shorter_than_window() {
+        // Reads shorter than the bounded window must yield no match, not a
+        // panic on an out-of-range slice.
+        for match_type in [
+            ExactBoundedMatch { from: 1, to: 6 },
+            HammingBoundedMatch {
+                threshold: Count(3),
+                from: 1,
+                to: 6,
+            },
+            EditBoundedMatch {
+                threshold: Count(1),
+                from: 1,
+                to: 6,
+            },
+        ] {
+            let fq = fastq_bytes(&[("read1", "AC", "II"), ("read2", "A", "I")]);
+            let patterns = Patterns::from_strs(["ACGT"]);
+
+            let mut g = Graph::<NoTrace>::new();
+            g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            g.add(MatchAnyOp::new(
+                te("seq1.* -> seq1.before, seq1.match, seq1.after"),
+                patterns,
+                match_type,
+            ));
+            let counter = g.add(CountOp::new([true]));
+            g.run().unwrap();
+
+            assert_eq!(counter.counts()[0], 2);
+        }
+    }
+
+    #[test]
     fn test_graph_match_distance_counts() {
         let g = Graph::<NoTrace>::new();
         let counts = g.match_distance_counts();
@@ -453,6 +779,257 @@ mod pipeline_tests {
         assert_eq!(dropped.ambiguity.accepted, 0);
     }
 
+    fn position_ambiguity_statistics(policy: PositionAmbiguityPolicy) -> MatchDistanceCounts {
+        let fq = fastq_bytes(&[("read1", "AAAACAAA", "IIIIIIII")]);
+        let patterns = Patterns::from_strs(["AAA"]).with_position_ambiguity_policy(policy);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            ExactSearch,
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        graph.match_distance_counts().remove(0)
+    }
+
+    #[test]
+    fn search_position_ambiguity_is_distinct_and_observable() {
+        let left = position_ambiguity_statistics(PositionAmbiguityPolicy::Leftmost);
+        assert_eq!(left.ambiguity.total, 0);
+        assert_eq!(left.ambiguity.position_total, 1);
+        assert_eq!(left.ambiguity.position_resolved_leftmost, 1);
+
+        let right = position_ambiguity_statistics(PositionAmbiguityPolicy::Rightmost);
+        assert_eq!(right.ambiguity.position_total, 1);
+        assert_eq!(right.ambiguity.position_resolved_rightmost, 1);
+
+        let dropped = position_ambiguity_statistics(PositionAmbiguityPolicy::NoMatch);
+        assert_eq!(dropped.ambiguity.position_total, 1);
+        assert_eq!(dropped.ambiguity.position_dropped, 1);
+    }
+
+    #[test]
+    fn position_quality_selects_the_low_quality_mismatch_window() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNACGA", "IIIIIIIIIII!")]);
+        let patterns = Patterns::from_strs(["ACGT"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(
+            MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                HammingSearch(Count(3)),
+            )
+            .retain_label_present("seq1.anchor"),
+        );
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(label("seq1.left"))],
+        ));
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        assert_eq!(
+            output_bytes.lock().unwrap().as_slice(),
+            b"@read1\nTCGTNNNN\n+\nIIIIIIII\n"
+        );
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.position_total, 1);
+        assert_eq!(report.ambiguity.position_resolved_quality, 1);
+        assert_eq!(report.ambiguity.position_dropped, 0);
+    }
+
+    #[test]
+    fn position_quality_drops_a_tie_without_a_sufficient_delta() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNACGA", "IIIIIIIIIIII")]);
+        let patterns = Patterns::from_strs(["ACGT"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            HammingSearch(Count(3)),
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.position_total, 1);
+        assert_eq!(report.ambiguity.position_resolved_quality, 0);
+        assert_eq!(report.ambiguity.position_dropped, 1);
+    }
+
+    #[test]
+    fn position_quality_rejects_edit_distance_until_gap_quality_is_defined() {
+        let patterns = Patterns::from_strs(["AAAA"])
+            .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
+        let error = MatchAnyOp::try_new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            EditSearch(Count(1)),
+        )
+        .err()
+        .expect("position-quality/edit construction must fail");
+        assert!(error
+            .to_string()
+            .contains("requires exact or Hamming search"));
+    }
+
+    #[test]
+    fn position_quality_metric_validation_covers_the_match_type_matrix() {
+        let patterns = || {
+            Patterns::from_strs(["AAAA"])
+                .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 })
+        };
+        for (match_type, transform) in [
+            (ExactSearch, "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (HammingSearch(Count(3)), "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (
+                ExactBoundedMatch { from: 0, to: 8 },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (
+                HammingBoundedMatch {
+                    threshold: Count(3),
+                    from: 0,
+                    to: 8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+        ] {
+            MatchAnyOp::try_new(te(transform), patterns(), match_type)
+                .expect("exact/Hamming position quality must remain supported");
+        }
+
+        for (match_type, transform) in [
+            (Edit(Count(1)), "seq1.* -> seq1.a"),
+            (EditPrefix(Count(1)), "seq1.* -> seq1.a, seq1.b"),
+            (EditSuffix(Count(1)), "seq1.* -> seq1.a, seq1.b"),
+            (EditSearch(Count(1)), "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (
+                EditBoundedMatch {
+                    threshold: Count(1),
+                    from: 0,
+                    to: 8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (GlobalAln(0.8), "seq1.* -> seq1.a"),
+            (
+                LocalAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (
+                PrefixAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b",
+            ),
+            (
+                SuffixAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b",
+            ),
+        ] {
+            let error = MatchAnyOp::try_new(te(transform), patterns(), match_type)
+                .err()
+                .expect("position quality must reject indel/alignment metrics");
+            assert!(error
+                .to_string()
+                .contains("requires exact or Hamming search"));
+        }
+    }
+
+    #[test]
+    fn pattern_quality_uses_each_searched_anchors_own_window() {
+        let fq = fastq_bytes(&[("read1", "TCGTNNNNTCGA", "IIIIIIII!III")]);
+        let patterns = Patterns::from_strs(["ACGT", "ACGA"])
+            .with_ambiguity_policy(AmbiguityPolicy::Quality { min_delta: 1 });
+        let output = SharedWriter::default();
+        let output_bytes = Arc::clone(&output.0);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(
+            MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                HammingSearch(Count(3)),
+            )
+            .retain_label_present("seq1.anchor"),
+        );
+        graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [ProjectPart::Label(label("seq1.left"))],
+        ));
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.try_run_with_threads(1).unwrap();
+
+        assert_eq!(
+            output_bytes.lock().unwrap().as_slice(),
+            b"@read1\nTCGTNNNN\n+\nIIIIIIII\n"
+        );
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.total, 1);
+        assert_eq!(report.ambiguity.resolved_quality, 1);
+        assert_eq!(report.ambiguity.dropped, 0);
+    }
+
+    #[test]
+    fn heterogeneous_exact_patterns_tie_by_distance_not_raw_match_count() {
+        let fq = fastq_bytes(&[("read1", "AAAA", "IIII")]);
+        let patterns =
+            Patterns::from_strs(["AAA", "AAAA"]).with_ambiguity_policy(AmbiguityPolicy::First);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+            patterns,
+            ExactSearch,
+        ));
+        graph.set_statistics_level(StatisticsLevel::Detailed);
+        graph.run().unwrap();
+        let report = graph.match_distance_counts().remove(0);
+        assert_eq!(report.ambiguity.total, 1);
+        assert_eq!(report.ambiguity.resolved_first, 1);
+    }
+
+    #[test]
+    fn nondefault_position_policy_covers_unseeded_approximate_search() {
+        for match_type in [HammingSearch(Count(3)), EditSearch(Count(1))] {
+            let fq = fastq_bytes(&[("read1", "AAATAAAT", "IIIIIIII")]);
+            let patterns = Patterns::from_strs(["AAAA"])
+                .with_position_ambiguity_policy(PositionAmbiguityPolicy::NoMatch);
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            graph.add(MatchAnyOp::new(
+                te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
+                patterns,
+                match_type,
+            ));
+            graph.set_statistics_level(StatisticsLevel::Detailed);
+            graph.run().unwrap();
+            let report = graph.match_distance_counts().remove(0);
+            assert_eq!(report.ambiguity.position_total, 1);
+            assert_eq!(report.ambiguity.position_dropped, 1);
+        }
+    }
+
     #[test]
     fn test_graph_interleaved_reader() {
         let fq = fastq_bytes(&[
@@ -487,7 +1064,9 @@ mod pipeline_tests {
         let mut graph = Graph::<NoTrace>::new();
         graph.add(InputFastqOp::from_interleaved_reader(Cursor::new(fq), 2).unwrap());
         let error = graph.try_run_with_threads(1).unwrap_err();
-        assert!(error.to_string().contains("Unpaired read"));
+        let message = error.to_string();
+        assert!(message.contains("expected 2 records, observed 1"));
+        assert!(message.contains("fragment 1"));
     }
 
     #[test]
@@ -698,6 +1277,24 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn arbitrary_reader_construction_is_fallible() {
+        let result = InputFastqOp::from_readers([Cursor::new(b"not FASTQ".to_vec())]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn writer_backed_output_reports_emitted_reads() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII"), ("read2", "TGCA", "IIII")]);
+        let output = SharedWriter::default();
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(output));
+        graph.set_statistics_level(StatisticsLevel::Basic);
+        graph.try_run_with_threads(1).unwrap();
+        assert_eq!(graph.final_output_reads(), Some(2));
+    }
+
+    #[test]
     fn test_prepared_pipeline_output_fastq_file_preserves_order() {
         let tmp = std::env::temp_dir().join(format!(
             "antiseq_test_prepared_file_{}.fastq",
@@ -729,6 +1326,110 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn direct_terminal_projection_matches_materialized_fastq_bytes() {
+        let input = fastq_bytes(&[("read1", "ACGT", "1234"), ("read2", "TGCA", "5678")]);
+
+        let materialized = SharedWriter::default();
+        let materialized_bytes = Arc::clone(&materialized.0);
+        let mut materialized_graph = Graph::<NoTrace>::new();
+        materialized_graph.add(InputFastqOp::from_reader(Cursor::new(input.clone())).unwrap());
+        materialized_graph.add(CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            2isize,
+        ));
+        materialized_graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"TT".to_vec()),
+                ProjectPart::Label(label("seq1.right")),
+                ProjectPart::Label(label("seq1.left")),
+            ],
+        ));
+        materialized_graph.add(OutputFastqOp::from_writer(materialized));
+        materialized_graph.try_run_with_threads(1).unwrap();
+
+        let direct = SharedWriter::default();
+        let direct_bytes = Arc::clone(&direct.0);
+        let mut direct_graph = Graph::<NoTrace>::new();
+        direct_graph.add(InputFastqOp::from_reader(Cursor::new(input)).unwrap());
+        direct_graph.add(CutOp::new(
+            TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+            2isize,
+        ));
+        direct_graph.add(ProjectOp::with_parts(
+            StrType::Seq(1),
+            [
+                ProjectPart::literal(b"TT".to_vec()),
+                ProjectPart::Label(label("seq1.right")),
+                ProjectPart::Label(label("seq1.left")),
+            ],
+        ));
+        direct_graph.add(OutputFastqOp::from_writer(direct));
+        let report = direct_graph
+            .try_run_pipeline(PipelineConfig {
+                workers: 1,
+                queue_capacity: 2,
+                max_in_flight_batches: 1,
+                batch_size: 1,
+                preserve_order: true,
+                direct_output_rendering: true,
+                input_mode: PipelineInputMode::WorkerLocal,
+            })
+            .unwrap();
+
+        assert!(report.prepared_output);
+        assert!(report.direct_output_rendering);
+        assert_eq!(
+            *direct_bytes.lock().unwrap(),
+            *materialized_bytes.lock().unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(direct_bytes.lock().unwrap().clone()).unwrap(),
+            "@read1\nTTGTAC\n+\nII3412\n@read2\nTTCATG\n+\nII7856\n"
+        );
+    }
+
+    #[test]
+    fn direct_terminal_projection_supports_file_outputs() {
+        let output_path = std::env::temp_dir().join(format!(
+            "antiseq_direct_projection_{}.fastq",
+            std::process::id()
+        ));
+        let report = {
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(
+                InputFastqOp::from_reader(Cursor::new(fastq_bytes(&[("read", "ACGT", "1234")])))
+                    .unwrap(),
+            );
+            graph.add(CutOp::new(
+                TransformExpr::from_bytes(b"seq1.* -> seq1.left, seq1.right").unwrap(),
+                2isize,
+            ));
+            graph.add(ProjectOp::with_parts(
+                StrType::Seq(1),
+                [
+                    ProjectPart::literal(b"TT".to_vec()),
+                    ProjectPart::Label(label("seq1.right")),
+                    ProjectPart::Label(label("seq1.left")),
+                ],
+            ));
+            graph.add(OutputFastqFileOp::from_file(
+                output_path.to_string_lossy().into_owned(),
+            ));
+            let report = graph.try_run_pipeline(PipelineConfig::new(1)).unwrap();
+            drop(graph);
+            report
+        };
+
+        assert!(report.direct_output_rendering);
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "@read\nTTGTAC\n+\nII3412\n"
+        );
+        std::fs::remove_file(output_path).ok();
+    }
+
+    #[test]
     fn test_try_graph_with_threads_rejects_zero_threads() {
         let g = Graph::<NoTrace>::new();
         let error = g.try_run_with_threads(0).unwrap_err();
@@ -742,7 +1443,7 @@ mod pipeline_tests {
         g.add(InputFastqOp::from_reader(Cursor::new(malformed)).unwrap());
 
         let error = g.try_run_with_threads(2).unwrap_err();
-        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("parsing record"));
     }
 
@@ -758,6 +1459,33 @@ mod pipeline_tests {
         }
     }
 
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "downstream reader closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingFlushWriter;
+
+    impl Write for FailingFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("intentional final flush failure"))
+        }
+    }
+
     #[test]
     fn test_try_graph_with_threads_returns_output_error() {
         let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
@@ -766,8 +1494,107 @@ mod pipeline_tests {
         g.add(OutputFastqOp::from_writer(FailingWriter));
 
         let error = g.try_run_with_threads(2).unwrap_err();
-        assert!(matches!(error, crate::errors::Error::GraphExecution(_)));
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("intentional write failure"));
+    }
+
+    #[test]
+    fn final_flush_failure_is_returned_before_graph_success() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("intentional final flush failure"));
+    }
+
+    #[test]
+    fn finish_failure_is_sticky_across_repeated_calls() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("intentional final flush failure"));
+
+        // A repeated finish must not report success for data that never
+        // reached its destination.
+        let repeat = graph.finish().unwrap_err();
+        assert!(matches!(
+            repeat,
+            crate::errors::Error::GraphFinalizationFailed
+        ));
+    }
+
+    #[test]
+    fn failed_execution_still_reports_finalization_errors() {
+        // One valid record streams into the writer; the second record is
+        // malformed, so execution fails. The failure path must still flush
+        // the writer that holds data and surface its error alongside the
+        // execution error instead of dropping it in Drop.
+        let mut malformed = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        malformed.extend_from_slice(b"@read2\nACGT\n+\nII\n");
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(malformed)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("parsing record"), "{message}");
+        assert!(
+            message.contains("intentional final flush failure"),
+            "{message}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_output_propagates_dev_full_for_plain_and_gzip_streams() {
+        use std::os::unix::fs::symlink;
+
+        let gzip_link = std::env::temp_dir().join(format!(
+            "antisequence-dev-full-{}-{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        // A `.gz` symlink exercises the actual file-path compression branch
+        // while retaining /dev/full's deterministic ENOSPC behavior.
+        let _ = std::fs::remove_file(&gzip_link);
+        symlink("/dev/full", &gzip_link).unwrap();
+
+        for path in [
+            "/dev/full".to_owned(),
+            gzip_link.to_string_lossy().into_owned(),
+        ] {
+            let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            graph.add(OutputFastqFileOp::from_file(path));
+            let error = graph.try_run_with_threads(1).unwrap_err();
+            assert!(
+                error.to_string().contains("No space left on device"),
+                "unexpected /dev/full error: {error}"
+            );
+        }
+        std::fs::remove_file(gzip_link).unwrap();
+    }
+
+    #[test]
+    fn broken_pipe_cancels_execution_without_panicking() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(BrokenPipeWriter));
+
+        let error = graph.try_run_with_threads(2).unwrap_err();
+        assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
+        assert!(error.to_string().contains("downstream reader closed"));
     }
 
     #[derive(Clone, Default)]
@@ -827,6 +1654,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 512,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -869,6 +1697,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -905,6 +1734,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap();
@@ -963,6 +1793,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 3,
                 batch_size: 257,
                 preserve_order: true,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::DedicatedReader,
             })
             .unwrap();
@@ -995,6 +1826,7 @@ mod pipeline_tests {
                 max_in_flight_batches: 1,
                 batch_size: 512,
                 preserve_order: false,
+                direct_output_rendering: true,
                 input_mode: PipelineInputMode::WorkerLocal,
             })
             .unwrap_err();
@@ -1014,6 +1846,70 @@ mod pipeline_tests {
             error,
             crate::errors::Error::InvalidPipelineGraph(_)
         ));
+    }
+
+    #[test]
+    fn invalid_pipeline_configuration_is_retryable_and_does_not_touch_output() {
+        let path = std::env::temp_dir().join(format!(
+            "antisequence-invalid-config-output-{}.fastq",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"sentinel\n").unwrap();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(Vec::<u8>::new())).unwrap());
+        graph.add(OutputFastqFileOp::from_file(
+            path.to_string_lossy().into_owned(),
+        ));
+        let mut invalid = PipelineConfig::new(1);
+        invalid.queue_capacity = 0;
+        assert!(matches!(
+            graph.try_run_pipeline(invalid),
+            Err(crate::errors::Error::InvalidPipelineConfig(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel\n");
+
+        graph.try_run_pipeline(PipelineConfig::new(1)).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn failed_execution_is_terminal_and_does_not_finalize_output() {
+        let path = std::env::temp_dir().join(format!(
+            "antisequence-failed-run-output-{}.fastq",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"sentinel\n").unwrap();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read1\nACGT\n+\nIII\n".to_vec())).unwrap(),
+        );
+        graph.add(OutputFastqFileOp::from_file(
+            path.to_string_lossy().into_owned(),
+        ));
+        assert!(graph.run().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel\n");
+        assert!(matches!(
+            graph.run(),
+            Err(crate::errors::Error::GraphAlreadyFinished)
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn successfully_finished_graph_cannot_be_executed_again() {
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(numbered_fastq(1))).unwrap());
+        graph.add(NullOutputOp::new());
+        graph.run().unwrap();
+        assert!(matches!(
+            graph.run(),
+            Err(crate::errors::Error::GraphAlreadyFinished)
+        ));
+        // Explicit repeated finalization remains harmless.
+        graph.finish().unwrap();
     }
 
     #[test]
@@ -1141,7 +2037,9 @@ mod pipeline_tests {
     fn test_match_type_k() {
         assert_eq!(Exact.k(4), 4);
         assert_eq!(ExactPrefix.k(4), 4);
-        assert_eq!(Hamming(Count(1)).k(4), 2);
+        // Hamming Count is a minimum-match threshold. One required match in
+        // four bases permits three mismatches, so the guaranteed seed is 1.
+        assert_eq!(Hamming(Count(1)).k(4), 1);
         assert_eq!(Edit(Count(1)).k(4), 2);
     }
 
@@ -1223,6 +2121,21 @@ mod pipeline_tests {
 
         // read1 doesn't have "barcode" label, so try_graph fails requirements -> catch
         assert_eq!(catch_counter.counts()[0], 1);
+    }
+
+    #[test]
+    fn try_op_can_return_successful_fallback_records() {
+        let fq = fastq_bytes(&[("read1", "ACGTNNNN", "IIIIIIII")]);
+        let mut preferred = Graph::<NoTrace>::new();
+        preferred.add(TrimOp::new([label("seq1.missing")]));
+        let fallback = Graph::<NoTrace>::new();
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(TryOp::new(preferred, fallback).return_catch_output());
+        let returned = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
+        assert_eq!(returned.counts(), [1]);
     }
 
     #[test]
@@ -1635,6 +2548,29 @@ mod pipeline_tests {
         assert_eq!(counter.counts()[0], 1);
     }
 
+    #[test]
+    fn test_hamming_search_mixed_lengths_does_not_use_unsound_common_seed() {
+        // Count(8) makes the 8-base literals exact matches, but permits eight
+        // mismatches in the 16-base literal. Deriving the common seed length
+        // from only the shortest literal used k=8 and missed this valid long
+        // match because the query contains no eight-base A run.
+        let fq = fastq_bytes(&[("read1", "ACACACACACACACAC", "IIIIIIIIIIIIIIII")]);
+        let patterns =
+            Patterns::from_strs(["CCCCCCCC", "GGGGGGGG", "TTTTTTTT", "AAAAAAAAAAAAAAAA"]);
+
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.before, seq1.match, seq1.after"),
+            patterns,
+            HammingSearch(Count(8)),
+        ));
+        let counter = graph.add(CountOp::new([true]));
+        graph.run().unwrap();
+
+        assert_eq!(counter.counts()[0], 1);
+    }
+
     // -- Regression: HammingLookup overflow for patterns > 8 bytes --
     // These tests exercise MatchAnyOp::new construction with long patterns,
     // which is the actual code path where the u64 encoding overflow occurred.
@@ -1688,6 +2624,77 @@ mod pipeline_tests {
             1,
             "14bp Hamming match with 1 mismatch should succeed"
         );
+    }
+
+    #[test]
+    fn test_short_hamming_lookup_falls_back_for_non_acgt_input() {
+        let fq = fastq_bytes(&[("accepted", "ACGN", "IIII"), ("rejected", "ACNN", "IIII")]);
+        let patterns = Patterns::from_strs(["ACGT"]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        let operation = MatchAnyOp::new(te("seq1.* -> seq1.*"), patterns, Hamming(Count(3)));
+        assert_eq!(
+            operation.matcher_plan().backend,
+            crate::matcher::MatcherBackend::HammingLookup
+        );
+        g.add(operation);
+        g.add(NullOutputOp::new());
+        g.set_statistics_level(StatisticsLevel::Detailed);
+        g.run().unwrap();
+
+        // MatchAnyOp does not reject a record merely because it failed to
+        // match. The detailed distance histogram only records successful
+        // matches, so its total proves that ACGN matched through the general
+        // verifier while the over-threshold ACNN control did not.
+        let report = g.match_distance_counts().remove(0);
+        assert_eq!(report.total, 2);
+        assert_eq!(report.counts.iter().sum::<usize>(), 1);
+        assert_eq!(report.counts[1], 1);
+    }
+
+    #[test]
+    fn alignment_thresholds_are_validated_before_seed_planning() {
+        for match_type in [
+            GlobalAln(1.01),
+            LocalAln {
+                identity: f64::NAN,
+                overlap: 0.8,
+            },
+            PrefixAln {
+                identity: 0.8,
+                overlap: -0.1,
+            },
+            SuffixAln {
+                identity: 0.8,
+                overlap: f64::INFINITY,
+            },
+        ] {
+            let transform = match match_type.num_mappings() {
+                1 => "seq1.* -> seq1.a",
+                2 => "seq1.* -> seq1.a, seq1.b",
+                3 => "seq1.* -> seq1.a, seq1.b, seq1.c",
+                _ => unreachable!(),
+            };
+            let error =
+                MatchAnyOp::try_new(te(transform), Patterns::from_strs(["ACGT"]), match_type)
+                    .err()
+                    .expect("invalid alignment thresholds must fail construction");
+            assert!(error.to_string().contains("finite fractions in 0..=1"));
+            // The compatibility helper remains total for direct callers and
+            // must never underflow even before construction validation.
+            let _ = match_type.k(4);
+        }
+    }
+
+    #[test]
+    fn edit_match_rejects_pattern_quality_ambiguity_at_construction() {
+        let patterns = Patterns::from_strs(["ACGT", "ACGA"])
+            .with_ambiguity_policy(AmbiguityPolicy::Quality { min_delta: 1 });
+        assert!(matches!(
+            MatchAnyOp::try_new(te("seq1.* -> seq1.*"), patterns, Edit(Count(1))),
+            Err(crate::errors::Error::InvalidOperation { .. })
+        ));
     }
 
     #[test]
@@ -2341,6 +3348,7 @@ mod pipeline_tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     #[test]
     fn test_accelerated_gzip_input_matches_standard_reader() {
         let input = numbered_fastq(1025);
@@ -2376,6 +3384,7 @@ mod pipeline_tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     #[test]
     fn test_accelerated_gzip_input_returns_decoder_errors() {
         let input = numbered_fastq(32);
@@ -2736,6 +3745,39 @@ mod pipeline_tests {
         // Original qual "12345678" reversed = "87654321"
         // Barcode is first 4 bases, so qual for barcode = "8765"
         assert_eq!(q_vals[0], b"8765");
+    }
+
+    #[test]
+    fn test_try_orientation_long_reads_keep_branches_isolated() {
+        let forward = format!("ACGT{}", "A".repeat(1_996));
+        let reverse = format!("{}ACGT", "T".repeat(1_996));
+        let quality = "I".repeat(2_000);
+        let fq = fastq_bytes(&[
+            ("fw_read", forward.as_str(), quality.as_str()),
+            ("rc_read", reverse.as_str(), quality.as_str()),
+        ]);
+
+        let inner = orientation_inner_graph("ACGT");
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(TryOrientationOp::new(inner, 1, b"ori"));
+
+        let outputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let output_clone = outputs.clone();
+        g.add(ForEachOp::new(move |read: &mut Read| {
+            output_clone.lock().unwrap().push(
+                read.str_mappings(StrType::Seq(1))
+                    .unwrap()
+                    .string()
+                    .to_vec(),
+            );
+        }));
+        g.run().unwrap();
+
+        let outputs = outputs.lock().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], forward.as_bytes());
+        assert_eq!(outputs[1], forward.as_bytes());
     }
 
     #[test]

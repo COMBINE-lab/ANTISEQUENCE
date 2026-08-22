@@ -4,6 +4,7 @@ pub struct SetOp {
     required_names: Vec<LabelOrAttr>,
     label_or_attr: LabelOrAttr,
     expr: Expr,
+    reorder_safe: bool,
 }
 
 impl SetOp {
@@ -24,7 +25,7 @@ impl SetOp {
     pub fn new(label_or_attr: impl Into<LabelOrAttr>, expr: impl Into<Expr>) -> Self {
         let label_or_attr = label_or_attr.into();
         let mut expr = expr.into();
-        expr.optimize();
+        let expression_is_constant = expr.optimize();
         let mut required_names = expr.required_names();
         match &label_or_attr {
             LabelOrAttr::Label(_) => required_names.push(label_or_attr.clone()),
@@ -32,17 +33,52 @@ impl SetOp {
                 str_type: a.str_type,
                 label: a.label,
             })),
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {}
         }
+        let reorder_safe = matches!(
+            &label_or_attr,
+            LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_)
+        ) && expression_is_constant;
 
         Self {
             required_names,
             label_or_attr,
             expr,
+            reorder_safe,
         }
     }
 }
 
 impl<T: Trace> GraphNode<T> for SetOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(std::slice::from_ref(&self.label_or_attr))
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        match &self.label_or_attr {
+            LabelOrAttr::Label(_) => MutationKind::Sequence,
+            LabelOrAttr::Attr(_) | LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_) => {
+                MutationKind::Metadata
+            }
+        }
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        RejectionBehavior::Never
+    }
+
+    fn removable_when_outputs_dead(&self) -> bool {
+        self.reorder_safe
+    }
+
+    fn can_move_after_selective_filter(&self) -> bool {
+        self.reorder_safe
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         for read in &mut reads {
             match &self.label_or_attr {
@@ -97,12 +133,43 @@ impl<T: Trace> GraphNode<T> for SetOp {
                         read: read.clone(),
                         context: Self::NAME,
                     })?;
+                    let new_val: Data = new_val.into();
 
-                    // panic to make borrow checker happy
-                    *read
-                        .data_mut(attr.str_type, attr.label, attr.attr)
-                        .unwrap_or_else(|e| panic!("Error in {}: {e}", Self::NAME)) =
-                        new_val.into();
+                    let target = match read.data_mut(attr.str_type, attr.label, attr.attr) {
+                        Ok(target) => target,
+                        Err(source) => {
+                            return Err(Error::NameError {
+                                source,
+                                read: read.clone(),
+                                context: Self::NAME,
+                            });
+                        }
+                    };
+                    *target = new_val;
+                }
+                LabelOrAttr::RecordAttr(attr) => {
+                    let new_val: Data = self
+                        .expr
+                        .eval(read, false)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?
+                        .into();
+                    *read.record_data_mut(attr.attr) = new_val;
+                }
+                LabelOrAttr::LaneAttr(attr) => {
+                    let new_val: Data = self
+                        .expr
+                        .eval(read, false)
+                        .map_err(|source| Error::NameError {
+                            source,
+                            read: read.clone(),
+                            context: Self::NAME,
+                        })?
+                        .into();
+                    *read.lane_data_mut(attr.lane, attr.attr) = new_val;
                 }
             }
         }

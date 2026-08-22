@@ -25,7 +25,7 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(reads) = reads else {
-            panic!("Expected some reads!")
+            return Err(Error::MissingNodeInput(self.name()));
         };
 
         // Preserve original ordering: record which indices pass the selector,
@@ -90,6 +90,45 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
 
     fn required_names(&self) -> &[LabelOrAttr] {
         &self.required_names
+    }
+
+    fn liveness_transfer(&self, live_out: &[LabelOrAttr]) -> Result<Vec<LabelOrAttr>> {
+        // Non-selected records pass through untouched; selected records must
+        // emerge with the enclosing live-out names available.
+        let mut live = live_out.to_vec();
+        for name in self.graph.validate_liveness_from(live_out)? {
+            if !live.contains(&name) {
+                live.push(name);
+            }
+        }
+        for name in &self.required_names {
+            if !live.contains(name) {
+                live.push(name.clone());
+            }
+        }
+        Ok(live)
+    }
+
+    fn has_nested_graphs(&self) -> bool {
+        true
+    }
+
+    fn optimize_nested_graphs(
+        &mut self,
+        optimization: GraphOptimizationConfig,
+        live_out: &[LabelOrAttr],
+    ) -> Vec<GraphOptimizationReport> {
+        vec![self
+            .graph
+            .optimize_for_compilation_from(optimization, live_out)]
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        self.graph.finish_existing()
     }
 
     fn name(&self) -> &'static str {

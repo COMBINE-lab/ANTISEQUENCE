@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Serialize, Serializer};
 
-const LEN: usize = 24usize;
+pub(crate) const LEN: usize = 24usize;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[repr(align(8))]

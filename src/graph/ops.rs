@@ -48,6 +48,9 @@ pub use match_any_op::*;
 mod input_fastq_op;
 pub use input_fastq_op::*;
 
+mod grouped_input_fastq_op;
+pub use grouped_input_fastq_op::*;
+
 mod output_fastq_op;
 pub use output_fastq_op::*;
 
@@ -59,6 +62,9 @@ pub use output_json_op::*;
 
 mod select_op;
 pub use select_op::*;
+
+mod switch_op;
+pub use switch_op::*;
 
 mod try_op;
 pub use try_op::*;

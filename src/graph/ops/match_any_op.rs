@@ -1,5 +1,19 @@
 use bio::pattern_matching::myers::long::Myers as LongMyers;
 use block_aligner::{cigar::*, scan_block::*, scores::*};
+#[cfg(feature = "baseline-simd")]
+use block_aligner_baseline as block_aligner;
+#[cfg(feature = "release-simd")]
+use block_aligner_release as block_aligner;
+
+#[cfg(all(feature = "baseline-simd", feature = "release-simd"))]
+compile_error!(
+    "`baseline-simd` and `release-simd` are mutually exclusive; use \
+     `--no-default-features --features release-simd` for a tuned application build"
+);
+#[cfg(not(any(feature = "baseline-simd", feature = "release-simd")))]
+compile_error!("select one matcher SIMD backend: `baseline-simd` or `release-simd`");
+#[cfg(all(feature = "simd-avx2", not(target_arch = "x86_64")))]
+compile_error!("the `simd-avx2` matcher backend is supported only on x86_64");
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
@@ -14,17 +28,18 @@ use std::marker::Send;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::graph::*;
+use crate::matcher::{
+    reference_match, MatchMetric, MatchScope, MatchSpec, MatcherBackend, MatcherPlan,
+    PatternSummary,
+};
 use crate::seed_search::*;
-use crate::{AmbiguityPolicy, Pattern, Patterns};
+use crate::{AmbiguityPolicy, Pattern, Patterns, PositionAmbiguityPolicy};
 
 /// Pre-computed lookup table for fast Hamming matching.
 ///
-/// Limitations:
-/// - Pattern length must be <= 8 bytes (encoded as u64).
-/// - Mismatch variants only substitute {A, C, G, T}. Sequences containing
-///   non-ACGT characters (e.g. N) will not generate all mismatch neighbors,
-///   so the lookup may produce false negatives for such inputs. The slow
-///   Hamming path handles all byte values correctly.
+/// Pattern length must be <= 8 bytes (encoded as u64). Mismatch variants use
+/// the DNA alphabet; reads containing another byte bypass this table and use
+/// the general byte-wise Hamming implementation.
 struct HammingLookup {
     /// Maps encoded sequence to the best pattern and whether another pattern
     /// tied it at the same Hamming distance.
@@ -48,7 +63,7 @@ impl HammingLookup {
     /// Only ACGT bases are used for mismatch variant generation.
     /// Non-ACGT characters in input sequences may cause false negatives
     /// in the fast lookup path (the slow Hamming fallback handles all bytes).
-    const NUCLEOTIDES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    const NUCLEOTIDES: [u8; 4] = *b"ACGT";
 
     /// Encode a sequence as u64 (up to 8 bytes).
     /// Panics in debug builds if seq.len() > 8.
@@ -172,16 +187,18 @@ impl HammingLookup {
 
 pub struct MatchAnyOp {
     required_names: Vec<LabelOrAttr>,
+    produced_names: Vec<LabelOrAttr>,
     label: Label,
     new_labels: [Option<Label>; 3],
     patterns: Patterns,
     max_literal_len: usize,
     all_literals: bool,
     match_type: MatchType,
+    matcher_plan: MatcherPlan,
     aligner: ThreadLocal<Option<RefCell<Box<dyn Aligner + Send>>>>,
     short_edit_searchers: Vec<Option<ShortEditSearcher>>,
     long_edit_searchers: ThreadLocal<RefCell<FxHashMap<usize, LongMyers<u64>>>>,
-    seed_hits: ThreadLocal<RefCell<FxHashSet<(usize, Option<isize>)>>>,
+    seed_hits: ThreadLocal<RefCell<FxHashSet<SeedHitKey>>>,
     seed_searcher: Option<SeedSearchers>,
     /// Fast hash-based lookup for Hamming matching (when applicable)
     hamming_lookup: Option<HammingLookup>,
@@ -190,6 +207,28 @@ pub struct MatchAnyOp {
     // Each worker mutates only its own accumulator. Graph execution joins all
     // workers before these cells are read and aggregated.
     local_stats: ThreadLocal<Mutex<LocalMatchStats>>,
+}
+
+type SeedHitKey = (usize, Option<isize>);
+type CandidateState = (usize, usize, usize, usize, usize, PositionResolution);
+type MatchPlacement = (usize, usize, usize);
+type ReferencePositionResult = Result<Option<(Option<MatchPlacement>, PositionResolution)>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionResolution {
+    Unique,
+    Leftmost,
+    Rightmost,
+    Quality,
+    Dropped,
+    Error,
+}
+
+impl PositionResolution {
+    #[inline(always)]
+    fn is_ambiguous(self) -> bool {
+        self != Self::Unique
+    }
 }
 
 enum PostMatchRetention {
@@ -270,7 +309,7 @@ impl ShortEditSearcher {
         let mut score = self.pattern_len;
         let high_bit = 1u64 << (self.pattern_len - 1);
         let mut best_score = usize::MAX;
-        let mut best_end = 0;
+        let mut best_ends: SmallVec<[usize; 8]> = SmallVec::new();
 
         for (i, &base) in text.iter().enumerate() {
             let eq = self.peq[base as usize];
@@ -282,9 +321,14 @@ impl ShortEditSearcher {
             score += usize::from((ph & high_bit) != 0);
             score -= usize::from((mh & high_bit) != 0);
 
-            if score <= max_edits && score < best_score {
-                best_score = score;
-                best_end = i + 1;
+            if score <= max_edits {
+                if score < best_score {
+                    best_score = score;
+                    best_ends.clear();
+                }
+                if score == best_score {
+                    best_ends.push(i + 1);
+                }
             }
 
             // No low boundary bit here: leading text is free for a
@@ -297,16 +341,23 @@ impl ShortEditSearcher {
             return None;
         }
 
+        let expected_matches = self.pattern_len.saturating_sub(best_score);
         let shortest = self.pattern_len.saturating_sub(best_score);
         let longest = self.pattern_len + best_score;
-        let earliest_start = best_end.saturating_sub(longest);
-        let latest_start = best_end.saturating_sub(shortest);
-        let expected_matches = self.pattern_len.saturating_sub(best_score);
-        let start = (earliest_start..=latest_start).find(|&candidate| {
-            self.global_matches(&text[candidate..best_end], best_score) == Some(expected_matches)
-        })?;
+        let (start, end) = best_ends
+            .into_iter()
+            .filter_map(|end| {
+                let earliest_start = end.saturating_sub(longest);
+                let latest_start = end.saturating_sub(shortest);
+                (earliest_start..=latest_start)
+                    .find(|&start| {
+                        self.global_matches(&text[start..end], best_score) == Some(expected_matches)
+                    })
+                    .map(|start| (start, end))
+            })
+            .min()?;
 
-        Some((expected_matches, start, best_end))
+        Some((expected_matches, start, end))
     }
 
     /// Search long text using the edit-distance pigeonhole principle.
@@ -386,7 +437,7 @@ impl ShortEditSearcher {
             if best.is_none_or(|current| {
                 candidate.0 > current.0
                     || (candidate.0 == current.0
-                        && (candidate.2, candidate.1) < (current.2, current.1))
+                        && (candidate.1, candidate.2) < (current.1, current.2))
             }) {
                 best = Some(candidate);
             }
@@ -414,6 +465,62 @@ impl MatchAnyOp {
     /// The input labeled interval will get a new attribute (`seq1.*.my_patterns`) that is set to the pattern
     /// that is matched. If no pattern matches, then it will be set to false.
     pub fn new(transform_expr: TransformExpr, patterns: Patterns, match_type: MatchType) -> Self {
+        Self::try_new(transform_expr, patterns, match_type)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible matcher construction for policy combinations whose semantics
+    /// can be validated before any reads are processed.
+    pub fn try_new(
+        transform_expr: TransformExpr,
+        patterns: Patterns,
+        match_type: MatchType,
+    ) -> Result<Self> {
+        let valid_fraction = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
+        let alignment_thresholds = match match_type {
+            MatchType::GlobalAln(identity) => Some((identity, 1.0)),
+            MatchType::LocalAln { identity, overlap }
+            | MatchType::PrefixAln { identity, overlap }
+            | MatchType::SuffixAln { identity, overlap } => Some((identity, overlap)),
+            _ => None,
+        };
+        if alignment_thresholds.is_some_and(|(identity, overlap)| {
+            !valid_fraction(identity) || !valid_fraction(overlap)
+        }) {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "alignment identity and overlap must be finite fractions in 0..=1"
+                    .to_owned(),
+            });
+        }
+        if matches!(
+            patterns.ambiguity_policy(),
+            Some(AmbiguityPolicy::Quality { .. })
+        ) && matches!(
+            match_type,
+            MatchType::Edit(_)
+                | MatchType::EditPrefix(_)
+                | MatchType::EditSuffix(_)
+                | MatchType::EditSearch(_)
+                | MatchType::EditBoundedMatch { .. }
+        ) {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "pattern quality ambiguity is undefined for edit-distance alignments with insertions or deletions".to_owned(),
+            });
+        }
+        if matches!(
+            patterns.position_ambiguity_policy(),
+            PositionAmbiguityPolicy::Quality { .. }
+        ) && !matches!(
+            MatchSpec::from_match_type(match_type).metric,
+            MatchMetric::Exact | MatchMetric::Hamming { .. }
+        ) {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "position quality policy requires exact or Hamming search over equal-length windows".to_owned(),
+            });
+        }
         let mut new_labels = [None, None, None];
 
         transform_expr.check_size(1, match_type.num_mappings(), Self::NAME);
@@ -425,8 +532,28 @@ impl MatchAnyOp {
             *label = transform_expr.after_label(i, Self::NAME);
         }
         transform_expr.check_same_str_type(Self::NAME);
+        let label = transform_expr.before(0);
+        let mut produced_names = new_labels
+            .iter()
+            .flatten()
+            .cloned()
+            .map(LabelOrAttr::Label)
+            .collect::<Vec<_>>();
+        produced_names.extend(
+            patterns
+                .pattern_name()
+                .into_iter()
+                .chain(patterns.multimatch_name())
+                .chain(patterns.attr_names().iter().copied())
+                .map(|attr| {
+                    LabelOrAttr::Attr(Attr {
+                        str_type: label.str_type,
+                        label: label.label,
+                        attr,
+                    })
+                }),
+        );
 
-        let seed_searcher = Self::get_searcher(&patterns, &match_type);
         let max_literal_len = patterns
             .iter_literals()
             .map(|(_, p)| p.len())
@@ -438,6 +565,14 @@ impl MatchAnyOp {
             .min()
             .unwrap_or(0);
         let all_literals = patterns.iter_exprs().count() == 0;
+        let pattern_summary = PatternSummary {
+            count: patterns.patterns().len(),
+            literal_count: patterns.iter_literals().count(),
+            min_literal_len,
+            max_literal_len,
+        };
+        let matcher_plan = MatcherPlan::build(match_type, pattern_summary);
+        let seed_searcher = Self::get_searcher(&patterns, &match_type);
         let short_edit_searchers = patterns
             .patterns()
             .iter()
@@ -448,7 +583,7 @@ impl MatchAnyOp {
                 _ => None,
             })
             .collect();
-        let mut required_names = vec![transform_expr.before(0).into()];
+        let mut required_names = vec![label.clone().into()];
         required_names.extend(
             patterns
                 .iter_exprs()
@@ -460,37 +595,30 @@ impl MatchAnyOp {
         // 2. Match type is Hamming with small mismatch count (<=2)
         // 3. Pattern count is reasonable (<=1000)
         // 4. Pattern length fits in u64 encoding (<=8 bytes)
-        let hamming_lookup = if let MatchType::Hamming(threshold) = match_type {
+        let hamming_lookup = if matcher_plan.backend == MatcherBackend::HammingLookup {
+            let MatchType::Hamming(threshold) = match_type else {
+                unreachable!("HammingLookup plans require a full Hamming match")
+            };
             let max_mismatches = max_literal_len.saturating_sub(threshold.get(max_literal_len));
-            let pattern_count = patterns.iter_literals().count();
-
-            if all_literals
-                && max_literal_len == min_literal_len
-                && max_mismatches <= 2
-                && pattern_count <= 1000
-                && max_literal_len > 0
-                && max_literal_len <= 8
-            {
-                Some(HammingLookup::new(
-                    patterns.iter_literals(),
-                    max_literal_len,
-                    max_mismatches,
-                ))
-            } else {
-                None
-            }
+            Some(HammingLookup::new(
+                patterns.iter_literals(),
+                max_literal_len,
+                max_mismatches,
+            ))
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             required_names,
-            label: transform_expr.before(0),
+            produced_names,
+            label,
             new_labels,
             patterns,
             max_literal_len,
             all_literals,
             match_type,
+            matcher_plan,
             aligner: ThreadLocal::new(),
             short_edit_searchers,
             long_edit_searchers: ThreadLocal::new(),
@@ -500,7 +628,12 @@ impl MatchAnyOp {
             post_match_retention: None,
             statistics_level: AtomicU8::new(StatisticsLevel::Off as u8),
             local_stats: ThreadLocal::new(),
-        }
+        })
+    }
+
+    /// The orthogonal semantics and selected implementation for this matcher.
+    pub fn matcher_plan(&self) -> &MatcherPlan {
+        &self.matcher_plan
     }
 
     /// Retain only reads for which this match created `label`.
@@ -548,12 +681,16 @@ impl MatchAnyOp {
             return None;
         }
 
-        let min_len = patterns
+        // A common seed length is sound only when it is safe for every
+        // pattern. In particular, a large absolute Hamming allowance can
+        // leave fewer guaranteed matching bases in a short pattern than in a
+        // long one, so deriving k from only the shortest literal can produce
+        // false negatives for mixed-length sets.
+        let k = patterns
             .iter_literals()
-            .map(|(_, p)| p.len())
+            .map(|(_, pattern)| match_type.k(pattern.len()))
             .min()
             .unwrap_or(0);
-        let k = match_type.k(min_len);
 
         use SeedSearchers::*;
         let res = match k {
@@ -571,6 +708,142 @@ impl MatchAnyOp {
         } else {
             Some(General(GeneralSearcher::new(patterns.iter_literals(), k)))
         }
+    }
+
+    #[inline]
+    fn candidate_rank(&self, pattern_len: usize, matches: usize) -> usize {
+        match self.matcher_plan.spec.metric {
+            MatchMetric::Exact | MatchMetric::Hamming { .. } | MatchMetric::Edit { .. } => {
+                usize::MAX - pattern_len.saturating_sub(matches)
+            }
+            MatchMetric::Alignment { .. } => matches,
+        }
+    }
+
+    /// Use the exhaustive specification only when a caller requests
+    /// non-default positional behavior or detailed ambiguity counts. The
+    /// normal leftmost/statistics-off path retains the optimized matcher with
+    /// no additional allocations.
+    fn reference_position_candidate(
+        &self,
+        text: &[u8],
+        quality: Option<&[u8]>,
+        pattern: &[u8],
+        collect_detailed_statistics: bool,
+    ) -> ReferencePositionResult {
+        if !self.uses_reference_position_oracle(collect_detailed_statistics) {
+            return Ok(None);
+        }
+        let policy = self.patterns.position_ambiguity_policy();
+
+        let patterns = [pattern];
+        let mut candidates =
+            reference_match(text, &patterns, self.matcher_plan.spec).map_err(|error| {
+                Error::InvalidOperation {
+                    operation: Self::NAME,
+                    reason: format!("invalid reference matcher bounds: {error:?}"),
+                }
+            })?;
+        let position_ambiguous = candidates.len() > 1;
+        let (selected, resolution) = if !position_ambiguous {
+            (candidates.into_iter().next(), PositionResolution::Unique)
+        } else {
+            match policy {
+                PositionAmbiguityPolicy::Leftmost => {
+                    (candidates.into_iter().next(), PositionResolution::Leftmost)
+                }
+                PositionAmbiguityPolicy::Rightmost => (
+                    candidates
+                        .drain(..)
+                        .max_by_key(|candidate| (candidate.start, candidate.end)),
+                    PositionResolution::Rightmost,
+                ),
+                PositionAmbiguityPolicy::NoMatch => {
+                    (candidates.into_iter().next(), PositionResolution::Dropped)
+                }
+                PositionAmbiguityPolicy::Error => {
+                    (candidates.into_iter().next(), PositionResolution::Error)
+                }
+                PositionAmbiguityPolicy::Quality { min_delta } => {
+                    let quality = quality.ok_or_else(|| {
+                        Error::GraphExecution(format!(
+                            "position quality policy requires quality scores for {}.{}",
+                            self.label.str_type, self.label.label
+                        ))
+                    })?;
+                    if quality.len() != text.len() {
+                        return Err(Error::GraphExecution(format!(
+                            "quality length {} does not match sequence length {} for {}.{}",
+                            quality.len(),
+                            text.len(),
+                            self.label.str_type,
+                            self.label.label
+                        )));
+                    }
+                    let mut scored = candidates
+                        .into_iter()
+                        .map(|candidate| {
+                            let observed = &text[candidate.start..candidate.end];
+                            if observed.len() != pattern.len() {
+                                return Err(Error::GraphExecution(
+                                    "position quality policy requires equal-length candidate windows"
+                                        .to_string(),
+                                ));
+                            }
+                            let score = pattern
+                                .iter()
+                                .zip(observed)
+                                .zip(&quality[candidate.start..candidate.end])
+                                .filter_map(|((&pattern_base, &query_base), &q)| {
+                                    (pattern_base != query_base)
+                                        .then_some(u64::from(q.saturating_sub(33)))
+                                })
+                                .sum::<u64>();
+                            Ok((score, candidate))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    scored.sort_unstable_by_key(|(score, candidate)| {
+                        (*score, candidate.start, candidate.end)
+                    });
+                    let resolved = scored[0].0 < scored[1].0
+                        && scored[1].0 - scored[0].0 >= u64::from(min_delta);
+                    (
+                        Some(scored.remove(0).1),
+                        if resolved {
+                            PositionResolution::Quality
+                        } else {
+                            PositionResolution::Dropped
+                        },
+                    )
+                }
+            }
+        };
+        Ok(Some((
+            selected.map(|candidate| {
+                (
+                    pattern.len().saturating_sub(candidate.distance),
+                    candidate.start,
+                    candidate.end,
+                )
+            }),
+            resolution,
+        )))
+    }
+
+    /// Whether the exhaustive positional oracle can affect this operation.
+    ///
+    /// Keeping this predicate outside the per-candidate loop is important:
+    /// the default leftmost/statistics-off path must not allocate or hash just
+    /// to cache values that are always `None`.
+    #[inline]
+    fn uses_reference_position_oracle(&self, collect_detailed_statistics: bool) -> bool {
+        (collect_detailed_statistics
+            || self.patterns.position_ambiguity_policy() != PositionAmbiguityPolicy::Leftmost)
+            && matches!(
+                self.matcher_plan.spec.scope,
+                MatchScope::Search | MatchScope::Bounded { .. }
+            )
+            && !matches!(self.matcher_plan.spec.metric, MatchMetric::Alignment { .. })
     }
 
     #[inline]
@@ -774,9 +1047,157 @@ impl MatchAnyOp {
             }
         }
     }
+
+    /// Resolve an equal-best pattern tie for searched, equal-length windows
+    /// using the qualities at each candidate's own placement. The ordinary
+    /// full-string resolver remains the fast path for non-search matchers.
+    fn resolve_search_quality_ambiguity(
+        &self,
+        read: &Read,
+        text: &[u8],
+        quality: Option<&[u8]>,
+        candidates: &[CandidateState],
+        mut stats: Option<&mut LocalMatchStats>,
+    ) -> Result<Option<usize>> {
+        let AmbiguityPolicy::Quality { min_delta } = self.effective_ambiguity_policy() else {
+            unreachable!("search quality resolver requires the quality policy")
+        };
+        let quality = quality.ok_or_else(|| {
+            Error::GraphExecution(format!(
+                "quality ambiguity policy requires quality scores for {}.{}",
+                self.label.str_type, self.label.label
+            ))
+        })?;
+        if quality.len() != text.len() {
+            return Err(Error::GraphExecution(format!(
+                "quality length {} does not match sequence length {} for {}.{}",
+                quality.len(),
+                text.len(),
+                self.label.str_type,
+                self.label.label
+            )));
+        }
+
+        let mut ordered: SmallVec<[&CandidateState; 4]> = candidates.iter().collect();
+        ordered.sort_unstable_by_key(|candidate| candidate.0);
+        ordered.dedup_by_key(|candidate| candidate.0);
+        if ordered.len() == 1 {
+            return Ok(ordered.first().map(|candidate| candidate.0));
+        }
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.ambiguity.total += 1;
+        }
+
+        let mut scores: SmallVec<[(u64, usize); 4]> = SmallVec::new();
+        for candidate in ordered {
+            let &(pattern_idx, _, _, start, end, _) = candidate;
+            let observed = text.get(start..end).ok_or_else(|| {
+                Error::GraphExecution(format!(
+                    "quality ambiguity candidate range {start}..{end} exceeds searched text length {}",
+                    text.len()
+                ))
+            })?;
+            let observed_quality = &quality[start..end];
+            let pattern = self.patterns.patterns()[pattern_idx]
+                .get(read)
+                .map_err(|source| Error::NameError {
+                    source,
+                    read: read.clone(),
+                    context: Self::NAME,
+                })?;
+            if pattern.len() != observed.len() {
+                return Err(Error::GraphExecution(
+                    "quality ambiguity policy requires equal-length candidate windows".to_string(),
+                ));
+            }
+            let mismatch_quality = pattern
+                .iter()
+                .zip(observed)
+                .zip(observed_quality)
+                .filter_map(|((&pattern_base, &query_base), &q)| {
+                    (pattern_base != query_base).then_some(u64::from(q.saturating_sub(33)))
+                })
+                .sum();
+            scores.push((mismatch_quality, pattern_idx));
+        }
+        scores.sort_unstable();
+        let (best_score, best_idx) = scores[0];
+        let runner_up_score = scores[1].0;
+        if best_score < runner_up_score && runner_up_score - best_score >= u64::from(min_delta) {
+            if let Some(stats) = stats {
+                stats.ambiguity.accepted += 1;
+                stats.ambiguity.resolved_quality += 1;
+            }
+            Ok(Some(best_idx))
+        } else {
+            if let Some(stats) = stats {
+                stats.ambiguity.dropped += 1;
+            }
+            Ok(None)
+        }
+    }
 }
 
 impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
+    fn produced_names(&self) -> Option<&[LabelOrAttr]> {
+        Some(&self.produced_names)
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
+    fn mutation_kind(&self) -> MutationKind {
+        MutationKind::Metadata
+    }
+
+    fn rejection_behavior(&self) -> RejectionBehavior {
+        if self.post_match_retention.is_some() {
+            RejectionBehavior::MayReject
+        } else {
+            RejectionBehavior::Never
+        }
+    }
+
+    fn is_selective_filter(&self) -> bool {
+        self.post_match_retention.is_some()
+    }
+
+    fn is_infallible_selective_filter(&self) -> bool {
+        use crate::patterns::{AmbiguityPolicy, PositionAmbiguityPolicy};
+        self.post_match_retention.is_some()
+            && !matches!(
+                self.effective_ambiguity_policy(),
+                AmbiguityPolicy::Error | AmbiguityPolicy::Quality { .. }
+            )
+            && matches!(
+                self.patterns.position_ambiguity_policy(),
+                PositionAmbiguityPolicy::Leftmost
+                    | PositionAmbiguityPolicy::Rightmost
+                    | PositionAmbiguityPolicy::NoMatch
+            )
+    }
+
+    fn cost_class(&self) -> CostClass {
+        use MatchType::*;
+        match self.match_type {
+            GlobalAln(_)
+            | LocalAln { .. }
+            | PrefixAln { .. }
+            | SuffixAln { .. }
+            | Edit(_)
+            | EditPrefix(_)
+            | EditSuffix(_)
+            | EditSearch(_)
+            | EditBoundedMatch { .. } => CostClass::Alignment,
+            ExactSearch
+            | HammingSearch(_)
+            | ExactBoundedMatch { .. }
+            | HammingBoundedMatch { .. } => CostClass::Search,
+            _ => CostClass::Linear,
+        }
+    }
+
     fn run_inner(&self, mut reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
         let collect_stats =
             self.statistics_level.load(Ordering::Relaxed) == StatisticsLevel::Detailed as u8;
@@ -830,7 +1251,10 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
 
             // Fast path: use pre-computed hash lookup for Hamming matching
-            if let Some(ref lookup) = self.hamming_lookup {
+            if let Some(lookup) = self.hamming_lookup.as_ref().filter(|_| {
+                text.iter()
+                    .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
+            }) {
                 let pattern_len = lookup.pattern_len;
                 let resolved_hit = match lookup.lookup(text) {
                     Some(hit) => {
@@ -952,8 +1376,12 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                     }
                     ExactSearch => (text, 0, true),
                     ExactBoundedMatch { from, to } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        // Verification treats `to` as inclusive; the prefilter
+                        // window must not be narrower. Short reads clamp to an
+                        // empty window instead of panicking.
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                     Hamming(_) => (text, 0, false),
                     HammingPrefix(_) => (&text[..text.len().min(self.max_literal_len)], 0, false),
@@ -967,8 +1395,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         from,
                         to,
                     } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                     GlobalAln(_) => (text, 0, false),
                     LocalAln { .. } => (text, 0, true),
@@ -1005,8 +1434,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         from,
                         to,
                     } => {
-                        let to = text.len().min(to);
-                        (&text[from..to], 0, false)
+                        let end = text.len().min(to.saturating_add(1));
+                        let start = from.min(end);
+                        (&text[start..end], 0, false)
                     }
                 };
 
@@ -1033,9 +1463,31 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 seed_hits.extend(self.patterns.iter_exprs().map(|(i, _)| (i, None)));
             }
 
-            let mut max_matches = 0;
-            let mut max_pattern_idx = usize::MAX;
-            let mut best_candidates: SmallVec<[(usize, usize, usize, usize); 4]> = SmallVec::new();
+            let mut best_rank = None;
+            // pattern index, pattern length, matches, cut 1, cut 2, positional resolution
+            let mut best_candidates: SmallVec<[CandidateState; 4]> = SmallVec::new();
+            let position_quality = if matches!(
+                self.patterns.position_ambiguity_policy(),
+                PositionAmbiguityPolicy::Quality { .. }
+            ) {
+                read.substring_qual(self.label.str_type, self.label.label)
+                    .map_err(|source| Error::NameError {
+                        source,
+                        read: read.clone(),
+                        context: Self::NAME,
+                    })?
+            } else {
+                None
+            };
+            // A seed index may produce many hits for the same pattern. The
+            // exhaustive positional oracle depends only on this read and
+            // pattern, so compute it at most once per pattern per read. The
+            // cache is keyed sparsely by the patterns the seeds actually hit:
+            // a dense per-pattern table would cost O(pattern count) per read,
+            // which is prohibitive for whitelist-scale pattern sets.
+            let mut reference_positions = self.uses_reference_position_oracle(collect_stats).then(
+                FxHashMap::<usize, Option<(Option<MatchPlacement>, PositionResolution)>>::default,
+            );
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -1046,236 +1498,312 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-                if max_matches > pattern_len {
-                    continue;
-                }
-
-                let matches = match self.match_type {
-                    Exact => {
-                        if text == pattern_str {
-                            Some((pattern_len, pattern_len, 0))
-                        } else {
-                            None
-                        }
+                let reference_position = if let Some(cache) = reference_positions.as_mut() {
+                    if let Some(cached) = cache.get(&pattern_idx) {
+                        *cached
+                    } else {
+                        let computed = self.reference_position_candidate(
+                            text,
+                            position_quality,
+                            pattern_str,
+                            collect_stats,
+                        )?;
+                        cache.insert(pattern_idx, computed);
+                        computed
                     }
-                    ExactPrefix => {
-                        if pattern_len <= text.len() && &text[..pattern_len] == pattern_str {
-                            Some((pattern_len, pattern_len, 0))
-                        } else {
-                            None
-                        }
-                    }
-                    ExactSuffix => {
-                        if pattern_len <= text.len()
-                            && &text[text.len() - pattern_len..] == pattern_str
-                        {
-                            Some((pattern_len, text.len() - pattern_len, 0))
-                        } else {
-                            None
-                        }
-                    }
-                    ExactSearch => {
-                        let (text_start, text_end) = if let Some(text_i) = text_i {
-                            (
-                                text_i.max(0) as usize,
-                                text.len().min((text_i + (pattern_len as isize)) as usize),
-                            )
-                        } else {
-                            (0, text.len())
-                        };
-                        let text_around = &text[text_start..text_end];
-                        memmem::find(text_around, pattern_str)
-                            .map(|i| (pattern_len, text_start + i, text_start + i + pattern_len))
-                    }
-                    ExactBoundedMatch { from, to } => {
-                        let to = text.len().min(to);
-                        let text_around = &text[from..=to];
-                        memmem::find(text_around, pattern_str)
-                            .map(|i| (pattern_len, from + i, from + i + pattern_len))
-                    }
-                    Hamming(t) => {
-                        let t = t.get(pattern_len);
-                        hamming(text, pattern_str, t).map(|m| (m, pattern_len, 0))
-                    }
-                    HammingPrefix(t) => {
-                        if pattern_len <= text.len() {
-                            let t = t.get(pattern_len);
-                            hamming(&text[..pattern_len], pattern_str, t)
-                                .map(|m| (m, pattern_len, 0))
-                        } else {
-                            None
-                        }
-                    }
-                    HammingSuffix(t) => {
-                        if pattern_len <= text.len() {
-                            let t = t.get(pattern_len);
-                            hamming(&text[text.len() - pattern_len..], pattern_str, t)
-                                .map(|m| (m, text.len() - pattern_len, 0))
-                        } else {
-                            None
-                        }
-                    }
-                    HammingSearch(t) => {
-                        let t = t.get(pattern_len);
-                        if let Some(text_i) = text_i {
-                            // Seed hit gives us the exact position - just check that position
-                            let text_start = text_i.max(0) as usize;
-                            let text_end = text.len().min(text_start + pattern_len);
-                            if text_end - text_start == pattern_len {
-                                let text_slice = &text[text_start..text_end];
-                                hamming(text_slice, pattern_str, t)
-                                    .map(|m| (m, text_start, text_end))
-                            } else {
-                                None
+                } else {
+                    None
+                };
+                let (matches, position_resolution) = if let Some(reference) = reference_position {
+                    reference
+                } else {
+                    (
+                        match self.match_type {
+                            Exact => {
+                                if text == pattern_str {
+                                    Some((pattern_len, pattern_len, 0))
+                                } else {
+                                    None
+                                }
                             }
-                        } else {
-                            // No seed hit - fall back to full search
-                            hamming_search(text, pattern_str, t)
-                        }
-                    }
-                    HammingBoundedMatch {
-                        threshold: t,
-                        from,
-                        to,
-                    } => {
-                        let t = t.get(pattern_len);
-                        // Use exclusive range - to is the max position, so we need to+1 for the slice
-                        // but capped at text.len()
-                        let to_exclusive = text.len().min(to + 1);
-                        let text_around = &text[from..to_exclusive];
-                        hamming_search(text_around, pattern_str, t)
-                            .map(|(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx))
-                    }
-                    GlobalAln(identity) => aligner_cell
-                        .as_ref()
-                        .unwrap()
-                        .borrow_mut()
-                        .align(text, pattern_str, identity, identity)
-                        .map(|(m, _, end_idx)| (m, end_idx, 0)),
-                    LocalAln { identity, overlap } => {
-                        let a = additional(identity, pattern_len) as isize;
-                        let (text_start, text_end) = if let Some(text_i) = text_i {
-                            (
-                                (text_i - a).max(0) as usize,
-                                text.len()
-                                    .min((text_i + (pattern_len as isize) + a) as usize),
-                            )
-                        } else {
-                            (0, text.len())
-                        };
-                        let text_around = &text[text_start..text_end];
-                        aligner_cell
-                            .as_ref()
-                            .unwrap()
-                            .borrow_mut()
-                            .align(text_around, pattern_str, identity, overlap)
-                            .map(|(m, start_idx, end_idx)| {
-                                (m, text_start + start_idx, text_start + end_idx)
-                            })
-                    }
-                    PrefixAln { identity, overlap } => {
-                        let a = additional(identity, pattern_len);
-                        aligner_cell
-                            .as_ref()
-                            .unwrap()
-                            .borrow_mut()
-                            .align(
-                                &text[..text.len().min(pattern_len + a)],
-                                pattern_str,
-                                identity,
-                                overlap,
-                            )
-                            .map(|(m, _, end_idx)| (m, end_idx, 0))
-                    }
-                    SuffixAln { identity, overlap } => {
-                        let a = additional(identity, pattern_len);
-                        let text_start = text.len().saturating_sub(pattern_len + a);
-                        aligner_cell
-                            .as_ref()
-                            .unwrap()
-                            .borrow_mut()
-                            .align(&text[text_start..], pattern_str, identity, overlap)
-                            .map(|(m, start_idx, _)| (m, text_start + start_idx, 0))
-                    }
-                    Edit(t) => {
-                        let max_edits = t.get(pattern_len);
-                        edit_distance(text, pattern_str, max_edits).map(|m| (m, pattern_len, 0))
-                    }
-                    EditPrefix(t) => {
-                        let max_edits = t.get(pattern_len);
-                        edit_prefix(text, pattern_str, max_edits)
-                            .map(|(m, end_pos)| (m, end_pos, 0))
-                    }
-                    EditSuffix(t) => {
-                        let max_edits = t.get(pattern_len);
-                        edit_suffix(text, pattern_str, max_edits)
-                            .map(|(m, start_pos)| (m, start_pos, 0))
-                    }
-                    EditSearch(t) => {
-                        let max_edits = t.get(pattern_len);
-                        if let Some(text_i) = text_i {
-                            // Seed hit - search around the seed position
-                            let text_start = (text_i - (max_edits as isize)).max(0) as usize;
-                            let text_end = text.len().min(
-                                (text_i + (pattern_len as isize) + (max_edits as isize)) as usize,
-                            );
-                            if text_end > text_start {
-                                let text_slice = &text[text_start..text_end];
+                            ExactPrefix => {
+                                if pattern_len <= text.len() && &text[..pattern_len] == pattern_str
+                                {
+                                    Some((pattern_len, pattern_len, 0))
+                                } else {
+                                    None
+                                }
+                            }
+                            ExactSuffix => {
+                                if pattern_len <= text.len()
+                                    && &text[text.len() - pattern_len..] == pattern_str
+                                {
+                                    Some((pattern_len, text.len() - pattern_len, 0))
+                                } else {
+                                    None
+                                }
+                            }
+                            ExactSearch => {
+                                let (text_start, text_end) = if let Some(text_i) = text_i {
+                                    (
+                                        text_i.max(0) as usize,
+                                        text.len().min((text_i + (pattern_len as isize)) as usize),
+                                    )
+                                } else {
+                                    (0, text.len())
+                                };
+                                let text_around = &text[text_start..text_end];
+                                memmem::find(text_around, pattern_str).map(|i| {
+                                    (pattern_len, text_start + i, text_start + i + pattern_len)
+                                })
+                            }
+                            ExactBoundedMatch { from, to } => {
+                                // `to` is inclusive; clamp both bounds so reads
+                                // shorter than the window yield no match instead
+                                // of panicking on an out-of-range slice.
+                                let end = text.len().min(to.saturating_add(1));
+                                let start = from.min(end);
+                                let text_around = &text[start..end];
+                                memmem::find(text_around, pattern_str)
+                                    .map(|i| (pattern_len, start + i, start + i + pattern_len))
+                            }
+                            Hamming(t) => {
+                                let t = t.get(pattern_len);
+                                hamming(text, pattern_str, t).map(|m| (m, pattern_len, 0))
+                            }
+                            HammingPrefix(t) => {
+                                if pattern_len <= text.len() {
+                                    let t = t.get(pattern_len);
+                                    hamming(&text[..pattern_len], pattern_str, t)
+                                        .map(|m| (m, pattern_len, 0))
+                                } else {
+                                    None
+                                }
+                            }
+                            HammingSuffix(t) => {
+                                if pattern_len <= text.len() {
+                                    let t = t.get(pattern_len);
+                                    hamming(&text[text.len() - pattern_len..], pattern_str, t)
+                                        .map(|m| (m, text.len() - pattern_len, 0))
+                                } else {
+                                    None
+                                }
+                            }
+                            HammingSearch(t) => {
+                                let t = t.get(pattern_len);
+                                if let Some(text_i) = text_i {
+                                    // Seed hit gives us the exact position - just check that position
+                                    let text_start = text_i.max(0) as usize;
+                                    let text_end = text.len().min(text_start + pattern_len);
+                                    if text_end - text_start == pattern_len {
+                                        let text_slice = &text[text_start..text_end];
+                                        hamming(text_slice, pattern_str, t)
+                                            .map(|m| (m, text_start, text_end))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    // No seed hit - fall back to full search
+                                    hamming_search(text, pattern_str, t)
+                                }
+                            }
+                            HammingBoundedMatch {
+                                threshold: t,
+                                from,
+                                to,
+                            } => {
+                                let t = t.get(pattern_len);
+                                // Use exclusive range - to is the max position, so we need to+1 for the slice
+                                // but capped at text.len()
+                                let to_exclusive = text.len().min(to + 1);
+                                let text_around = &text[from..to_exclusive];
+                                hamming_search(text_around, pattern_str, t).map(
+                                    |(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx),
+                                )
+                            }
+                            GlobalAln(identity) => aligner_cell
+                                .as_ref()
+                                .unwrap()
+                                .borrow_mut()
+                                .align(text, pattern_str, identity, identity)
+                                .map(|(m, _, end_idx)| (m, end_idx, 0)),
+                            LocalAln { identity, overlap } => {
+                                let a = additional(identity, pattern_len) as isize;
+                                let (text_start, text_end) = if let Some(text_i) = text_i {
+                                    (
+                                        (text_i - a).max(0) as usize,
+                                        text.len()
+                                            .min((text_i + (pattern_len as isize) + a) as usize),
+                                    )
+                                } else {
+                                    (0, text.len())
+                                };
+                                let text_around = &text[text_start..text_end];
+                                aligner_cell
+                                    .as_ref()
+                                    .unwrap()
+                                    .borrow_mut()
+                                    .align(text_around, pattern_str, identity, overlap)
+                                    .map(|(m, start_idx, end_idx)| {
+                                        (m, text_start + start_idx, text_start + end_idx)
+                                    })
+                            }
+                            PrefixAln { identity, overlap } => {
+                                let a = additional(identity, pattern_len);
+                                aligner_cell
+                                    .as_ref()
+                                    .unwrap()
+                                    .borrow_mut()
+                                    .align(
+                                        &text[..text.len().min(pattern_len + a)],
+                                        pattern_str,
+                                        identity,
+                                        overlap,
+                                    )
+                                    .map(|(m, _, end_idx)| (m, end_idx, 0))
+                            }
+                            SuffixAln { identity, overlap } => {
+                                let a = additional(identity, pattern_len);
+                                let text_start = text.len().saturating_sub(pattern_len + a);
+                                aligner_cell
+                                    .as_ref()
+                                    .unwrap()
+                                    .borrow_mut()
+                                    .align(&text[text_start..], pattern_str, identity, overlap)
+                                    .map(|(m, start_idx, _)| (m, text_start + start_idx, 0))
+                            }
+                            Edit(t) => {
+                                let max_edits = t.get(pattern_len);
+                                edit_distance(text, pattern_str, max_edits)
+                                    .map(|m| (m, pattern_len, 0))
+                            }
+                            EditPrefix(t) => {
+                                let max_edits = t.get(pattern_len);
+                                edit_prefix(text, pattern_str, max_edits)
+                                    .map(|(m, end_pos)| (m, end_pos, 0))
+                            }
+                            EditSuffix(t) => {
+                                let max_edits = t.get(pattern_len);
+                                edit_suffix(text, pattern_str, max_edits)
+                                    .map(|(m, start_pos)| (m, start_pos, 0))
+                            }
+                            EditSearch(t) => {
+                                let max_edits = t.get(pattern_len);
+                                if let Some(text_i) = text_i {
+                                    // Seed hit - search around the seed position
+                                    let text_start =
+                                        (text_i - (max_edits as isize)).max(0) as usize;
+                                    let text_end = text.len().min(
+                                        (text_i + (pattern_len as isize) + (max_edits as isize))
+                                            as usize,
+                                    );
+                                    if text_end > text_start {
+                                        let text_slice = &text[text_start..text_end];
+                                        self.edit_search_dispatch(
+                                            pattern_idx,
+                                            matches!(pattern, Pattern::Literal { .. }),
+                                            text_slice,
+                                            pattern_str,
+                                            max_edits,
+                                        )
+                                        .map(
+                                            |(m, start_idx, end_idx)| {
+                                                (m, text_start + start_idx, text_start + end_idx)
+                                            },
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    // No seed hit - full search
+                                    self.edit_search_dispatch(
+                                        pattern_idx,
+                                        matches!(pattern, Pattern::Literal { .. }),
+                                        text,
+                                        pattern_str,
+                                        max_edits,
+                                    )
+                                }
+                            }
+                            EditBoundedMatch {
+                                threshold: t,
+                                from,
+                                to,
+                            } => {
+                                let max_edits = t.get(pattern_len);
+                                let to_exclusive = text.len().min(to + 1);
+                                let text_around = &text[from..to_exclusive];
                                 self.edit_search_dispatch(
                                     pattern_idx,
                                     matches!(pattern, Pattern::Literal { .. }),
-                                    text_slice,
+                                    text_around,
                                     pattern_str,
                                     max_edits,
                                 )
                                 .map(|(m, start_idx, end_idx)| {
-                                    (m, text_start + start_idx, text_start + end_idx)
+                                    (m, from + start_idx, from + end_idx)
                                 })
-                            } else {
-                                None
                             }
-                        } else {
-                            // No seed hit - full search
-                            self.edit_search_dispatch(
-                                pattern_idx,
-                                matches!(pattern, Pattern::Literal { .. }),
-                                text,
-                                pattern_str,
-                                max_edits,
-                            )
-                        }
-                    }
-                    EditBoundedMatch {
-                        threshold: t,
-                        from,
-                        to,
-                    } => {
-                        let max_edits = t.get(pattern_len);
-                        let to_exclusive = text.len().min(to + 1);
-                        let text_around = &text[from..to_exclusive];
-                        self.edit_search_dispatch(
-                            pattern_idx,
-                            matches!(pattern, Pattern::Literal { .. }),
-                            text_around,
-                            pattern_str,
-                            max_edits,
-                        )
-                        .map(|(m, start_idx, end_idx)| (m, from + start_idx, from + end_idx))
-                    }
+                        },
+                        PositionResolution::Unique,
+                    )
                 };
 
                 if let Some((matches, cut_pos1, cut_pos2)) = matches {
-                    if max_pattern_idx == usize::MAX || matches > max_matches {
-                        max_matches = matches;
-                        max_pattern_idx = pattern_idx;
+                    let rank = self.candidate_rank(pattern_len, matches);
+                    if best_rank.is_none_or(|best| rank > best) {
+                        best_rank = Some(rank);
                         best_candidates.clear();
-                        best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
-                    } else if matches == max_matches && pattern_idx != max_pattern_idx {
-                        if !best_candidates
-                            .iter()
-                            .any(|&(candidate_idx, _, _, _)| candidate_idx == pattern_idx)
+                        best_candidates.push((
+                            pattern_idx,
+                            pattern_len,
+                            matches,
+                            cut_pos1,
+                            cut_pos2,
+                            position_resolution,
+                        ));
+                    } else if best_rank == Some(rank) {
+                        if let Some(candidate) = best_candidates
+                            .iter_mut()
+                            .find(|candidate| candidate.0 == pattern_idx)
                         {
-                            best_candidates.push((pattern_idx, pattern_len, cut_pos1, cut_pos2));
+                            if candidate.3 != cut_pos1 || candidate.4 != cut_pos2 {
+                                candidate.5 = match self.patterns.position_ambiguity_policy() {
+                                    PositionAmbiguityPolicy::Leftmost => {
+                                        PositionResolution::Leftmost
+                                    }
+                                    PositionAmbiguityPolicy::Rightmost => {
+                                        PositionResolution::Rightmost
+                                    }
+                                    PositionAmbiguityPolicy::Quality { .. } => {
+                                        PositionResolution::Dropped
+                                    }
+                                    PositionAmbiguityPolicy::NoMatch => PositionResolution::Dropped,
+                                    PositionAmbiguityPolicy::Error => PositionResolution::Error,
+                                };
+                                let prefer_new = match candidate.5 {
+                                    PositionResolution::Rightmost => cut_pos1 > candidate.3,
+                                    PositionResolution::Unique
+                                    | PositionResolution::Leftmost
+                                    | PositionResolution::Quality
+                                    | PositionResolution::Dropped
+                                    | PositionResolution::Error => cut_pos1 < candidate.3,
+                                };
+                                if prefer_new {
+                                    candidate.2 = matches;
+                                    candidate.3 = cut_pos1;
+                                    candidate.4 = cut_pos2;
+                                }
+                            }
+                        } else {
+                            best_candidates.push((
+                                pattern_idx,
+                                pattern_len,
+                                matches,
+                                cut_pos1,
+                                cut_pos2,
+                                position_resolution,
+                            ));
                         }
                     }
                 }
@@ -1289,26 +1817,94 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         read: read.clone(),
                         context: Self::NAME,
                     })?;
-                let candidate_indices: SmallVec<[usize; 4]> = best_candidates
-                    .iter()
-                    .map(|&(pattern_idx, _, _, _)| pattern_idx)
-                    .collect();
-                self.resolve_ambiguity(
-                    read,
-                    text,
-                    quality,
-                    &candidate_indices,
-                    stats.as_deref_mut(),
-                )?
+                if matches!(
+                    self.effective_ambiguity_policy(),
+                    AmbiguityPolicy::Quality { .. }
+                ) && matches!(
+                    self.matcher_plan.spec.scope,
+                    MatchScope::Search | MatchScope::Bounded { .. }
+                ) {
+                    self.resolve_search_quality_ambiguity(
+                        read,
+                        text,
+                        quality,
+                        &best_candidates,
+                        stats.as_deref_mut(),
+                    )?
+                } else {
+                    let candidate_indices: SmallVec<[usize; 4]> = best_candidates
+                        .iter()
+                        .map(|&(pattern_idx, _, _, _, _, _)| pattern_idx)
+                        .collect();
+                    self.resolve_ambiguity(
+                        read,
+                        text,
+                        quality,
+                        &candidate_indices,
+                        stats.as_deref_mut(),
+                    )?
+                }
             } else {
                 best_candidates.first().map(|candidate| candidate.0)
             };
 
+            let selected_pattern_idx = match selected_pattern_idx {
+                Some(pattern_idx) => {
+                    let position_resolution = best_candidates
+                        .iter()
+                        .find(|candidate| candidate.0 == pattern_idx)
+                        .map_or(PositionResolution::Unique, |candidate| candidate.5);
+                    if position_resolution.is_ambiguous() {
+                        if let Some(stats) = stats.as_deref_mut() {
+                            stats.ambiguity.position_total += 1;
+                        }
+                        match position_resolution {
+                            PositionResolution::Leftmost => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_leftmost += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionResolution::Rightmost => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_rightmost += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionResolution::Quality => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_resolved_quality += 1;
+                                }
+                                Some(pattern_idx)
+                            }
+                            PositionResolution::Dropped => {
+                                if let Some(stats) = stats.as_deref_mut() {
+                                    stats.ambiguity.position_dropped += 1;
+                                }
+                                None
+                            }
+                            PositionResolution::Error => {
+                                return Err(Error::GraphExecution(format!(
+                                    "{} found multiple equal-best positions for pattern {}",
+                                    Self::NAME,
+                                    pattern_idx
+                                )));
+                            }
+                            PositionResolution::Unique => Some(pattern_idx),
+                        }
+                    } else {
+                        Some(pattern_idx)
+                    }
+                }
+                None => None,
+            };
+
             if let Some(selected_pattern_idx) = selected_pattern_idx {
-                let &(_, max_pattern_len, max_cut_pos1, max_cut_pos2) = best_candidates
-                    .iter()
-                    .find(|&&(pattern_idx, _, _, _)| pattern_idx == selected_pattern_idx)
-                    .expect("resolved candidate must be present in equal-best candidate set");
+                let &(_, max_pattern_len, selected_matches, max_cut_pos1, max_cut_pos2, _) =
+                    best_candidates
+                        .iter()
+                        .find(|&&(pattern_idx, _, _, _, _, _)| pattern_idx == selected_pattern_idx)
+                        .expect("resolved candidate must be present in equal-best candidate set");
                 let selected_pattern = &self.patterns.patterns()[selected_pattern_idx];
                 let pattern_str =
                     selected_pattern
@@ -1320,7 +1916,11 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         })?;
                 let pattern_attrs = selected_pattern.attrs();
                 if let Some(stats) = stats.as_deref_mut() {
-                    Self::record_distance(&mut stats.distance_counts, max_pattern_len, max_matches);
+                    Self::record_distance(
+                        &mut stats.distance_counts,
+                        max_pattern_len,
+                        selected_matches,
+                    );
                 }
                 let pattern_value = self
                     .patterns
@@ -1478,6 +2078,11 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             ambiguity.resolved_first += local.ambiguity.resolved_first;
             ambiguity.resolved_random += local.ambiguity.resolved_random;
             ambiguity.resolved_quality += local.ambiguity.resolved_quality;
+            ambiguity.position_total += local.ambiguity.position_total;
+            ambiguity.position_dropped += local.ambiguity.position_dropped;
+            ambiguity.position_resolved_leftmost += local.ambiguity.position_resolved_leftmost;
+            ambiguity.position_resolved_rightmost += local.ambiguity.position_resolved_rightmost;
+            ambiguity.position_resolved_quality += local.ambiguity.position_resolved_quality;
             if local.distance_counts.len() > totals.len() {
                 totals.resize(local.distance_counts.len(), 0);
             }
@@ -1505,16 +2110,17 @@ fn hamming(a: &[u8], b: &[u8], threshold: usize) -> Option<usize> {
         return None;
     }
 
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
     let n = a.len();
     let mut res = 0;
     let mut i = 0;
 
+    // SAFETY: each unaligned load is restricted to a complete 8-byte chunk
+    // within both equal-length slices. The tail is copied through safe slice
+    // operations below and is never over-read.
     unsafe {
         while i < (n / 8) * 8 {
-            let a_word = std::ptr::read_unaligned(a_ptr.add(i) as *const u64);
-            let b_word = std::ptr::read_unaligned(b_ptr.add(i) as *const u64);
+            let a_word = std::ptr::read_unaligned(a.as_ptr().add(i) as *const u64);
+            let b_word = std::ptr::read_unaligned(b.as_ptr().add(i) as *const u64);
 
             let xor = a_word ^ b_word;
             let or1 = xor | (xor >> 1);
@@ -1525,18 +2131,18 @@ fn hamming(a: &[u8], b: &[u8], threshold: usize) -> Option<usize> {
 
             i += 8;
         }
+    }
 
-        if i < n {
-            let a_word = read_rest_u64(a_ptr.add(i), n - i);
-            let b_word = read_rest_u64(b_ptr.add(i), n - i);
+    if i < n {
+        let a_word = read_rest_u64(&a[i..]);
+        let b_word = read_rest_u64(&b[i..]);
 
-            let xor = a_word ^ b_word;
-            let or1 = xor | (xor >> 1);
-            let or2 = or1 | (or1 >> 2);
-            let or3 = or2 | (or2 >> 4);
-            let mask = or3 & 0x0101010101010101u64;
-            res += mask.count_ones() as usize;
-        }
+        let xor = a_word ^ b_word;
+        let or1 = xor | (xor >> 1);
+        let or2 = or1 | (or1 >> 2);
+        let or3 = or2 | (or2 >> 4);
+        let mask = or3 & 0x0101010101010101u64;
+        res += mask.count_ones() as usize;
     }
 
     let matches = n - res;
@@ -1548,24 +2154,11 @@ fn hamming(a: &[u8], b: &[u8], threshold: usize) -> Option<usize> {
     }
 }
 
-unsafe fn read_rest_u64(ptr: *const u8, len: usize) -> u64 {
-    let addr = ptr as usize;
-    let start_page = addr >> 12;
-    let end_page = (addr + 7) >> 12;
-
-    if start_page == end_page {
-        std::ptr::read_unaligned(ptr as *const u64) & ((1u64 << (len * 8)) - 1)
-    } else {
-        let mut res = 0u64;
-        let mut i = 0;
-
-        while i < len {
-            res |= (*ptr.add(i) as u64) << (i * 8);
-            i += 1;
-        }
-
-        res
-    }
+fn read_rest_u64(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() < 8);
+    let mut word = [0u8; 8];
+    word[..bytes.len()].copy_from_slice(bytes);
+    u64::from_ne_bytes(word)
 }
 
 fn hamming_search(a: &[u8], b: &[u8], threshold: usize) -> Option<(usize, usize, usize)> {
@@ -1729,9 +2322,42 @@ fn edit_search_long_myers(
     max_edits: usize,
 ) -> Option<(usize, usize, usize)> {
     let mut matches = searcher.find_all_lazy(text, max_edits);
-    let (best_end, best_distance) = matches.by_ref().min_by_key(|&(_, distance)| distance)?;
-    let (start, traced_distance) = matches.hit_at(best_end)?;
-    debug_assert_eq!(best_distance, traced_distance);
+    let mut best_distance = usize::MAX;
+    let mut best_ends: Vec<usize> = Vec::new();
+    for (end, distance) in matches.by_ref() {
+        if distance < best_distance {
+            best_distance = distance;
+            best_ends.clear();
+        }
+        if distance == best_distance {
+            best_ends.push(end);
+        }
+    }
+    if best_ends.is_empty() {
+        return None;
+    }
+    // A placement within `best_distance` edits spans at most pattern_len +
+    // best_distance characters, so its start cannot precede its end by more
+    // than that window. Ends ascend, so tracebacks stop once no later end can
+    // improve the lexicographic (start, end) minimum; this keeps equal-best
+    // tie resolution linear on repetitive reads.
+    let window = pattern_len.saturating_add(best_distance);
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if (end + 1).saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let Some((start, traced_distance)) = matches.hit_at(end) else {
+            continue;
+        };
+        debug_assert_eq!(best_distance, traced_distance);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
     Some((
         pattern_len.saturating_sub(best_distance),
         start,
@@ -1761,7 +2387,7 @@ fn edit_search_myers(
     let high_bit = 1u64 << (m - 1);
 
     let mut best_score = usize::MAX;
-    let mut best_end = 0;
+    let mut best_ends: SmallVec<[usize; 8]> = SmallVec::new();
 
     for (i, &c) in text.iter().enumerate() {
         let eq = peq[c as usize];
@@ -1778,9 +2404,14 @@ fn edit_search_myers(
             score -= 1;
         }
 
-        if score <= max_edits && score < best_score {
-            best_score = score;
-            best_end = i + 1;
+        if score <= max_edits {
+            if score < best_score {
+                best_score = score;
+                best_ends.clear();
+            }
+            if score == best_score {
+                best_ends.push(i + 1);
+            }
         }
 
         pv = (mh << 1) | !(xv | (ph << 1));
@@ -1791,8 +2422,28 @@ fn edit_search_myers(
         return None;
     }
 
-    // Reverse DP to find exact start position
-    let start = find_start_reverse_dp(&text[..best_end], pattern, best_score);
+    // Any window within `best_score` edits of an m-length pattern spans at
+    // most m + best_score text characters, so the reverse DP only needs that
+    // suffix of text[..end] (excluded longer windows exceed the edit budget by
+    // the length bound). Ends arrive in ascending order, so once no later end
+    // can start before the current best start, the lexicographic (start, end)
+    // minimum is final. Both bounds keep tie resolution linear on repetitive
+    // reads with many equal-best ends.
+    let window = m.saturating_add(best_score);
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if end.saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let low = end.saturating_sub(window);
+        let start = low + find_start_reverse_dp(&text[low..end], pattern, best_score);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
 
     Some((m.saturating_sub(best_score), start, best_end))
 }
@@ -1851,7 +2502,7 @@ fn edit_search_dp(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usiz
     }
 
     let mut best_score = usize::MAX;
-    let mut best_end = 0;
+    let mut best_ends = Vec::new();
 
     for i in 1..=n {
         curr[0] = 0; // Free gaps at text start
@@ -1862,9 +2513,14 @@ fn edit_search_dp(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usiz
         }
 
         // Check if this is a valid end position (free gaps at text end)
-        if curr[m] <= max_edits && curr[m] < best_score {
-            best_score = curr[m];
-            best_end = i;
+        if curr[m] <= max_edits {
+            if curr[m] < best_score {
+                best_score = curr[m];
+                best_ends.clear();
+            }
+            if curr[m] == best_score {
+                best_ends.push(i);
+            }
         }
 
         std::mem::swap(&mut prev, &mut curr);
@@ -1874,8 +2530,28 @@ fn edit_search_dp(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usiz
         return None;
     }
 
-    // Reverse DP to find exact start position
-    let start = find_start_reverse_dp(&text[..best_end], pattern, best_score);
+    // Any window within `best_score` edits of an m-length pattern spans at
+    // most m + best_score text characters, so the reverse DP only needs that
+    // suffix of text[..end] (excluded longer windows exceed the edit budget by
+    // the length bound). Ends arrive in ascending order, so once no later end
+    // can start before the current best start, the lexicographic (start, end)
+    // minimum is final. Both bounds keep tie resolution linear on repetitive
+    // reads with many equal-best ends.
+    let window = m.saturating_add(best_score);
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if end.saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let low = end.saturating_sub(window);
+        let start = low + find_start_reverse_dp(&text[low..end], pattern, best_score);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
 
     Some((m.saturating_sub(best_score), start, best_end))
 }
@@ -1921,7 +2597,7 @@ fn edit_prefix(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usize, 
         }
 
         // Free gaps at text end: check if full pattern is matched at this text position
-        if curr[m] <= max_edits && curr[m] <= best_score {
+        if curr[m] <= max_edits && curr[m] < best_score {
             best_score = curr[m];
             best_end = i;
         }
@@ -2059,6 +2735,9 @@ impl<const LOCAL: bool> GlobalLocalAligner<LOCAL> {
     }
 }
 
+// SAFETY: the aligner owns every backing buffer and contains no references to
+// thread-local state. Instances are moved into a worker-local `RefCell` before
+// use and are never accessed concurrently.
 unsafe impl<const LOCAL: bool> Send for GlobalLocalAligner<LOCAL> {}
 
 impl<const LOCAL: bool> Aligner for GlobalLocalAligner<LOCAL> {
@@ -2188,6 +2867,9 @@ impl<const PREFIX: bool> PrefixSuffixAligner<PREFIX> {
     }
 }
 
+// SAFETY: as above, all SIMD/block-aligner state is owned by the value. The
+// surrounding `ThreadLocal<RefCell<_>>` gives each worker exclusive mutable
+// access, so moving an unused instance between threads cannot create aliasing.
 unsafe impl<const PREFIX: bool> Send for PrefixSuffixAligner<PREFIX> {}
 
 impl<const PREFIX: bool> Aligner for PrefixSuffixAligner<PREFIX> {
@@ -2333,8 +3015,8 @@ mod edit_distance_tests {
     }
 
     /// Deliberately slow oracle for semi-global search. Match ordering mirrors
-    /// the public behavior: minimum distance, then earliest end, then earliest
-    /// start for that end.
+    /// the public behavior: minimum distance, then leftmost start, then
+    /// shortest equal-start placement.
     fn reference_edit_search(
         text: &[u8],
         pattern: &[u8],
@@ -2358,7 +3040,10 @@ mod edit_distance_tests {
 
             let (distance, start) = best_at_end.unwrap();
             if distance <= max_edits
-                && best.is_none_or(|(best_distance, _, _)| distance < best_distance)
+                && best.is_none_or(|(best_distance, best_start, best_end)| {
+                    distance < best_distance
+                        || (distance == best_distance && (start, end) < (best_start, best_end))
+                })
             {
                 best = Some((distance, start, end));
             }
@@ -2572,6 +3257,27 @@ mod edit_distance_tests {
                 "long Myers differential failure in case {case_idx}: pattern_len={pattern_len}, max_edits={max_edits}"
             );
         }
+    }
+
+    #[test]
+    fn test_edit_search_repetitive_ties_choose_leftmost_short_pattern() {
+        let pattern = vec![b'A'; 32];
+        let text = vec![b'A'; 10_000];
+        assert_eq!(edit_search(&text, &pattern, 2), Some((32, 0, 32)));
+    }
+
+    #[test]
+    fn test_edit_search_repetitive_ties_choose_leftmost_long_pattern() {
+        let pattern = vec![b'A'; 96];
+        let text = vec![b'A'; 10_000];
+        let expected = Some((96, 0, 96));
+        assert_eq!(edit_search_dp(&text, &pattern, 2), expected);
+
+        let mut searcher = LongMyers::<u64>::new(&pattern);
+        assert_eq!(
+            edit_search_long_myers(&mut searcher, &text, pattern.len(), 2),
+            expected
+        );
     }
 
     // -- Bug 1: edit_search_myers estimates start position instead of computing it exactly --
