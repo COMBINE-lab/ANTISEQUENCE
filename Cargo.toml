@@ -24,6 +24,11 @@ include = [
 keywords = ["bioinformatics", "fastq", "sequencing", "preprocessing"]
 categories = ["science"]
 
+[package.metadata.docs.rs]
+# docs.rs must not combine the mutually exclusive portable and AVX2 backends.
+all-features = false
+features = ["accelerated-gzip"]
+
 [dependencies]
 needletail = "0.5"
 bio = { version = "4.0.1", default-features = false }
