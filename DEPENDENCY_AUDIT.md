@@ -46,7 +46,7 @@ admit the current compatible releases in the “keep” rows.
 | `gzp` | 2.0.4 | 2.0.4 | Keep; current. |
 | `rapidgzip-core` (optional) | 0.2.1 | 0.3.1 | Keep for 0.1; opt-in feature is differentially tested against standard gzip. Defer the 0.3 migration to a dedicated correctness/memory/throughput pass. |
 | `regex` | 1.13.1 | 1.13.1 | Keep; current. |
-| `thiserror` | 2.0.19 | 2.0.20 | Updated direct dependency; `bio-types` still brings the 1.x line transitively. |
+| `thiserror` | 2.0.20 | 2.0.20 | Updated direct dependency; `bio-types` still brings the 1.x line transitively. |
 | `rand` | 0.8.7 | 0.10.2 | Keep 0.8 after its security patch; preserve deterministic ambiguity choices. |
 | `rand_xoshiro` | 0.6.0 | 0.8.1 | Keep with rand 0.8; migrate and golden-test together. |
 | `thread_local` | 1.1.10 | 1.1.10 | Keep; current. |
