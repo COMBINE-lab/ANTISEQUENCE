@@ -64,4 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: antisequence-macos-arm64
-      - run: cargo test --locked --lib --doc --features accelerated-gzip
+      # Cargo rejects combining `--doc` with another target selector. Keep the
+      # library test and rustdoc test as separate portability gates.
+      - run: cargo test --locked --lib --features accelerated-gzip
+      - run: cargo test --locked --doc --features accelerated-gzip
