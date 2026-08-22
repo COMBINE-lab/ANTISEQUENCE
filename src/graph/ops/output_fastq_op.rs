@@ -692,8 +692,43 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
     }
 
     fn finish(&self) -> Result<()> {
-        let writers = self.file_writers.lock();
         let mut failures = Vec::new();
+
+        // Constant output paths are knowable even when the input contains no
+        // records. Materialize them here so a successful zero-record run still
+        // fulfills its output contract. Dynamic per-read paths necessarily
+        // remain absent when there is no read from which to evaluate them.
+        if !stub_output() {
+            for file_name in self.file_consts.iter().flatten() {
+                let already_open = self.file_writers.lock().contains_key(file_name);
+                match self.get_writer(file_name) {
+                    Ok(writer) => {
+                        if !already_open
+                            && self.parallel_gzip_members
+                            && file_name.ends_with(b".gz")
+                        {
+                            match gzip_member(&[], Vec::new(), self.gzip_level) {
+                                Ok(member) => {
+                                    if let Err(source) = writer.lock().write_all(&member) {
+                                        failures.push(Error::FileIo {
+                                            file: utf8(file_name),
+                                            source: Box::new(source),
+                                        });
+                                    }
+                                }
+                                Err(source) => failures.push(source),
+                            }
+                        }
+                    }
+                    Err(source) => failures.push(Error::FileIo {
+                        file: utf8(file_name),
+                        source: Box::new(source),
+                    }),
+                }
+            }
+        }
+
+        let writers = self.file_writers.lock();
         for (file_name, writer) in writers.iter() {
             if let Err(source) = writer.lock().flush() {
                 failures.push(Error::FileIo {

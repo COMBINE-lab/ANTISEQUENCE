@@ -337,6 +337,38 @@ mod pipeline_tests {
     }
 
     #[test]
+    fn zero_record_runs_materialize_valid_constant_outputs() {
+        for (parallel_members, suffix) in
+            [(false, "fastq"), (false, "fastq.gz"), (true, "fastq.gz")]
+        {
+            let path = std::env::temp_dir().join(format!(
+                "antisequence-empty-output-{}-{parallel_members}.{suffix}",
+                std::process::id()
+            ));
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(Vec::<u8>::new())).unwrap());
+            graph.add(
+                OutputFastqFileOp::from_file(path.to_string_lossy().into_owned())
+                    .with_parallel_gzip_members(parallel_members),
+            );
+            graph.run().unwrap();
+            assert!(path.is_file());
+            if suffix.ends_with(".gz") {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(&path).unwrap()),
+                    &mut decoded,
+                )
+                .unwrap();
+                assert!(decoded.is_empty());
+            } else {
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            }
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
     fn test_graph_cut_pipeline() {
         let fq = fastq_bytes(&[("read1", "ACGTACGT", "IIIIIIII")]);
 
