@@ -29,6 +29,7 @@ jobs:
       - run: cargo test --locked --all-targets --features accelerated-gzip --no-fail-fast
       - run: cargo doc --locked --no-deps --features accelerated-gzip
       - run: cargo package --locked
+      - run: bash scripts/verify_downstream.sh
 
   avx2:
     runs-on: ubuntu-latest

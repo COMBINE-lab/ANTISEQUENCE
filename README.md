@@ -63,6 +63,11 @@ graph.run()?;
 # Ok::<(), antisequence::errors::Error>(())
 ```
 
+The same program lives in `examples/downstream_smoke.rs`. The release gate
+packages the crate, extracts that archive into a temporary clean project, and
+compiles/runs the example against the extracted package with
+`scripts/verify_downstream.sh`.
+
 Compilation checks input/transform/output stage ordering and freezes the node
 sequence. Every operation exposes an allocation-free descriptor containing
 its requirements, produced names, mutation and rejection behavior, cost
