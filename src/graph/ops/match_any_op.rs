@@ -1,17 +1,17 @@
 use bio::pattern_matching::myers::long::Myers as LongMyers;
 use block_aligner::{cigar::*, scan_block::*, scores::*};
-#[cfg(feature = "simd-avx2")]
-use block_aligner_avx2 as block_aligner;
-#[cfg(feature = "portable-simd")]
-use block_aligner_portable as block_aligner;
+#[cfg(feature = "baseline-simd")]
+use block_aligner_baseline as block_aligner;
+#[cfg(feature = "release-simd")]
+use block_aligner_release as block_aligner;
 
-#[cfg(all(feature = "portable-simd", feature = "simd-avx2"))]
+#[cfg(all(feature = "baseline-simd", feature = "release-simd"))]
 compile_error!(
-    "`portable-simd` and `simd-avx2` are mutually exclusive; use \
-     `--no-default-features --features simd-avx2` for an AVX2 build"
+    "`baseline-simd` and `release-simd` are mutually exclusive; use \
+     `--no-default-features --features release-simd` for a tuned application build"
 );
-#[cfg(not(any(feature = "portable-simd", feature = "simd-avx2")))]
-compile_error!("select one matcher SIMD backend: `portable-simd` or `simd-avx2`");
+#[cfg(not(any(feature = "baseline-simd", feature = "release-simd")))]
+compile_error!("select one matcher SIMD backend: `baseline-simd` or `release-simd`");
 #[cfg(all(feature = "simd-avx2", not(target_arch = "x86_64")))]
 compile_error!("the `simd-avx2` matcher backend is supported only on x86_64");
 

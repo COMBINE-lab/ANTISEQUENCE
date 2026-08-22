@@ -31,7 +31,7 @@ jobs:
           shared-key: antisequence-fast
       - name: Format
         run: cargo fmt --all --check
-      - name: Check portable and accelerated APIs
+      - name: Check baseline and accelerated APIs
         run: cargo check --locked --all-targets --features accelerated-gzip
       - name: Test library and documentation
         run: cargo test --locked --lib --doc --features accelerated-gzip

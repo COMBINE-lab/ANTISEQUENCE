@@ -44,7 +44,7 @@ impl<const K: usize> SmallSearcher<K> {
         #[allow(unused)] patterns: impl Iterator<Item = (usize, &'a [u8])>,
     ) -> Result<Self, ()> {
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 const REPEAT: Aligned<64> = Aligned::<64>([0u8; 64]);
                 let mut pattern_luts = [REPEAT; K];
                 let mut pattern_idxs = Vec::new();
@@ -84,7 +84,7 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
         #[allow(unused)] mut candidate_fn: impl FnMut(SeedMatch),
     ) {
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 const L: usize = 32;
 
                 #[inline(always)]
@@ -397,7 +397,7 @@ impl Filter {
         let mut zero_mask = 0u64;
 
         cfg_if! {
-            if #[cfg(target_feature = "avx2")] {
+            if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
                 let hashes = _mm256_loadu_si256(self.hashes.as_ptr().add(idx) as _);
                 let match_hash = _mm256_cmpeq_epi16(_mm256_set1_epi16(hash_hi as _), hashes);
                 let match_zero = _mm256_cmpeq_epi16(hashes, _mm256_setzero_si256());
@@ -432,7 +432,7 @@ pub struct SeedMatch {
 struct Aligned<const L: usize>([u8; L]);
 
 cfg_if! {
-    if #[cfg(target_feature = "avx2")] {
+    if #[cfg(any(target_feature = "avx2", all(target_arch = "x86_64", feature = "release-simd")))] {
         #[cfg(target_arch = "x86")]
         use std::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -548,7 +548,10 @@ mod tests {
         assert!(expected.is_subset(&observed));
     }
 
-    #[cfg(target_feature = "avx2")]
+    #[cfg(any(
+        target_feature = "avx2",
+        all(target_arch = "x86_64", feature = "release-simd")
+    ))]
     #[test]
     fn small_searcher_emits_every_pattern_sharing_a_seed() {
         let patterns = [b"AC".as_slice(), b"AC".as_slice()];
@@ -560,7 +563,10 @@ mod tests {
         assert_eq!(observed, BTreeSet::from([0, 1]));
     }
 
-    #[cfg(target_feature = "avx2")]
+    #[cfg(any(
+        target_feature = "avx2",
+        all(target_arch = "x86_64", feature = "release-simd")
+    ))]
     #[test]
     fn small_searcher_emits_a_candidate_stored_in_bit_seven() {
         let patterns = [

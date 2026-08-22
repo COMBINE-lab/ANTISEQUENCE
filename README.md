@@ -8,26 +8,30 @@ Rust stream processing library for sequencing reads.
 antisequence = "0.1"
 ```
 
-The default matcher backend is portable across the supported CPU families:
-SSE2 on x86_64 and NEON on aarch64. The speculative parallel gzip decoder is
-an independent opt-in feature:
+The default `baseline-simd` matcher backend preserves a library-friendly CPU
+floor: SSE2 on x86_64 and NEON on aarch64. The speculative parallel gzip
+decoder is an independent opt-in feature:
 
 ```toml
 [dependencies]
 antisequence = { version = "0.1", features = ["accelerated-gzip"] }
 ```
 
-For a locally built x86_64 binary whose deployment hosts all support AVX2,
-disable the portable default and select the optimized backend explicitly:
+Binary applications publishing architecture-tuned artifacts should disable the
+baseline default and select `release-simd`. It uses AVX2 on x86_64 and NEON on
+aarch64:
 
 ```toml
 [dependencies]
-antisequence = { version = "0.1", default-features = false, features = ["simd-avx2"] }
+antisequence = { version = "0.1", default-features = false, features = ["release-simd"] }
 ```
 
-`portable-simd` and `simd-avx2` are intentionally mutually exclusive so an
-AVX2 CPU floor cannot be introduced accidentally through Cargo feature
-unification.
+`baseline-simd` and `release-simd` are intentionally mutually exclusive so an
+application cannot accidentally combine incompatible block-aligner widths.
+The pre-release feature names `portable-simd` and `simd-avx2` remain aliases for
+Git users, but new consumers should use the role-based names. Applications can
+record [`compiled_simd_backend`](https://docs.rs/antisequence/latest/antisequence/fn.compiled_simd_backend.html)
+in their build or run provenance.
 
 ## Goals
 * Robust, flexible, and actually universal primitives for manipulating raw DNA/RNA sequences from fastq files

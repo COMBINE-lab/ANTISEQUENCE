@@ -120,6 +120,60 @@ cfg_if::cfg_if! {
     }
 }
 
+/// SIMD implementation compiled into ANTISEQUENCE's alignment backend.
+///
+/// This is build provenance, not the per-operation matcher-plan family. Binary
+/// applications should expose it in their version and run reports so release
+/// builds cannot silently fall back to a lower-width backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledSimdBackend {
+    X86Sse2,
+    X86Avx2,
+    Aarch64Neon,
+}
+
+impl CompiledSimdBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86Sse2 => "x86-sse2",
+            Self::X86Avx2 => "x86-avx2",
+            Self::Aarch64Neon => "aarch64-neon",
+        }
+    }
+
+    pub const fn cpu_requirement(self) -> &'static str {
+        match self {
+            Self::X86Sse2 => "x86-64-v1 (SSE2)",
+            Self::X86Avx2 => "x86-64-v3 (AVX2)",
+            Self::Aarch64Neon => "AArch64 (NEON)",
+        }
+    }
+}
+
+impl std::fmt::Display for CompiledSimdBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Return the alignment SIMD backend selected by Cargo features for this build.
+pub const fn compiled_simd_backend() -> CompiledSimdBackend {
+    #[cfg(all(target_arch = "x86_64", feature = "release-simd"))]
+    {
+        return CompiledSimdBackend::X86Avx2;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "baseline-simd"))]
+    {
+        return CompiledSimdBackend::X86Sse2;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return CompiledSimdBackend::Aarch64Neon;
+    }
+    #[allow(unreachable_code)]
+    CompiledSimdBackend::X86Sse2
+}
+
 pub mod errors;
 pub mod expr;
 pub mod graph;
@@ -136,6 +190,21 @@ mod seed_search;
 
 pub use crate::patterns::*;
 pub use crate::read::*;
+
+#[cfg(test)]
+mod simd_build_tests {
+    use super::{compiled_simd_backend, CompiledSimdBackend};
+
+    #[test]
+    fn compiled_backend_matches_selected_feature() {
+        #[cfg(all(target_arch = "x86_64", feature = "baseline-simd"))]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::X86Sse2);
+        #[cfg(all(target_arch = "x86_64", feature = "release-simd"))]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::X86Avx2);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(compiled_simd_backend(), CompiledSimdBackend::Aarch64Neon);
+    }
+}
 
 #[cfg(test)]
 mod pipeline_tests {

@@ -22,8 +22,9 @@ library under their own application lockfiles, as usual.
 - `rapidgzip-core` is optional behind `accelerated-gzip`. seqproc enables it
   explicitly, while applications using only graph/matcher APIs do not compile
   or ship the speculative decoder.
-- Block aligner uses portable SSE2/NEON defaults. x86_64 AVX2 is an explicit,
-  mutually exclusive opt-in feature and is tested separately.
+- Block aligner uses library-safe SSE2/NEON defaults. The mutually exclusive
+  `release-simd` application feature selects AVX2 on x86_64 and NEON on
+  aarch64, and is tested separately.
 - Compatible patch/minor releases are accepted by the existing caret
   requirements and are exercised by lockfile-free library CI.
 - The declared Rust floor is 1.88, matching the highest minimum in the fresh
@@ -61,7 +62,7 @@ admit the current compatible releases in the “keep” rows.
 | `crossbeam-channel` | 0.5.16 | 0.5.16 | Keep; current. |
 | `mimalloc` (optional) | 0.1.52 | 0.1.52 | Keep; current. |
 | `jemallocator` (optional) | 0.5.4 | 0.5.4 | Keep; current. |
-| `block-aligner` | 0.5.1 | 0.5.1 | Keep; current. SSE2/NEON is portable default; AVX2 is explicit opt-in. |
+| `block-aligner` | 0.5.1 | 0.5.1 | Keep; current. SSE2/NEON is the library baseline; `release-simd` selects AVX2 for tuned x86_64 applications. |
 
 ## Transitive findings
 
@@ -83,7 +84,7 @@ costs rather than duplicated per-read work.
 cargo update --dry-run --verbose
 cargo tree --duplicates
 cargo test --locked --all-targets --features accelerated-gzip
-cargo test --locked --all-targets --no-default-features --features simd-avx2,accelerated-gzip
+cargo test --locked --all-targets --no-default-features --features release-simd,accelerated-gzip
 cargo package --locked --allow-dirty
 cargo audit
 ```
