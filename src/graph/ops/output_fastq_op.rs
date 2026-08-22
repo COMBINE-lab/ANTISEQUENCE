@@ -643,6 +643,22 @@ impl OutputFastqFileOp {
         }
         Ok(())
     }
+
+    /// Flush every writer that has been opened, finalizing gzip members and
+    /// streams, and collect all failures. Opens no new files.
+    fn flush_open_writers(&self) -> Vec<Error> {
+        let mut failures = Vec::new();
+        let writers = self.file_writers.lock();
+        for (file_name, writer) in writers.iter() {
+            if let Err(source) = writer.lock().flush() {
+                failures.push(Error::FileIo {
+                    file: utf8(file_name),
+                    source: Box::new(source),
+                });
+            }
+        }
+        failures
+    }
 }
 
 impl Drop for OutputFastqFileOp {
@@ -728,15 +744,27 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
             }
         }
 
-        let writers = self.file_writers.lock();
-        for (file_name, writer) in writers.iter() {
-            if let Err(source) = writer.lock().flush() {
-                failures.push(Error::FileIo {
-                    file: utf8(file_name),
-                    source: Box::new(source),
-                });
-            }
+        failures.extend(self.flush_open_writers());
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let summary = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(Error::WorkerFailures {
+                summary,
+                errors: failures,
+            })
         }
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        // Failure-path finalization: flush and finalize only writers that
+        // already streamed data. Never materialize constant outputs here — a
+        // failed run must not create or truncate destinations it never wrote.
+        let failures = self.flush_open_writers();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1202,6 +1230,12 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
 
     fn cost_class(&self) -> CostClass {
         CostClass::Io
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        // Writers are supplied at construction, so failure-path finalization
+        // is identical to success-path finalization: flush what was written.
+        <Self as GraphNode<T>>::finish(self)
     }
 
     fn finish(&self) -> Result<()> {

@@ -27,6 +27,8 @@ pub struct Graph<T: Trace = NoTrace> {
 const GRAPH_READY: u8 = 0;
 const GRAPH_RUNNING: u8 = 1;
 const GRAPH_FINISHED: u8 = 2;
+const GRAPH_FINISHING: u8 = 3;
+const GRAPH_FINISH_FAILED: u8 = 4;
 
 /// Mutable graph construction API.
 ///
@@ -1022,6 +1024,18 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         Ok(())
     }
 
+    /// Flush and finalize only writers that already hold buffered data.
+    ///
+    /// Called instead of [`GraphNode::finish`] when an execution failed:
+    /// implementations must not create files or materialize constant
+    /// outputs, but must still surface flush and footer failures for data
+    /// that was already streamed. Nested control-flow nodes forward the
+    /// hook to their child graphs.
+    #[inline]
+    fn finish_existing(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Select optional runtime statistics for this node.
     ///
     /// Statistics are disabled by default so ordinary graph execution does not
@@ -1535,6 +1549,15 @@ impl<T: Trace> Graph<T> {
     /// concurrently. Public callers can also drive a graph batch by batch,
     /// but must call `finish` when the stream is complete.
     fn begin_or_continue_execution(&self) -> Result<()> {
+        // Hot path: `run_one` calls this per batch, and nested graphs inside
+        // `TryOp`/`WhileOp` call it once per read across every worker. A
+        // failed `compare_exchange` still takes the cacheline exclusively,
+        // so the already-running common case must be a plain load.
+        match self.execution_state.load(Ordering::Acquire) {
+            GRAPH_RUNNING => return Ok(()),
+            GRAPH_READY => {}
+            _ => return Err(Error::GraphAlreadyFinished),
+        }
         match self.execution_state.compare_exchange(
             GRAPH_READY,
             GRAPH_RUNNING,
@@ -2945,34 +2968,77 @@ impl<T: Trace> Graph<T> {
         Ok(())
     }
 
-    /// Finish every node, retaining all failures so one broken output cannot
-    /// hide a second broken output.
-    pub fn finish(&self) -> Result<()> {
-        if self.execution_state.swap(GRAPH_FINISHED, Ordering::AcqRel) == GRAPH_FINISHED {
-            return Ok(());
+    /// Claim finalization exactly once and record its outcome. A repeated
+    /// `finish` after success is an idempotent `Ok`; a repeated call after a
+    /// failed finalization returns the sticky [`Error::GraphFinalizationFailed`]
+    /// so no caller can observe a false success for data that never reached
+    /// its destination.
+    fn finalize_with(&self, finalize: impl Fn(&dyn GraphNode<T>) -> Result<()>) -> Result<()> {
+        loop {
+            let state = self.execution_state.load(Ordering::Acquire);
+            match state {
+                GRAPH_FINISHED => return Ok(()),
+                GRAPH_FINISH_FAILED => return Err(Error::GraphFinalizationFailed),
+                GRAPH_FINISHING => return Err(Error::GraphAlreadyRunning),
+                _ => {
+                    if self
+                        .execution_state
+                        .compare_exchange(
+                            state,
+                            GRAPH_FINISHING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
         }
         let failures = self
             .nodes
             .iter()
-            .filter_map(|node| node.finish().err())
+            .filter_map(|node| finalize(node.as_ref()).err())
             .collect::<Vec<_>>();
         if failures.is_empty() {
+            self.execution_state
+                .store(GRAPH_FINISHED, Ordering::Release);
             Ok(())
         } else {
+            self.execution_state
+                .store(GRAPH_FINISH_FAILED, Ordering::Release);
             Err(aggregate_failures(failures))
         }
+    }
+
+    /// Finish every node, retaining all failures so one broken output cannot
+    /// hide a second broken output.
+    pub fn finish(&self) -> Result<()> {
+        self.finalize_with(|node| node.finish())
+    }
+
+    /// Flush and finalize writers that already hold buffered data without
+    /// creating files or materializing constant outputs. Used on failed
+    /// executions so finalization failures are reported instead of being
+    /// silently dropped in `Drop`.
+    pub fn finish_existing(&self) -> Result<()> {
+        self.finalize_with(|node| node.finish_existing())
     }
 
     fn finish_after<R>(&self, execution: Result<R>) -> Result<R> {
         match execution {
             Ok(value) => self.finish().map(|()| value),
             Err(error) => {
-                // Finalization may materialize constant outputs and flush or
-                // truncate destinations. A failed execution must be terminal,
-                // but must not turn partial state into apparently valid output.
-                self.execution_state
-                    .store(GRAPH_FINISHED, Ordering::Release);
-                Err(error)
+                // A failed execution is terminal and must not materialize
+                // constant outputs or truncate destinations that were never
+                // written. Writers that already hold data are still flushed
+                // and finalized so their failures surface alongside the
+                // execution error rather than vanishing in `Drop`.
+                match self.finish_existing() {
+                    Ok(()) => Err(error),
+                    Err(finish_error) => Err(aggregate_failures(vec![error, finish_error])),
+                }
             }
         }
     }

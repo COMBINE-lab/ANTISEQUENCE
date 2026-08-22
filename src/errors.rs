@@ -15,6 +15,9 @@ pub enum Error {
     #[error("Graph execution is already active")]
     GraphAlreadyRunning,
 
+    #[error("Graph finalization previously failed; outputs must not be trusted")]
+    GraphFinalizationFailed,
+
     #[error("Number of threads must be greater than zero (received {0})")]
     InvalidThreadCount(usize),
 

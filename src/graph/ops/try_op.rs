@@ -149,6 +149,24 @@ impl<T: Trace> GraphNode<T> for TryOp<T> {
         ]
     }
 
+    fn finish_existing(&self) -> Result<()> {
+        let try_result = self.try_graph.finish_existing();
+        let catch_result = self.catch_graph.finish_existing();
+        match (try_result, catch_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(first), Err(second)) => {
+                let errors = vec![first, second];
+                let summary = errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Err(Error::WorkerFailures { summary, errors })
+            }
+        }
+    }
+
     fn finish(&self) -> Result<()> {
         let try_result = self.try_graph.finish();
         let catch_result = self.catch_graph.finish();

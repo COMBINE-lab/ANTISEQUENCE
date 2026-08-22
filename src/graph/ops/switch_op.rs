@@ -197,6 +197,24 @@ impl<T: Trace> GraphNode<T> for SwitchOp<T> {
             .collect()
     }
 
+    fn finish_existing(&self) -> Result<()> {
+        let errors = self
+            .arms
+            .iter()
+            .filter_map(|arm| arm.graph.finish_existing().err())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let summary = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(Error::WorkerFailures { summary, errors })
+        }
+    }
+
     fn finish(&self) -> Result<()> {
         let errors = self
             .arms

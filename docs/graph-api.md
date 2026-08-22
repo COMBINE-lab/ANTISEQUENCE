@@ -36,11 +36,18 @@ contract to every node.
 
 High-level execution methods (`try_run_with_threads`, `try_run_pipeline`, and
 `try_run_planned`) finalize the graph on success and propagate writer footer or
-flush failures. Low-level consumers that call `run_one` directly own the
-streaming lifecycle and must call `Graph::finish()` exactly once after the last
-successful batch. Repeated explicit `finish()` calls are harmless, but a graph
-cannot be executed again after successful or failed execution has made it
-terminal.
+flush failures. On a failed execution they do not materialize constant outputs
+or create files the run never wrote, but writers that already streamed data are
+still flushed and finalized, and any finalization failure is aggregated with
+the execution error rather than dropped. Note that a destination the run *did*
+begin writing has already been created or truncated by that streaming; a failed
+run cannot restore its previous contents. Low-level consumers that call
+`run_one` directly own the streaming lifecycle and must call `Graph::finish()`
+exactly once after the last successful batch. Repeated `finish()` calls after
+success are harmless; once a finalization has failed, every later `finish()`
+returns the sticky `GraphFinalizationFailed` error so no caller can observe a
+false success. A graph cannot be executed again after successful or failed
+execution has made it terminal.
 
 Compilation enables conservative graph optimization by default. Use
 `compile_with(GraphOptimizationConfig { enabled: false })` to construct a

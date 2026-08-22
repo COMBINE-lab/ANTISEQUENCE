@@ -1511,6 +1511,48 @@ mod pipeline_tests {
             .contains("intentional final flush failure"));
     }
 
+    #[test]
+    fn finish_failure_is_sticky_across_repeated_calls() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("intentional final flush failure"));
+
+        // A repeated finish must not report success for data that never
+        // reached its destination.
+        let repeat = graph.finish().unwrap_err();
+        assert!(matches!(
+            repeat,
+            crate::errors::Error::GraphFinalizationFailed
+        ));
+    }
+
+    #[test]
+    fn failed_execution_still_reports_finalization_errors() {
+        // One valid record streams into the writer; the second record is
+        // malformed, so execution fails. The failure path must still flush
+        // the writer that holds data and surface its error alongside the
+        // execution error instead of dropping it in Drop.
+        let mut malformed = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        malformed.extend_from_slice(b"@read2\nACGT\n+\nII\n");
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(malformed)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("parsing record"), "{message}");
+        assert!(
+            message.contains("intentional final flush failure"),
+            "{message}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn file_output_propagates_dev_full_for_plain_and_gzip_streams() {

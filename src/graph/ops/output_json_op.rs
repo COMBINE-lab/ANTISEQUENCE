@@ -148,6 +148,11 @@ impl<'writer, T: Trace> GraphNode<T> for OutputJsonOp<'writer> {
         CostClass::Io
     }
 
+    fn finish_existing(&self) -> Result<()> {
+        // The JSON writer is supplied at construction; flush what exists.
+        <Self as GraphNode<T>>::finish(self)
+    }
+
     fn finish(&self) -> Result<()> {
         self.writer
             .lock()

@@ -77,6 +77,9 @@ impl<T: Trace> TryOrientationOp<T> {
         // Record metadata is not yet a separate typed control plane. Give
         // every nested orientation operation its own reserved 24-byte key so
         // nested graphs and user `_batch_idx` attributes cannot alias it.
+        // "__as_to_" (8 bytes) plus 16 hex digits must fit InlineString;
+        // fail at compile time if the prefix or id width ever changes.
+        const _: () = assert!(8 + 16 <= crate::inline_string::LEN);
         let operation_id = NEXT_TRY_ORIENTATION_ID.fetch_add(1, Ordering::Relaxed);
         let batch_idx_name = format!("__as_to_{operation_id:016x}");
         Self {
@@ -297,6 +300,10 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
 
     fn finish(&self) -> Result<()> {
         self.inner.finish()
+    }
+
+    fn finish_existing(&self) -> Result<()> {
+        self.inner.finish_existing()
     }
 
     fn name(&self) -> &'static str {

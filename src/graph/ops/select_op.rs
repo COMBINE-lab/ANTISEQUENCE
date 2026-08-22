@@ -127,6 +127,10 @@ impl<T: Trace> GraphNode<T> for SelectOp<T> {
         self.graph.finish()
     }
 
+    fn finish_existing(&self) -> Result<()> {
+        self.graph.finish_existing()
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

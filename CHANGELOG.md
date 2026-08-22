@@ -7,6 +7,24 @@ All notable changes to ANTISEQUENCE are documented here. This project follows
 
 ## [0.1.0] - 2026-08-21
 
+- Atomic graph execution lifecycle: a graph runs at most once, repeated
+  execution returns the typed `GraphAlreadyRunning`/`GraphAlreadyFinished`
+  errors, and retry-after-failure is intentionally not supported.
+- Fallible recursive finalization (`GraphNode::finish`): footer and flush
+  failures surface before success is reported. Failed executions flush and
+  finalize writers that already streamed data (without creating files or
+  materializing constant outputs) and aggregate those failures with the
+  execution error; a failed finalization is sticky, and later `finish()`
+  calls return the typed `GraphFinalizationFailed` error.
+- Mixed-length Hamming pattern sets now derive the shared seed width from
+  each literal's independently safe bound, fixing silent false negatives,
+  and fall back to exhaustive verification when no shared exact seed is
+  guaranteed.
+- `MatchAnyOp::new` panics on the configurations `try_new` rejects
+  (pattern-quality ambiguity with edit metrics, position-quality with
+  non-Exact/Hamming metrics, alignment thresholds outside `0.0..=1.0`);
+  use `try_new` for fallible construction.
+
 - Typed, validated graph construction with explicit missing-input policies.
 - Whole-graph and bounded pipeline execution with ordered parallel output.
 - Exact, Hamming, edit-distance, seeded, lookup-table, Myers, and SIMD matcher
