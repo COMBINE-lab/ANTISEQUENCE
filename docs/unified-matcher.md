@@ -7,8 +7,12 @@ ANTISEQUENCE now separates matching semantics from backend selection.
   `Bounded`).
 - `MatchType` remains source-compatible and converts losslessly to
   `MatchSpec`.
-- `MatcherPlan` records the selected backend, pattern-set summary, and a stable
-  reason. `MatchAnyOp::matcher_plan()` exposes it before execution.
+- `MatcherPlan` records the selected backend family, pattern-set summary, and a
+  stable reason. `MatchAnyOp::matcher_plan()` exposes it before execution. The
+  backend field is an advisory, observable planning classification rather than
+  a public dispatch switch: construction prebuilds the corresponding lookup,
+  seed, Myers, or alignment state, and execution may use a correctness fallback
+  (for example, a non-ACGT query bypassing the short Hamming table).
 - `reference_match` is a deliberately exhaustive oracle for exact, Hamming,
   and edit semantics. It reports every equal-best `(pattern, start, end,
   distance)` candidate and is used for differential validation.

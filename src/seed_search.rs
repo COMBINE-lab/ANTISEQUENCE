@@ -98,7 +98,7 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
                         _mm256_set1_epi8(-1i8)
                     };
 
-                    for j in 0..K {
+                    for (j, pattern_lut) in pattern_luts.iter().enumerate() {
                         let mut chars = if REST {
                             read_rest_avx2(text.as_ptr().add(i + j), len)
                         } else {
@@ -109,7 +109,7 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
                             chars = _mm256_srli_epi16(chars, 1);
                         }
 
-                        let pattern_lut = _mm256_load_si256(pattern_luts[j].0.as_ptr() as _);
+                        let pattern_lut = _mm256_load_si256(pattern_lut.0.as_ptr() as _);
                         let curr_set = _mm256_shuffle_epi8(pattern_lut, _mm256_and_si256(chars, lo_4_mask));
                         set = _mm256_and_si256(set, curr_set);
                     }

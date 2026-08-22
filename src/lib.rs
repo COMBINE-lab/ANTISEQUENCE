@@ -2586,20 +2586,63 @@ mod pipeline_tests {
 
     #[test]
     fn test_short_hamming_lookup_falls_back_for_non_acgt_input() {
-        let fq = fastq_bytes(&[("read1", "ACGN", "IIII")]);
+        let fq = fastq_bytes(&[("accepted", "ACGN", "IIII"), ("rejected", "ACNN", "IIII")]);
         let patterns = Patterns::from_strs(["ACGT"]);
 
         let mut g = Graph::<NoTrace>::new();
         g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
-        g.add(MatchAnyOp::new(
-            te("seq1.* -> seq1.*"),
-            patterns,
-            Hamming(Count(3)),
-        ));
-        let counter = g.add(CountOp::new([true]));
+        let operation = MatchAnyOp::new(te("seq1.* -> seq1.*"), patterns, Hamming(Count(3)));
+        assert_eq!(
+            operation.matcher_plan().backend,
+            crate::matcher::MatcherBackend::HammingLookup
+        );
+        g.add(operation);
+        g.add(NullOutputOp::new());
+        g.set_statistics_level(StatisticsLevel::Detailed);
         g.run().unwrap();
 
-        assert_eq!(counter.counts()[0], 1);
+        // MatchAnyOp does not reject a record merely because it failed to
+        // match. The detailed distance histogram only records successful
+        // matches, so its total proves that ACGN matched through the general
+        // verifier while the over-threshold ACNN control did not.
+        let report = g.match_distance_counts().remove(0);
+        assert_eq!(report.total, 2);
+        assert_eq!(report.counts.iter().sum::<usize>(), 1);
+        assert_eq!(report.counts[1], 1);
+    }
+
+    #[test]
+    fn alignment_thresholds_are_validated_before_seed_planning() {
+        for match_type in [
+            GlobalAln(1.01),
+            LocalAln {
+                identity: f64::NAN,
+                overlap: 0.8,
+            },
+            PrefixAln {
+                identity: 0.8,
+                overlap: -0.1,
+            },
+            SuffixAln {
+                identity: 0.8,
+                overlap: f64::INFINITY,
+            },
+        ] {
+            let transform = match match_type.num_mappings() {
+                1 => "seq1.* -> seq1.a",
+                2 => "seq1.* -> seq1.a, seq1.b",
+                3 => "seq1.* -> seq1.a, seq1.b, seq1.c",
+                _ => unreachable!(),
+            };
+            let error =
+                MatchAnyOp::try_new(te(transform), Patterns::from_strs(["ACGT"]), match_type)
+                    .err()
+                    .expect("invalid alignment thresholds must fail construction");
+            assert!(error.to_string().contains("finite fractions in 0..=1"));
+            // The compatibility helper remains total for direct callers and
+            // must never underflow even before construction validation.
+            let _ = match_type.k(4);
+        }
     }
 
     #[test]

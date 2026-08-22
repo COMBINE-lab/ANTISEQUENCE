@@ -5,17 +5,7 @@ All notable changes to ANTISEQUENCE are documented here. This project follows
 
 ## [Unreleased]
 
-- Separate the library-safe `baseline-simd` backend from the application-tuned
-  `release-simd` backend and expose the compiled backend as public provenance.
-- Compile AVX2 seed search whenever the x86_64 release backend is selected,
-  including source builds that did not set a global `target-cpu` flag.
-- Document that applications selecting the AVX2 backend own runtime CPU-floor
-  enforcement; ANTISEQUENCE reports the exact backend requirement without
-  imposing seqproc's broader x86-64-v3 artifact policy on other consumers.
-
 ## [0.1.0] - 2026-08-21
-
-Initial public release.
 
 - Typed, validated graph construction with explicit missing-input policies.
 - Whole-graph and bounded pipeline execution with ordered parallel output.
@@ -27,6 +17,13 @@ Initial public release.
   graph/geometry/memory-aware batch planning.
 - FASTQ, sharded FASTQ, interleaved input, gzip output, and optional
   `rapidgzip-core` accelerated input.
+- Separate the library-safe `baseline-simd` backend from the application-tuned
+  `release-simd` backend and expose the compiled backend as public provenance.
+- Compile AVX2 seed search whenever the x86_64 release backend is selected,
+  including source builds that did not set a global `target-cpu` flag.
+- Document that applications selecting the AVX2 backend own runtime CPU-floor
+  enforcement; ANTISEQUENCE reports the exact backend requirement without
+  imposing seqproc's broader x86-64-v3 artifact policy on other consumers.
 - Baseline SSE2/NEON defaults and an explicit architecture-tuned application
   build feature.
 

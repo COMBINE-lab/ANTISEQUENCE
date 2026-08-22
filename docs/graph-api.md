@@ -29,9 +29,18 @@ first, duplicate input-stage nodes, or transformations placed after an output.
 Transform-only subgraphs are valid. The existing `Graph` API remains available
 for compatibility and can itself be frozen with `Graph::compile()`.
 
-The compiled graph does not expose structural mutation. Runtime statistics
-remain selectable because they are instrumentation state rather than graph
-structure.
+The compiled graph exposes neither structural mutation nor post-compilation
+statistics mutation. Select `StatisticsLevel` on `GraphBuilder` before
+`compile()`; the compiled graph then propagates that immutable instrumentation
+contract to every node.
+
+High-level execution methods (`try_run_with_threads`, `try_run_pipeline`, and
+`try_run_planned`) finalize the graph on success and propagate writer footer or
+flush failures. Low-level consumers that call `run_one` directly own the
+streaming lifecycle and must call `Graph::finish()` exactly once after the last
+successful batch. Repeated explicit `finish()` calls are harmless, but a graph
+cannot be executed again after successful or failed execution has made it
+terminal.
 
 Compilation enables conservative graph optimization by default. Use
 `compile_with(GraphOptimizationConfig { enabled: false })` to construct a

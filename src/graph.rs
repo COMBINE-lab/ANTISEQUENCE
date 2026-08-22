@@ -3416,19 +3416,23 @@ impl MatchType {
             EditSearch(t) => k_from_edits(len, t.get(len)),
             EditBoundedMatch { threshold: t, .. } => k_from_edits(len, t.get(len)),
             GlobalAln(identity) => {
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             PrefixAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             SuffixAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
             LocalAln { identity, overlap } => {
-                let len = ((len as f64) * overlap).ceil() as usize;
-                k_from_edits(len, len - (((len as f64) * identity).ceil() as usize))
+                let len = (((len as f64) * overlap).ceil() as usize).min(len);
+                let required = (((len as f64) * identity).ceil() as usize).min(len);
+                k_from_edits(len, len.saturating_sub(required))
             }
         }
     }

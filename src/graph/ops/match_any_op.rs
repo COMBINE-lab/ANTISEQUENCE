@@ -476,6 +476,23 @@ impl MatchAnyOp {
         patterns: Patterns,
         match_type: MatchType,
     ) -> Result<Self> {
+        let valid_fraction = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
+        let alignment_thresholds = match match_type {
+            MatchType::GlobalAln(identity) => Some((identity, 1.0)),
+            MatchType::LocalAln { identity, overlap }
+            | MatchType::PrefixAln { identity, overlap }
+            | MatchType::SuffixAln { identity, overlap } => Some((identity, overlap)),
+            _ => None,
+        };
+        if alignment_thresholds.is_some_and(|(identity, overlap)| {
+            !valid_fraction(identity) || !valid_fraction(overlap)
+        }) {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "alignment identity and overlap must be finite fractions in 0..=1"
+                    .to_owned(),
+            });
+        }
         if matches!(
             patterns.ambiguity_policy(),
             Some(AmbiguityPolicy::Quality { .. })
