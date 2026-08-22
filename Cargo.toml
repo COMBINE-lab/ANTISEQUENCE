@@ -10,16 +10,16 @@ homepage = "https://github.com/COMBINE-lab/ANTISEQUENCE"
 documentation = "https://docs.rs/antisequence"
 readme = "README.md"
 include = [
-    "src/**",
-    "examples/**",
-    "example_data/**",
-    "docs/**",
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    "CHANGELOG.md",
-    "CITATION.cff",
-    "LICENSE",
+    "/src/**",
+    "/examples/**",
+    "/example_data/**",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CITATION.cff",
+    "/LICENSE",
 ]
 keywords = ["bioinformatics", "fastq", "sequencing", "preprocessing"]
 categories = ["science"]
