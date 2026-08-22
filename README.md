@@ -31,7 +31,10 @@ application cannot accidentally combine incompatible block-aligner widths.
 The pre-release feature names `portable-simd` and `simd-avx2` remain aliases for
 Git users, but new consumers should use the role-based names. Applications can
 record [`compiled_simd_backend`](https://docs.rs/antisequence/latest/antisequence/fn.compiled_simd_backend.html)
-in their build or run provenance.
+in their build or run provenance. `release-simd` does not add runtime CPU
+dispatch: an executable selecting it must advertise or check the AVX2 floor
+before invoking matcher code. seqproc performs that check and applies its
+stronger x86-64-v3 distribution policy at the application boundary.
 
 ## Goals
 * Robust, flexible, and actually universal primitives for manipulating raw DNA/RNA sequences from fastq files

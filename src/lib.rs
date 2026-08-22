@@ -144,7 +144,7 @@ impl CompiledSimdBackend {
     pub const fn cpu_requirement(self) -> &'static str {
         match self {
             Self::X86Sse2 => "x86-64-v1 (SSE2)",
-            Self::X86Avx2 => "x86-64-v3 (AVX2)",
+            Self::X86Avx2 => "x86_64 with AVX2",
             Self::Aarch64Neon => "AArch64 (NEON)",
         }
     }
