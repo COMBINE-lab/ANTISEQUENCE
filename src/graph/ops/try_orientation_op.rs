@@ -1,5 +1,8 @@
 use crate::graph::*;
 use crate::inline_string::InlineString;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TRY_ORIENTATION_ID: AtomicU64 = AtomicU64::new(0);
 
 static COMP_LUT: [u8; 256] = {
     let mut l = [0u8; 256];
@@ -71,15 +74,60 @@ impl<T: Trace> TryOrientationOp<T> {
                 }
             }
         }
+        // Record metadata is not yet a separate typed control plane. Give
+        // every nested orientation operation its own reserved 24-byte key so
+        // nested graphs and user `_batch_idx` attributes cannot alias it.
+        let operation_id = NEXT_TRY_ORIENTATION_ID.fetch_add(1, Ordering::Relaxed);
+        let batch_idx_name = format!("__as_to_{operation_id:016x}");
         Self {
             inner,
             read_idx,
             attr_name,
-            batch_idx_attr: InlineString::new(b"_batch_idx"),
+            batch_idx_attr: InlineString::new(batch_idx_name.as_bytes()),
             required_names: [root],
             produced_names,
             orientation_name,
         }
+    }
+
+    fn survivor_index(&self, read: &Read, batch_len: usize) -> Result<usize> {
+        match read.record_data(self.batch_idx_attr) {
+            Some(Data::Int(index)) if *index >= 0 && (*index as usize) < batch_len => {
+                Ok(*index as usize)
+            }
+            Some(Data::Int(index)) => Err(Error::GraphExecution(format!(
+                "{} internal batch index {index} is outside 0..{batch_len}",
+                Self::NAME
+            ))),
+            Some(_) => Err(Error::GraphExecution(format!(
+                "{} internal batch index was modified to a non-integer value by its nested graph",
+                Self::NAME
+            ))),
+            None => Err(Error::GraphExecution(format!(
+                "{} internal batch index was removed by its nested graph",
+                Self::NAME
+            ))),
+        }
+    }
+
+    fn tag_survivors(
+        &self,
+        reads: Vec<Read>,
+        orientation: &[u8],
+        batch_len: usize,
+    ) -> Result<Vec<(usize, Read)>> {
+        // Preserve the established public representation of the orientation
+        // value during the compatibility cycle.
+        let orientation = Data::Bytes(orientation.to_vec());
+        reads
+            .into_iter()
+            .map(|mut read| {
+                let index = self.survivor_index(&read, batch_len)?;
+                *read.lane_data_mut(self.read_idx, self.attr_name) = orientation.clone();
+                read.remove_record_data(&self.batch_idx_attr);
+                Ok((index, read))
+            })
+            .collect()
     }
 }
 
@@ -96,6 +144,12 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         // Step 1: Tag each read with a batch index and clone the batch.
         let mut tagged = reads;
         for (i, read) in tagged.iter_mut().enumerate() {
+            if read.record_data(self.batch_idx_attr).is_some() {
+                return Err(Error::GraphExecution(format!(
+                    "{} internal batch-index namespace collision",
+                    Self::NAME
+                )));
+            }
             *read.record_data_mut(self.batch_idx_attr) = Data::Int(i as isize);
         }
         let mut clones = Vec::with_capacity(tagged.len());
@@ -112,7 +166,11 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         let (fw_result, done) = self.inner.run_one(Some(tagged), trace)?;
 
         if done {
-            let res = (fw_result, done);
+            let mut survivors = self.tag_survivors(fw_result.unwrap_or_default(), b"fw", n)?;
+            survivors.sort_by_key(|(index, _)| *index);
+            let output = (!survivors.is_empty())
+                .then(|| survivors.into_iter().map(|(_, read)| read).collect());
+            let res = (output, done);
             trace.add(self.name(), start, &res.0);
             return Ok(res);
         }
@@ -122,14 +180,7 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
         // Collect surviving batch indices from forward pass.
         let mut fw_survived = vec![false; n];
         for read in &fw_survivors {
-            if let Some(data) = read.record_data(self.batch_idx_attr) {
-                if let Ok(idx) = data.as_int() {
-                    let idx = idx as usize;
-                    if idx < n {
-                        fw_survived[idx] = true;
-                    }
-                }
-            }
+            fw_survived[self.survivor_index(read, n)?] = true;
         }
 
         // Step 3: Build retry batch from clones at dropped indices.
@@ -162,48 +213,15 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
             (Vec::new(), false)
         };
 
-        // Step 5: Set orientation attributes and remove batch_idx.
-        let fw_val = Data::Bytes(b"fw".to_vec());
-        let rc_val = Data::Bytes(b"rc".to_vec());
-
-        let mut all_survivors: Vec<(usize, Read)> =
-            Vec::with_capacity(fw_survivors.len() + rc_survivors.len());
-
-        for mut read in fw_survivors {
-            let idx = read
-                .record_data(self.batch_idx_attr)
-                .expect("_batch_idx must be set on all reads by Step 1")
-                .as_int()
-                .expect("_batch_idx must be an Int") as usize;
-
-            *read.lane_data_mut(self.read_idx, self.attr_name) = fw_val.clone();
-
-            all_survivors.push((idx, read));
-        }
-
-        for mut read in rc_survivors {
-            let idx = read
-                .record_data(self.batch_idx_attr)
-                .expect("_batch_idx must be set on all reads by Step 1")
-                .as_int()
-                .expect("_batch_idx must be an Int") as usize;
-
-            *read.lane_data_mut(self.read_idx, self.attr_name) = rc_val.clone();
-
-            all_survivors.push((idx, read));
-        }
+        // Step 5: Set orientation attributes and remove the private batch key.
+        let mut all_survivors = self.tag_survivors(fw_survivors, b"fw", n)?;
+        all_survivors.extend(self.tag_survivors(rc_survivors, b"rc", n)?);
 
         // Step 6: Sort by original batch index to preserve ordering.
         all_survivors.sort_by_key(|(idx, _)| *idx);
 
-        // Step 7: Remove internal _batch_idx attribute from survivors.
-        let final_reads: Vec<Read> = all_survivors
-            .into_iter()
-            .map(|(_, mut r)| {
-                r.remove_record_data(&self.batch_idx_attr);
-                r
-            })
-            .collect();
+        // Step 7: Return records without exposing control metadata.
+        let final_reads: Vec<Read> = all_survivors.into_iter().map(|(_, read)| read).collect();
 
         let res = if final_reads.is_empty() {
             (None, rc_done)
@@ -291,5 +309,77 @@ impl<T: Trace> GraphNode<T> for TryOrientationOp<T> {
 
     fn all_match_distance_counts(&self) -> Vec<MatchDistanceCounts> {
         self.inner.match_distance_counts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct DoneImmediately;
+
+    impl GraphNode<NoTrace> for DoneImmediately {
+        fn run_inner(&self, reads: Vec<Read>) -> Result<(Option<Vec<Read>>, bool)> {
+            Ok((Some(reads), true))
+        }
+
+        fn required_names(&self) -> &[LabelOrAttr] {
+            &[]
+        }
+
+        fn name(&self) -> &'static str {
+            "DoneImmediately"
+        }
+    }
+
+    fn input_reads() -> Vec<Read> {
+        let fastq = b"@one\nACGT\n+\nIIII\n@two\nTGCA\n+\nIIII\n";
+        let mut input = Graph::<NoTrace>::new();
+        input.add(InputFastqOp::from_reader(Cursor::new(fastq)).unwrap());
+        input
+            .run_one(None, &NoTrace)
+            .unwrap()
+            .0
+            .expect("input batch")
+    }
+
+    #[test]
+    fn nested_done_retains_all_records_and_cleans_private_metadata() {
+        let user_batch_idx = InlineString::new(b"_batch_idx");
+        let mut reads = input_reads();
+        for read in &mut reads {
+            *read.record_data_mut(user_batch_idx) = Data::Int(41);
+        }
+        let mut inner = Graph::<NoTrace>::new();
+        inner.add(DoneImmediately);
+        let operation = TryOrientationOp::new(inner, 1, b"ori");
+        let private_key = operation.batch_idx_attr;
+
+        let (output, done) = operation.run(Some(reads), &NoTrace).unwrap();
+        assert!(done);
+        let output = output.expect("nested completion must retain its output");
+        assert_eq!(output.len(), 2);
+        for read in output {
+            assert!(read.record_data(private_key).is_none());
+            assert!(matches!(
+                read.record_data(user_batch_idx),
+                Some(Data::Int(41))
+            ));
+            assert!(matches!(
+                read.lane_data(1, InlineString::new(b"ori")),
+                Some(Data::Bytes(value)) if value == b"fw"
+            ));
+        }
+    }
+
+    #[test]
+    fn private_batch_namespace_collision_is_a_typed_error() {
+        let operation = TryOrientationOp::new(Graph::<NoTrace>::new(), 1, b"ori");
+        let mut reads = input_reads();
+        *reads[0].record_data_mut(operation.batch_idx_attr) = Data::Int(7);
+        let error = operation.run(Some(reads), &NoTrace).unwrap_err();
+        assert!(matches!(error, Error::GraphExecution(_)));
+        assert!(error.to_string().contains("namespace collision"));
     }
 }

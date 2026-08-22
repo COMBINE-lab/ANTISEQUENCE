@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::graph::*;
 use crate::matcher::{
-    reference_match, MatchMetric, MatchScope, MatcherBackend, MatcherPlan, PatternSummary,
+    reference_match, MatchMetric, MatchScope, MatchSpec, MatcherBackend, MatcherPlan,
+    PatternSummary,
 };
 use crate::seed_search::*;
 use crate::{AmbiguityPolicy, Pattern, Patterns, PositionAmbiguityPolicy};
@@ -491,6 +492,18 @@ impl MatchAnyOp {
                 reason: "pattern quality ambiguity is undefined for edit-distance alignments with insertions or deletions".to_owned(),
             });
         }
+        if matches!(
+            patterns.position_ambiguity_policy(),
+            PositionAmbiguityPolicy::Quality { .. }
+        ) && !matches!(
+            MatchSpec::from_match_type(match_type).metric,
+            MatchMetric::Exact | MatchMetric::Hamming { .. }
+        ) {
+            return Err(Error::InvalidOperation {
+                operation: Self::NAME,
+                reason: "position quality policy requires exact or Hamming search over equal-length windows".to_owned(),
+            });
+        }
         let mut new_labels = [None, None, None];
 
         transform_expr.check_size(1, match_type.num_mappings(), Self::NAME);
@@ -701,30 +714,10 @@ impl MatchAnyOp {
         pattern: &[u8],
         collect_detailed_statistics: bool,
     ) -> ReferencePositionResult {
+        if !self.uses_reference_position_oracle(collect_detailed_statistics) {
+            return Ok(None);
+        }
         let policy = self.patterns.position_ambiguity_policy();
-        if !collect_detailed_statistics && policy == PositionAmbiguityPolicy::Leftmost {
-            return Ok(None);
-        }
-        if !matches!(
-            self.matcher_plan.spec.scope,
-            MatchScope::Search | MatchScope::Bounded { .. }
-        ) {
-            return Ok(None);
-        }
-        if matches!(policy, PositionAmbiguityPolicy::Quality { .. })
-            && !matches!(
-                self.matcher_plan.spec.metric,
-                MatchMetric::Exact | MatchMetric::Hamming { .. }
-            )
-        {
-            return Err(Error::GraphExecution(
-                "position quality policy requires exact or Hamming search over equal-length windows"
-                    .to_string(),
-            ));
-        }
-        if matches!(self.matcher_plan.spec.metric, MatchMetric::Alignment { .. }) {
-            return Ok(None);
-        }
 
         let patterns = [pattern];
         let mut candidates =

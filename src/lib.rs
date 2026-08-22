@@ -869,20 +869,89 @@ mod pipeline_tests {
 
     #[test]
     fn position_quality_rejects_edit_distance_until_gap_quality_is_defined() {
-        let fq = fastq_bytes(&[("read1", "AAATAAAT", "IIIIIIII")]);
         let patterns = Patterns::from_strs(["AAAA"])
             .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 });
-        let mut graph = Graph::<NoTrace>::new();
-        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
-        graph.add(MatchAnyOp::new(
+        let error = MatchAnyOp::try_new(
             te("seq1.* -> seq1.left, seq1.anchor, seq1.right"),
             patterns,
             EditSearch(Count(1)),
-        ));
-        let error = graph.try_run_with_threads(1).unwrap_err();
+        )
+        .err()
+        .expect("position-quality/edit construction must fail");
         assert!(error
             .to_string()
             .contains("requires exact or Hamming search"));
+    }
+
+    #[test]
+    fn position_quality_metric_validation_covers_the_match_type_matrix() {
+        let patterns = || {
+            Patterns::from_strs(["AAAA"])
+                .with_position_ambiguity_policy(PositionAmbiguityPolicy::Quality { min_delta: 1 })
+        };
+        for (match_type, transform) in [
+            (ExactSearch, "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (HammingSearch(Count(3)), "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (
+                ExactBoundedMatch { from: 0, to: 8 },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (
+                HammingBoundedMatch {
+                    threshold: Count(3),
+                    from: 0,
+                    to: 8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+        ] {
+            MatchAnyOp::try_new(te(transform), patterns(), match_type)
+                .expect("exact/Hamming position quality must remain supported");
+        }
+
+        for (match_type, transform) in [
+            (Edit(Count(1)), "seq1.* -> seq1.a"),
+            (EditPrefix(Count(1)), "seq1.* -> seq1.a, seq1.b"),
+            (EditSuffix(Count(1)), "seq1.* -> seq1.a, seq1.b"),
+            (EditSearch(Count(1)), "seq1.* -> seq1.a, seq1.b, seq1.c"),
+            (
+                EditBoundedMatch {
+                    threshold: Count(1),
+                    from: 0,
+                    to: 8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (GlobalAln(0.8), "seq1.* -> seq1.a"),
+            (
+                LocalAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b, seq1.c",
+            ),
+            (
+                PrefixAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b",
+            ),
+            (
+                SuffixAln {
+                    identity: 0.8,
+                    overlap: 0.8,
+                },
+                "seq1.* -> seq1.a, seq1.b",
+            ),
+        ] {
+            let error = MatchAnyOp::try_new(te(transform), patterns(), match_type)
+                .err()
+                .expect("position quality must reject indel/alignment metrics");
+            assert!(error
+                .to_string()
+                .contains("requires exact or Hamming search"));
+        }
     }
 
     #[test]
@@ -1440,6 +1509,38 @@ mod pipeline_tests {
         assert!(error
             .to_string()
             .contains("intentional final flush failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_output_propagates_dev_full_for_plain_and_gzip_streams() {
+        use std::os::unix::fs::symlink;
+
+        let gzip_link = std::env::temp_dir().join(format!(
+            "antisequence-dev-full-{}-{}.fastq.gz",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        // A `.gz` symlink exercises the actual file-path compression branch
+        // while retaining /dev/full's deterministic ENOSPC behavior.
+        let _ = std::fs::remove_file(&gzip_link);
+        symlink("/dev/full", &gzip_link).unwrap();
+
+        for path in [
+            "/dev/full".to_owned(),
+            gzip_link.to_string_lossy().into_owned(),
+        ] {
+            let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+            let mut graph = Graph::<NoTrace>::new();
+            graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+            graph.add(OutputFastqFileOp::from_file(path));
+            let error = graph.try_run_with_threads(1).unwrap_err();
+            assert!(
+                error.to_string().contains("No space left on device"),
+                "unexpected /dev/full error: {error}"
+            );
+        }
+        std::fs::remove_file(gzip_link).unwrap();
     }
 
     #[test]
