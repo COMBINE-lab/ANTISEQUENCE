@@ -1451,12 +1451,14 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
             };
             // A seed index may produce many hits for the same pattern. The
             // exhaustive positional oracle depends only on this read and
-            // pattern, so compute it at most once per pattern per read.
-            let mut reference_positions =
-                vec![
-                    None::<Option<(Option<MatchPlacement>, PositionResolution)>>;
-                    self.patterns.patterns().len()
-                ];
+            // pattern, so compute it at most once per pattern per read. The
+            // cache is keyed sparsely by the patterns the seeds actually hit:
+            // a dense per-pattern table would cost O(pattern count) per read,
+            // which is prohibitive for whitelist-scale pattern sets.
+            let mut reference_positions: FxHashMap<
+                usize,
+                Option<(Option<MatchPlacement>, PositionResolution)>,
+            > = FxHashMap::default();
 
             for &(pattern_idx, text_i) in seed_hits.iter() {
                 let pattern = &self.patterns.patterns()[pattern_idx];
@@ -1467,8 +1469,9 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
                 let pattern_str: &[u8] = &pattern_str_cow;
                 let pattern_len = pattern_str.len();
-                let reference_position = if let Some(cached) = reference_positions[pattern_idx] {
-                    cached
+                let reference_position = if let Some(cached) = reference_positions.get(&pattern_idx)
+                {
+                    *cached
                 } else {
                     let computed = self.reference_position_candidate(
                         text,
@@ -1476,7 +1479,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                         pattern_str,
                         collect_stats,
                     )?;
-                    reference_positions[pattern_idx] = Some(computed);
+                    reference_positions.insert(pattern_idx, computed);
                     computed
                 };
                 let (matches, position_resolution) = if let Some(reference) = reference_position {
@@ -2287,18 +2290,42 @@ fn edit_search_long_myers(
     max_edits: usize,
 ) -> Option<(usize, usize, usize)> {
     let mut matches = searcher.find_all_lazy(text, max_edits);
-    let hits = matches.by_ref().collect::<Vec<_>>();
-    let best_distance = hits.iter().map(|(_, distance)| *distance).min()?;
-    let (start, best_end, traced_distance) = hits
-        .into_iter()
-        .filter(|(_, distance)| *distance == best_distance)
-        .filter_map(|(end, _)| {
-            matches
-                .hit_at(end)
-                .map(|(start, distance)| (start, end, distance))
-        })
-        .min_by_key(|(start, end, _)| (*start, *end))?;
-    debug_assert_eq!(best_distance, traced_distance);
+    let mut best_distance = usize::MAX;
+    let mut best_ends: Vec<usize> = Vec::new();
+    for (end, distance) in matches.by_ref() {
+        if distance < best_distance {
+            best_distance = distance;
+            best_ends.clear();
+        }
+        if distance == best_distance {
+            best_ends.push(end);
+        }
+    }
+    if best_ends.is_empty() {
+        return None;
+    }
+    // A placement within `best_distance` edits spans at most pattern_len +
+    // best_distance characters, so its start cannot precede its end by more
+    // than that window. Ends ascend, so tracebacks stop once no later end can
+    // improve the lexicographic (start, end) minimum; this keeps equal-best
+    // tie resolution linear on repetitive reads.
+    let window = pattern_len + best_distance;
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if (end + 1).saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let Some((start, traced_distance)) = matches.hit_at(end) else {
+            continue;
+        };
+        debug_assert_eq!(best_distance, traced_distance);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
     Some((
         pattern_len.saturating_sub(best_distance),
         start,
@@ -2363,15 +2390,28 @@ fn edit_search_myers(
         return None;
     }
 
-    let (start, best_end) = best_ends
-        .into_iter()
-        .map(|end| {
-            (
-                find_start_reverse_dp(&text[..end], pattern, best_score),
-                end,
-            )
-        })
-        .min()?;
+    // Any window within `best_score` edits of an m-length pattern spans at
+    // most m + best_score text characters, so the reverse DP only needs that
+    // suffix of text[..end] (excluded longer windows exceed the edit budget by
+    // the length bound). Ends arrive in ascending order, so once no later end
+    // can start before the current best start, the lexicographic (start, end)
+    // minimum is final. Both bounds keep tie resolution linear on repetitive
+    // reads with many equal-best ends.
+    let window = m + best_score;
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if end.saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let low = end.saturating_sub(window);
+        let start = low + find_start_reverse_dp(&text[low..end], pattern, best_score);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
 
     Some((m.saturating_sub(best_score), start, best_end))
 }
@@ -2458,15 +2498,28 @@ fn edit_search_dp(text: &[u8], pattern: &[u8], max_edits: usize) -> Option<(usiz
         return None;
     }
 
-    let (start, best_end) = best_ends
-        .into_iter()
-        .map(|end| {
-            (
-                find_start_reverse_dp(&text[..end], pattern, best_score),
-                end,
-            )
-        })
-        .min()?;
+    // Any window within `best_score` edits of an m-length pattern spans at
+    // most m + best_score text characters, so the reverse DP only needs that
+    // suffix of text[..end] (excluded longer windows exceed the edit budget by
+    // the length bound). Ends arrive in ascending order, so once no later end
+    // can start before the current best start, the lexicographic (start, end)
+    // minimum is final. Both bounds keep tie resolution linear on repetitive
+    // reads with many equal-best ends.
+    let window = m + best_score;
+    let mut best: Option<(usize, usize)> = None;
+    for end in best_ends {
+        if let Some((best_start, _)) = best {
+            if end.saturating_sub(window) >= best_start {
+                break;
+            }
+        }
+        let low = end.saturating_sub(window);
+        let start = low + find_start_reverse_dp(&text[low..end], pattern, best_score);
+        if best.is_none_or(|current| (start, end) < current) {
+            best = Some((start, end));
+        }
+    }
+    let (start, best_end) = best?;
 
     Some((m.saturating_sub(best_score), start, best_end))
 }
