@@ -87,12 +87,17 @@ with:
 - `NodeStage`.
 
 The default descriptor is conservative: produced names are unknown, mutation
-may replace a record, and rejection is allowed. It also uses the existing
-`required_names()`, `name()`, and `stage()` declarations. A custom statically
-linked operation should additionally override `produced_names()`,
-`mutation_kind()`, `rejection_behavior()`, and `cost_class()` when applicable.
-No dynamic plugin ABI is required: applications such as seqproc can keep a
-compile-time registry of constructors for custom operation types.
+may replace a record, rejection is allowed, and the operation is an opaque
+optimizer barrier. It also uses the existing `required_names()`, `name()`, and
+`stage()` declarations. A custom statically linked operation may override
+`produced_names()`, `invalidation_effect()`, `mutation_kind()`,
+`rejection_behavior()`, and `cost_class()` to improve diagnostics. It must also
+override `effects_are_complete()` to return `true` before the optimizer will
+treat those declarations as a complete proof and move or remove the node.
+Declaring produced names alone deliberately does not opt a third-party node
+into optimization. No dynamic plugin ABI is required: applications such as
+seqproc can keep a compile-time registry of constructors for custom operation
+types.
 
 Built-in input, output, matching, interval, projection, lookup, filtering, and
 arbitrary-function operations declare their known effects. An omitted custom

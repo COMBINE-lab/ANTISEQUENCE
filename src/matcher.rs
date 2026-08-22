@@ -465,6 +465,40 @@ mod tests {
     }
 
     #[test]
+    fn planner_exposes_every_backend_family() {
+        let dynamic = PatternSummary {
+            count: 1,
+            literal_count: 0,
+            min_literal_len: 0,
+            max_literal_len: 0,
+        };
+        assert_eq!(
+            MatcherPlan::build(MatchType::Exact, dynamic).backend,
+            MatcherBackend::DynamicPatterns
+        );
+        assert_eq!(
+            MatcherPlan::build(MatchType::GlobalAln(0.9), literals(1, 24)).backend,
+            MatcherBackend::SimdAlignment
+        );
+        assert_eq!(
+            MatcherPlan::build(MatchType::Exact, literals(1, 8)).backend,
+            MatcherBackend::DirectExact
+        );
+        assert_eq!(
+            MatcherPlan::build(MatchType::ExactSearch, literals(1, 8)).backend,
+            MatcherBackend::ExactSearch
+        );
+        assert_eq!(
+            MatcherPlan::build(MatchType::ExactSearch, literals(4, 8)).backend,
+            MatcherBackend::SeededCandidates
+        );
+        assert_eq!(
+            MatcherPlan::build(MatchType::Hamming(Count(7)), literals(2, 12)).backend,
+            MatcherBackend::ExhaustiveHamming
+        );
+    }
+
+    #[test]
     fn reference_match_reports_pattern_and_position_ambiguity_separately() {
         let patterns: [&[u8]; 2] = [b"AAA", b"AAC"];
         let candidates =

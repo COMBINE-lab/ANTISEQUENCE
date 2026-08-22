@@ -1,24 +1,39 @@
-name: CI
+name: Fast CI
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
+
+concurrency:
+  group: antisequence-fast-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  ci:
-    runs-on: ${{matrix.os}}
-
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-
+  fast:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
     steps:
-    - uses: actions/checkout@v2
-
-    - name: Check format
-      run: cargo fmt --check
-
-    - name: Build
-      run: cargo build --release
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: antisequence-fast
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check portable and accelerated APIs
+        run: cargo check --locked --all-targets --features accelerated-gzip
+      - name: Test library and documentation
+        run: cargo test --locked --lib --doc --features accelerated-gzip
+      - name: Clippy
+        run: cargo clippy --locked --lib --features accelerated-gzip -- -D warnings

@@ -1,6 +1,34 @@
 # ANTISEQUENCE
 Rust stream processing library for sequencing reads.
 
+## Installation and CPU features
+
+```toml
+[dependencies]
+antisequence = "0.1"
+```
+
+The default matcher backend is portable across the supported CPU families:
+SSE2 on x86_64 and NEON on aarch64. The speculative parallel gzip decoder is
+an independent opt-in feature:
+
+```toml
+[dependencies]
+antisequence = { version = "0.1", features = ["accelerated-gzip"] }
+```
+
+For a locally built x86_64 binary whose deployment hosts all support AVX2,
+disable the portable default and select the optimized backend explicitly:
+
+```toml
+[dependencies]
+antisequence = { version = "0.1", default-features = false, features = ["simd-avx2"] }
+```
+
+`portable-simd` and `simd-avx2` are intentionally mutually exclusive so an
+AVX2 CPU floor cannot be introduced accidentally through Cargo feature
+unification.
+
 ## Goals
 * Robust, flexible, and actually universal primitives for manipulating raw DNA/RNA sequences from fastq files
 * Parse complex read structures from novel sequencing protocols

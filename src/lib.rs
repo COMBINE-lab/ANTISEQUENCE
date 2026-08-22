@@ -19,6 +19,22 @@
 //!
 //! See [`graph`] for all supported operations.
 //!
+//! ```no_run
+//! use antisequence::graph::{GraphBuilder, InputFastqOp, NullOutputOp};
+//! use antisequence::trace::NoTrace;
+//! use std::io::Cursor;
+//!
+//! # fn main() -> Result<(), antisequence::errors::Error> {
+//! let input = b"@read\nACGT\n+\nIIII\n";
+//! let mut builder = GraphBuilder::<NoTrace>::new();
+//! builder.add(InputFastqOp::from_reader(Cursor::new(input))?);
+//! builder.add(NullOutputOp::new());
+//! let graph = builder.compile()?;
+//! graph.run()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Each operation declares its requirements and effects through an
 //! allocation-free [`OperationDescriptor`](crate::graph::OperationDescriptor).
 //! Missing requirements use an explicit
@@ -149,6 +165,152 @@ mod pipeline_tests {
 
     fn te(s: &str) -> TransformExpr {
         TransformExpr::from_bytes(s).unwrap()
+    }
+
+    fn run_literal_match(
+        text: &[u8],
+        patterns: &[Vec<u8>],
+        match_type: MatchType,
+        statistics: StatisticsLevel,
+    ) -> (crate::matcher::MatcherBackend, Option<(usize, usize)>) {
+        let mut fastq = b"@read\n".to_vec();
+        fastq.extend_from_slice(text);
+        fastq.extend_from_slice(b"\n+\n");
+        fastq.extend(std::iter::repeat_n(b'I', text.len()));
+        fastq.push(b'\n');
+
+        let spec = crate::matcher::MatchSpec::from(match_type);
+        let transform = match spec.scope {
+            crate::matcher::MatchScope::Search | crate::matcher::MatchScope::Bounded { .. } => {
+                "seq1.* -> seq1.before, seq1.hit, seq1.after"
+            }
+            _ => "seq1.* -> seq1.hit",
+        };
+        let mut graph = Graph::<NoTrace>::new();
+        graph.set_statistics_level(statistics);
+        graph.add(InputFastqOp::from_reader(Cursor::new(fastq)).unwrap());
+        let matcher = graph.add(MatchAnyOp::new(
+            te(transform),
+            Patterns::from_strs(patterns),
+            match_type,
+        ));
+        let backend = matcher.matcher_plan().backend;
+        let (reads, _) = graph.run_one(None, &NoTrace).unwrap();
+        let candidate = reads.unwrap()[0]
+            .mapping(StrType::Seq(1), InlineString::new(b"hit"))
+            .ok()
+            .map(|mapping| (mapping.start, mapping.start + mapping.len));
+        (backend, candidate)
+    }
+
+    #[test]
+    fn literal_matcher_backends_agree_with_the_reference_matcher() {
+        use crate::matcher::{reference_match, MatchSpec, MatcherBackend};
+
+        let long_pattern = vec![b'A'; 70];
+        let mut long_query = long_pattern.clone();
+        long_query[35] = b'C';
+        let cases = vec![
+            (
+                b"ACGT".to_vec(),
+                vec![b"ACGT".to_vec()],
+                Exact,
+                MatcherBackend::DirectExact,
+            ),
+            (
+                b"GGACGTCC".to_vec(),
+                vec![b"ACGT".to_vec()],
+                ExactSearch,
+                MatcherBackend::ExactSearch,
+            ),
+            (
+                b"ACGN".to_vec(),
+                vec![b"ACGT".to_vec(), b"TTTT".to_vec()],
+                Hamming(Count(3)),
+                MatcherBackend::HammingLookup,
+            ),
+            (
+                b"GGCCGGTT".to_vec(),
+                vec![
+                    b"AAAA".to_vec(),
+                    b"CCCC".to_vec(),
+                    b"CCGG".to_vec(),
+                    b"TTTT".to_vec(),
+                ],
+                ExactSearch,
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGTAA".to_vec(),
+                vec![
+                    b"AAAAAAAAAA".to_vec(),
+                    b"CCCCCCCCCC".to_vec(),
+                    b"ACGTACGTAT".to_vec(),
+                    b"TTTTTTTTTT".to_vec(),
+                ],
+                Hamming(Count(9)),
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGT".to_vec(),
+                vec![
+                    b"AAAAAAAA".to_vec(),
+                    b"CCCCCCCC".to_vec(),
+                    b"ACGTACGA".to_vec(),
+                    b"TTTTTTTT".to_vec(),
+                ],
+                Edit(Count(1)),
+                MatcherBackend::SeededCandidates,
+            ),
+            (
+                b"ACGTACGTAA".to_vec(),
+                vec![b"ACGTACGTAT".to_vec(), b"TTTTTTTTTT".to_vec()],
+                Hamming(Count(9)),
+                MatcherBackend::ExhaustiveHamming,
+            ),
+            (
+                b"ACGTACGTACGTACGA".to_vec(),
+                vec![b"ACGTACGTACGTACGT".to_vec()],
+                Edit(Count(1)),
+                MatcherBackend::Myers64,
+            ),
+            (
+                long_query,
+                vec![long_pattern],
+                Edit(Count(1)),
+                MatcherBackend::MyersLong,
+            ),
+        ];
+
+        for (text, patterns, match_type, expected_backend) in cases {
+            let pattern_refs = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let reference = reference_match(&text, &pattern_refs, MatchSpec::from(match_type))
+                .expect("reference-supported literal matcher case");
+            assert_eq!(reference.len(), 1, "test case must have one best candidate");
+            let expected = Some((reference[0].start, reference[0].end));
+            let (backend, observed) =
+                run_literal_match(&text, &patterns, match_type, StatisticsLevel::Off);
+            assert_eq!(backend, expected_backend);
+            assert_eq!(observed, expected, "backend {backend:?} diverged");
+        }
+    }
+
+    #[test]
+    fn detailed_statistics_do_not_change_match_coordinates() {
+        let patterns = vec![b"AAAA".to_vec()];
+        let without = run_literal_match(
+            b"AAATAAAT",
+            &patterns,
+            EditSearch(Count(1)),
+            StatisticsLevel::Off,
+        );
+        let with = run_literal_match(
+            b"AAATAAAT",
+            &patterns,
+            EditSearch(Count(1)),
+            StatisticsLevel::Detailed,
+        );
+        assert_eq!(without, with);
     }
 
     #[test]
@@ -2812,6 +2974,7 @@ mod pipeline_tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     #[test]
     fn test_accelerated_gzip_input_matches_standard_reader() {
         let input = numbered_fastq(1025);
@@ -2847,6 +3010,7 @@ mod pipeline_tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     #[test]
     fn test_accelerated_gzip_input_returns_decoder_errors() {
         let input = numbered_fastq(32);

@@ -1,5 +1,19 @@
 use bio::pattern_matching::myers::long::Myers as LongMyers;
 use block_aligner::{cigar::*, scan_block::*, scores::*};
+#[cfg(feature = "simd-avx2")]
+use block_aligner_avx2 as block_aligner;
+#[cfg(feature = "portable-simd")]
+use block_aligner_portable as block_aligner;
+
+#[cfg(all(feature = "portable-simd", feature = "simd-avx2"))]
+compile_error!(
+    "`portable-simd` and `simd-avx2` are mutually exclusive; use \
+     `--no-default-features --features simd-avx2` for an AVX2 build"
+);
+#[cfg(not(any(feature = "portable-simd", feature = "simd-avx2")))]
+compile_error!("select one matcher SIMD backend: `portable-simd` or `simd-avx2`");
+#[cfg(all(feature = "simd-avx2", not(target_arch = "x86_64")))]
+compile_error!("the `simd-avx2` matcher backend is supported only on x86_64");
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;

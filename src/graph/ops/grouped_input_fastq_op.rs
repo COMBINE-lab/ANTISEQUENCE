@@ -3,8 +3,11 @@ use std::sync::{
     Arc, OnceLock,
 };
 
-use needletail::{parse_fastx_file, parse_fastx_reader, FastxReader};
+#[cfg(feature = "accelerated-gzip")]
+use needletail::parse_fastx_reader;
+use needletail::{parse_fastx_file, FastxReader};
 use parking_lot::Mutex;
+#[cfg(feature = "accelerated-gzip")]
 use rapidgzip_core::Decoder as RapidGzipDecoder;
 use smallvec::SmallVec;
 use thread_local::ThreadLocal;
@@ -25,6 +28,7 @@ fn grouped_chunk_size() -> usize {
 #[derive(Clone, Copy)]
 enum DecoderMode {
     Automatic,
+    #[cfg(feature = "accelerated-gzip")]
     Accelerated {
         threads: usize,
         chunk_size_bytes: usize,
@@ -82,6 +86,7 @@ impl ShardedFastqReader {
             return Ok(true);
         }
         let reader: Box<dyn FastxReader> = match self.decoder {
+            #[cfg(feature = "accelerated-gzip")]
             DecoderMode::Accelerated {
                 threads,
                 chunk_size_bytes,
@@ -243,6 +248,7 @@ impl GroupedInputFastqOp {
         Self::from_files_with_decoder(lanes, DecoderMode::Automatic, 1)
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     pub fn from_files_accelerated_gzip<S: AsRef<str>>(
         lanes: impl IntoIterator<Item = impl IntoIterator<Item = S>>,
         decoder_threads: usize,
@@ -274,6 +280,7 @@ impl GroupedInputFastqOp {
         Self::from_files_with_decoder([files], DecoderMode::Automatic, interleaved)
     }
 
+    #[cfg(feature = "accelerated-gzip")]
     pub fn from_interleaved_files_accelerated_gzip<S: AsRef<str>>(
         files: impl IntoIterator<Item = S>,
         interleaved: usize,

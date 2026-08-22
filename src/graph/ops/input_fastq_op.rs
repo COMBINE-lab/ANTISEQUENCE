@@ -1,5 +1,6 @@
 use needletail::*;
 use parking_lot::Mutex;
+#[cfg(feature = "accelerated-gzip")]
 use rapidgzip_core::Decoder as RapidGzipDecoder;
 use smallvec::SmallVec;
 use std::fs::File;
@@ -188,6 +189,7 @@ impl<'reader> InputFastqOp<'reader> {
     /// Stream one or more FASTQ files, decoding `.gz` inputs through
     /// rapidgzip-core before needletail parsing. `decoder_threads` is the
     /// adaptive worker ceiling per gzip input; workers are created lazily.
+    #[cfg(feature = "accelerated-gzip")]
     pub fn from_files_accelerated_gzip<S: AsRef<str>>(
         files: impl IntoIterator<Item = S>,
         decoder_threads: usize,
@@ -610,6 +612,7 @@ mod tests {
         encoder.write_all(&[]).unwrap();
         fs::write(&gzip, encoder.finish().unwrap()).unwrap();
         assert_empty(InputFastqOp::from_file(gzip.to_string_lossy()).unwrap());
+        #[cfg(feature = "accelerated-gzip")]
         assert_empty(
             InputFastqOp::from_files_accelerated_gzip(
                 [gzip.to_string_lossy().into_owned()],
