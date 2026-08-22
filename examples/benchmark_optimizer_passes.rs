@@ -161,8 +161,10 @@ fn main() {
         let mut builder = GraphBuilder::<NoTrace>::new();
         builder.add(CpuWorkOp::new());
         builder.add(TotalFilterOp::new());
-        let mut config = GraphOptimizationConfig::default();
-        config.early_selective_filter_placement = early_filter;
+        let config = GraphOptimizationConfig {
+            early_selective_filter_placement: early_filter,
+            ..GraphOptimizationConfig::default()
+        };
         builder.compile_with(config).unwrap()
     };
     let early = make_filter_graph(true);
@@ -180,8 +182,10 @@ fn main() {
             ));
         }
         builder.add(NullOutputOp::new());
-        let mut config = GraphOptimizationConfig::default();
-        config.dead_label_elimination = dead_labels;
+        let config = GraphOptimizationConfig {
+            dead_label_elimination: dead_labels,
+            ..GraphOptimizationConfig::default()
+        };
         builder.compile_with(config).unwrap()
     };
     let dead_eliminated = make_dead_graph(true);

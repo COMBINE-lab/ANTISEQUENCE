@@ -1221,7 +1221,7 @@ impl<T: crate::trace::Trace> GraphNode<T> for MatchAnyOp {
                 })?;
 
             // Fast path: use pre-computed hash lookup for Hamming matching
-            if let Some(ref lookup) = self.hamming_lookup.as_ref().filter(|_| {
+            if let Some(lookup) = self.hamming_lookup.as_ref().filter(|_| {
                 text.iter()
                     .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'))
             }) {

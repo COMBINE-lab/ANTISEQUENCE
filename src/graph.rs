@@ -4056,8 +4056,10 @@ mod graph_api_tests {
             }
         );
 
-        let mut config = GraphOptimizationConfig::default();
-        config.early_selective_filter_placement = false;
+        let config = GraphOptimizationConfig {
+            early_selective_filter_placement: false,
+            ..GraphOptimizationConfig::default()
+        };
         let unoptimized = make_builder().compile_with(config).unwrap();
         let unoptimized_names = unoptimized
             .descriptors()
