@@ -12,7 +12,7 @@ use rapidgzip_core::Decoder as RapidGzipDecoder;
 use smallvec::SmallVec;
 use thread_local::ThreadLocal;
 
-use crate::{errors::*, expr::LabelOrAttr, graph::*};
+use crate::{expr::LabelOrAttr, graph::*};
 
 fn grouped_chunk_size() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();

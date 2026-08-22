@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
 
-use crate::errors::*;
 use crate::expr::LabelOrAttr;
 use crate::graph::*;
 use std::sync::OnceLock;
