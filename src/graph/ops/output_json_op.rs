@@ -8,6 +8,34 @@ use flate2::{write::GzEncoder, Compression};
 
 use crate::graph::*;
 
+struct FinishingGzipWriter<W: Write> {
+    inner: GzEncoder<W>,
+    finished: bool,
+}
+
+impl<W: Write> FinishingGzipWriter<W> {
+    fn new(writer: W, level: u32) -> Self {
+        Self {
+            inner: GzEncoder::new(writer, Compression::new(level)),
+            finished: false,
+        }
+    }
+}
+
+impl<W: Write> Write for FinishingGzipWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.finished {
+            self.inner.try_finish()?;
+            self.finished = true;
+        }
+        self.inner.get_mut().flush()
+    }
+}
+
 pub struct OutputJsonOp<'writer> {
     writer: Mutex<Box<dyn Write + Send + 'writer>>,
 }
@@ -39,9 +67,9 @@ impl<'writer> OutputJsonOp<'writer> {
         }
 
         let writer: Mutex<Box<dyn Write + Send>> = if file_path.ends_with(".gz") {
-            Mutex::new(Box::new(BufWriter::new(GzEncoder::new(
+            Mutex::new(Box::new(BufWriter::new(FinishingGzipWriter::new(
                 File::create(file_path)?,
-                Compression::new(gzip_level),
+                gzip_level,
             ))))
         } else {
             Mutex::new(Box::new(BufWriter::new(File::create(file_path)?)))
@@ -104,6 +132,10 @@ impl<'writer, T: Trace> GraphNode<T> for OutputJsonOp<'writer> {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
     }
@@ -114,6 +146,14 @@ impl<'writer, T: Trace> GraphNode<T> for OutputJsonOp<'writer> {
 
     fn cost_class(&self) -> CostClass {
         CostClass::Io
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .map_err(|_| Error::GraphExecution("JSON output writer lock was poisoned".to_owned()))?
+            .flush()
+            .map_err(|error| Error::BytesIo(Box::new(error)))
     }
 
     fn supports_prepared_output(&self) -> bool {

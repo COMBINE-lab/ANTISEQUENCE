@@ -168,6 +168,12 @@ impl StrMappings {
         }
     }
 
+    /// Invalidate coordinate-bearing labels after a whole-lane sequence
+    /// rewrite while retaining the canonical full-length `*` mapping.
+    pub(crate) fn invalidate_after_sequence_rewrite(&mut self) {
+        self.reset_default_mapping(self.string().len());
+    }
+
     #[inline(always)]
     fn reset_fastq_entry(
         &mut self,
@@ -176,7 +182,18 @@ impl StrMappings {
         origin: Arc<Origin>,
         idx: usize,
     ) {
-        self.ensure_owned();
+        // Parsed FASTQ bytes replace the entire entry. If a fork still owns
+        // the shared storage, do not deep-clone bytes that are about to be
+        // discarded; recover the allocation only when this is the last owner.
+        if let Some(shared) = self.shared.take() {
+            if let Ok(shared) = Arc::try_unwrap(shared) {
+                self.string = shared.string;
+                self.qual = shared.qual;
+            } else {
+                self.string.clear();
+                self.qual = None;
+            }
+        }
         Self::reset_buffer(&mut self.string, string);
         match qual {
             Some(bytes) => {

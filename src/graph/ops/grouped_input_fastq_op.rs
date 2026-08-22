@@ -73,7 +73,10 @@ impl ShardedFastqReader {
             file: file.clone(),
             source: Box::new(source),
         })?;
-        if metadata.is_file() && metadata.len() == 0 {
+        if metadata.is_file()
+            && (metadata.len() == 0
+                || (file.ends_with(".gz") && super::input_fastq_op::gzip_file_is_empty(&file)?))
+        {
             self.active_shard = Some(shard);
             self.empty_shard = Some(shard);
             return Ok(true);
@@ -615,10 +618,11 @@ impl<T: Trace> GraphNode<T> for GroupedInputFastqOp {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, sync::atomic::AtomicUsize};
+    use std::{fs, io::Write, path::PathBuf, sync::atomic::AtomicUsize};
 
     use super::*;
     use crate::trace::NoTrace;
+    use flate2::{write::GzEncoder, Compression};
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -687,6 +691,29 @@ mod tests {
             <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, Some(reads), &NoTrace).unwrap();
         assert!(done);
         assert!(reads.is_none());
+    }
+
+    #[test]
+    fn grouped_empty_gzip_shard_is_a_valid_boundary() {
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let empty_gzip = std::env::temp_dir().join(format!(
+            "antisequence-grouped-empty-{}-{id}.fastq.gz",
+            std::process::id()
+        ));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&[]).unwrap();
+        fs::write(&empty_gzip, encoder.finish().unwrap()).unwrap();
+        let data = Fixture::write(&["@a\nACGT\n+\nIIII\n"]);
+        let op = GroupedInputFastqOp::from_files([[
+            empty_gzip.to_string_lossy().into_owned(),
+            data.0[0].to_string_lossy().into_owned(),
+        ]])
+        .unwrap();
+        let (reads, done) =
+            <GroupedInputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap();
+        assert!(!done);
+        assert_eq!(reads.unwrap().len(), 1);
+        let _ = fs::remove_file(empty_gzip);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::marker::{Send, Sync};
-use std::ops::{Deref, RangeBounds};
+use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -27,8 +27,8 @@ pub struct Graph<T: Trace = NoTrace> {
 ///
 /// Calling [`GraphBuilder::compile`] validates stage ordering and transfers
 /// the nodes into a structurally immutable [`CompiledGraph`]. Runtime
-/// instrumentation remains configurable through atomics and does not mutate
-/// graph structure.
+/// instrumentation is selected before compilation because statistics are an
+/// observable optimizer barrier.
 pub struct GraphBuilder<T: Trace = NoTrace> {
     graph: Graph<T>,
 }
@@ -91,6 +91,10 @@ pub struct GraphOptimizationReport {
     pub original_operations: usize,
     pub optimized_operations: usize,
     pub opaque_barriers: usize,
+    /// Nested nodes whose external `Arc` handles prevented recursive mutation
+    /// during compilation. This is separately observable so callers do not
+    /// mistake a partially optimized graph for the fully private case.
+    pub shared_nested_graph_barriers: usize,
     pub terminal_projection_candidates: usize,
     pub passes: Vec<GraphOptimizationPassReport>,
 }
@@ -431,6 +435,10 @@ pub struct BatchSizePlan {
     pub estimated_batch_bytes: usize,
     pub estimated_peak_live_bytes: usize,
     pub memory_budget_bytes: usize,
+    /// Whether the static estimate fits the requested budget. The planner
+    /// cannot promise a hard cap when fixed buffers alone exceed the budget or
+    /// the minimum viable batch is still larger than the remaining allowance.
+    pub memory_budget_satisfied: bool,
     pub reason_codes: Vec<&'static str>,
 }
 
@@ -555,7 +563,7 @@ fn plan_batch_configuration(
             pipeline.batch_size = selected;
             reason_codes.push("static_graph_cost_model");
             reason_codes.push("geometry_length_estimate");
-            reason_codes.push("bounded_peak_memory");
+            reason_codes.push("memory_budget_target");
             if costs.alignment > 0 {
                 reason_codes.push("alignment_cost_reduces_batch");
             } else if costs.search > 0 {
@@ -573,6 +581,12 @@ fn plan_batch_configuration(
     let estimated_peak_live_bytes = hints.fixed_buffer_bytes.saturating_add(
         estimated_batch_bytes.saturating_mul(pipeline.max_in_flight_batches.max(1)),
     );
+    let memory_budget_satisfied = estimated_peak_live_bytes <= hints.memory_budget_bytes;
+    reason_codes.push(if memory_budget_satisfied {
+        "memory_budget_estimate_satisfied"
+    } else {
+        "memory_budget_estimate_exceeded"
+    });
     (
         pipeline,
         BatchSizePlan {
@@ -593,6 +607,7 @@ fn plan_batch_configuration(
             estimated_batch_bytes,
             estimated_peak_live_bytes,
             memory_budget_bytes: hints.memory_budget_bytes,
+            memory_budget_satisfied,
             reason_codes,
         },
     )
@@ -788,12 +803,20 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
         None
     }
 
+    /// Whether the node's optimizer-facing effects are complete. Third-party
+    /// nodes remain opaque by default even if they declare produced names;
+    /// declaring outputs alone must never opt a node into reordering.
+    #[inline]
+    fn effects_are_complete(&self) -> bool {
+        false
+    }
+
     /// Interval names invalidated by this node. Built-in nodes that declare
     /// their produced-name set preserve all other names by default. An
     /// undeclared custom node remains an optimizer barrier.
     #[inline]
     fn invalidation_effect(&self) -> InvalidationEffect<'_> {
-        if self.produced_names().is_some() {
+        if self.effects_are_complete() {
             InvalidationEffect::PreserveAll
         } else {
             InvalidationEffect::Opaque
@@ -980,6 +1003,18 @@ pub trait GraphNode<T: Trace = NoTrace>: Send + Sync {
             "output node {} does not support prepared output",
             self.name()
         )))
+    }
+
+    /// Finish externally visible work owned by this node.
+    ///
+    /// Graph runners invoke this exactly once after their workers have joined,
+    /// before reporting success. Output implementations must surface buffered
+    /// write and flush failures here rather than relying on `Drop`, where an
+    /// error cannot be returned. Nested control-flow nodes forward the hook to
+    /// their child graphs.
+    #[inline]
+    fn finish(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Select optional runtime statistics for this node.
@@ -1225,14 +1260,6 @@ impl<T: Trace> GraphBuilder<T> {
     }
 }
 
-impl<T: Trace> Deref for CompiledGraph<T> {
-    type Target = Graph<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.graph
-    }
-}
-
 impl<T: Trace> CompiledGraph<T> {
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = OperationDescriptor<'_>> {
         self.graph.descriptors()
@@ -1240,6 +1267,104 @@ impl<T: Trace> CompiledGraph<T> {
 
     pub fn optimization_report(&self) -> &GraphOptimizationReport {
         &self.optimization_report
+    }
+
+    /// Statistics are immutable after compilation so proof-gated passes
+    /// cannot become observable after they have rewritten the graph.
+    pub fn statistics_level(&self) -> StatisticsLevel {
+        self.graph.statistics_level()
+    }
+
+    pub fn missing_input_policy(&self) -> MissingInputPolicy {
+        self.graph.missing_input_policy()
+    }
+
+    pub fn match_distance_counts(&self) -> Vec<MatchDistanceCounts> {
+        self.graph.match_distance_counts()
+    }
+
+    pub fn input_stats(&self) -> Option<InputStats> {
+        self.graph.input_stats()
+    }
+
+    pub fn failed_reads(&self) -> usize {
+        self.graph.failed_reads()
+    }
+
+    pub fn final_output_reads(&self) -> Option<usize> {
+        self.graph.final_output_reads()
+    }
+
+    pub fn run(&self) -> Result<()> {
+        self.graph.run()
+    }
+
+    pub fn run_trace(&self, trace_path: impl AsRef<Path>) -> Result<()> {
+        self.graph.run_trace(trace_path)
+    }
+
+    pub fn run_with_threads(&self, threads: usize) {
+        self.graph.run_with_threads(threads)
+    }
+
+    pub fn run_with_threads_trace(&self, threads: usize, trace_path: impl AsRef<Path>) {
+        self.graph.run_with_threads_trace(threads, trace_path)
+    }
+
+    pub fn try_run_with_threads(&self, threads: usize) -> Result<()> {
+        self.graph.try_run_with_threads(threads)
+    }
+
+    pub fn try_run_with_threads_trace(
+        &self,
+        threads: usize,
+        trace_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.graph.try_run_with_threads_trace(threads, trace_path)
+    }
+
+    pub fn try_run_pipeline(&self, config: PipelineConfig) -> Result<PipelineReport> {
+        self.graph
+            .try_run_pipeline(self.effective_pipeline_config(config))
+    }
+
+    pub fn try_run_pipeline_trace(
+        &self,
+        config: PipelineConfig,
+        trace_path: impl AsRef<Path>,
+    ) -> Result<PipelineReport> {
+        self.graph
+            .try_run_pipeline_trace(self.effective_pipeline_config(config), trace_path)
+    }
+
+    pub fn run_one(
+        &self,
+        reads: Option<Vec<Read>>,
+        trace: &T,
+    ) -> Result<(Option<Vec<Read>>, bool)> {
+        self.graph.run_one(reads, trace)
+    }
+
+    pub fn try_run_one(
+        &self,
+        reads: Option<Vec<Read>>,
+        trace: &T,
+    ) -> Result<(Option<Vec<Read>>, bool, bool)> {
+        self.graph.try_run_one(reads, trace)
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
+    fn effective_pipeline_config(&self, mut config: PipelineConfig) -> PipelineConfig {
+        config.direct_output_rendering &= self.optimization_report.enabled
+            && self
+                .optimization_report
+                .config
+                .terminal_projection_output_fusion
+            && self.optimization_report.terminal_projection_candidates > 0;
+        config
     }
 
     /// Produce a deterministic execution plan without starting any workers.
@@ -1353,11 +1478,13 @@ impl<T: Trace> CompiledGraph<T> {
             ExecutionBackend::WorkerLocalPipeline => {
                 let mut config = plan.pipeline;
                 config.input_mode = PipelineInputMode::WorkerLocal;
+                config.direct_output_rendering = plan.direct_output_rendering;
                 Some(self.graph.try_run_pipeline(config)?)
             }
             ExecutionBackend::DedicatedReaderPipeline => {
                 let mut config = plan.pipeline;
                 config.input_mode = PipelineInputMode::DedicatedReader;
+                config.direct_output_rendering = plan.direct_output_rendering;
                 Some(self.graph.try_run_pipeline(config)?)
             }
         };
@@ -1440,7 +1567,7 @@ impl<T: Trace> Graph<T> {
             .count();
         let mut passes = Vec::new();
 
-        if optimization.enabled && optimization.semantic_noop_elimination {
+        if optimization.enabled && optimization.semantic_noop_elimination && !T::RECORDS_EVENTS {
             let before = self.nodes.len();
             self.nodes.retain(|node| !node.is_semantic_noop());
             passes.push(GraphOptimizationPassReport {
@@ -1596,6 +1723,11 @@ impl<T: Trace> Graph<T> {
             original_operations,
             optimized_operations,
             opaque_barriers,
+            shared_nested_graph_barriers: shared_nested_barriers
+                + nested_reports
+                    .iter()
+                    .map(|report| report.shared_nested_graph_barriers)
+                    .sum::<usize>(),
             terminal_projection_candidates,
             passes,
         }
@@ -1759,7 +1891,8 @@ impl<T: Trace> Graph<T> {
     }
 
     fn run_trace_inner(&self, trace: &T) -> Result<()> {
-        self.run_trace_inner_until_cancelled(trace, None)
+        let execution = self.run_trace_inner_until_cancelled(trace, None);
+        self.finish_after(execution)
     }
 
     fn run_trace_inner_until_cancelled(
@@ -1855,11 +1988,12 @@ impl<T: Trace> Graph<T> {
         });
 
         let failures = failures.into_inner().unwrap();
-        if failures.is_empty() {
+        let execution = if failures.is_empty() {
             Ok(())
         } else {
             Err(aggregate_failures(failures))
-        }
+        };
+        self.finish_after(execution)
     }
 
     /// Run this graph with a bounded input, transform, and output pipeline.
@@ -1874,7 +2008,7 @@ impl<T: Trace> Graph<T> {
         trace_path: impl AsRef<Path>,
     ) -> Result<PipelineReport> {
         let trace = T::new(trace_path);
-        let result = self.run_pipeline_inner(config, &trace);
+        let result = self.finish_after(self.run_pipeline_inner(config, &trace));
         trace.finish();
         result
     }
@@ -2770,6 +2904,30 @@ impl<T: Trace> Graph<T> {
         Ok(())
     }
 
+    /// Finish every node, retaining all failures so one broken output cannot
+    /// hide a second broken output.
+    pub fn finish(&self) -> Result<()> {
+        let failures = self
+            .nodes
+            .iter()
+            .filter_map(|node| node.finish().err())
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(aggregate_failures(failures))
+        }
+    }
+
+    fn finish_after<R>(&self, execution: Result<R>) -> Result<R> {
+        let finish = self.finish();
+        match (execution, finish) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(execution), Err(finish)) => Err(aggregate_failures(vec![execution, finish])),
+        }
+    }
+
     fn run_node_range(
         &self,
         mut curr: Option<Vec<Read>>,
@@ -2895,11 +3053,45 @@ impl<T: Trace> Graph<T> {
         mut curr: Option<Vec<Read>>,
         trace: &T,
     ) -> Result<(Option<Vec<Read>>, bool, bool)> {
+        let mut failed = false;
         for node in &self.nodes {
-            if let Some(reads) = &curr {
-                if let Some(first) = reads.first() {
-                    if !first.has_names(node.required_names()) {
-                        return Ok((curr, true, false));
+            if let Some(reads) = &mut curr {
+                let requirements = node.required_names();
+                if !requirements.is_empty() {
+                    match self.missing_input_policy() {
+                        MissingInputPolicy::Skip => {
+                            if reads
+                                .first()
+                                .is_some_and(|read| !read.has_names(requirements))
+                            {
+                                return Ok((curr, true, false));
+                            }
+                        }
+                        MissingInputPolicy::Error => {
+                            if let Some(read) =
+                                reads.iter().find(|read| !read.has_names(requirements))
+                            {
+                                let missing = requirements
+                                    .iter()
+                                    .filter(|required| {
+                                        !read.has_names(std::slice::from_ref(*required))
+                                    })
+                                    .cloned()
+                                    .collect();
+                                return Err(Error::MissingRequiredInputs {
+                                    node: node.name(),
+                                    missing,
+                                });
+                            }
+                        }
+                        MissingInputPolicy::Reject => {
+                            let before = reads.len();
+                            reads.retain(|read| read.has_names(requirements));
+                            failed |= reads.len() != before;
+                            if reads.is_empty() {
+                                return Ok((None, true, false));
+                            }
+                        }
                     }
                 }
             }
@@ -2908,14 +3100,14 @@ impl<T: Trace> Graph<T> {
             curr = c;
 
             if done {
-                return Ok((curr, false, done));
+                return Ok((curr, failed, done));
             }
             if curr.is_none() {
                 break;
             }
         }
 
-        Ok((curr, false, false))
+        Ok((curr, failed, false))
     }
 }
 
@@ -3136,7 +3328,25 @@ impl MatchType {
     }
 
     pub fn k(&self, len: usize) -> usize {
-        let k_from_edits = |len: usize, e: usize| (len - e).div_ceil(e + 1);
+        // Pigeonhole seeding is sound only when `e` is the maximum number of
+        // errors. If every position may differ, no positive-length exact seed
+        // is guaranteed and the caller must use exhaustive verification.
+        let k_from_edits = |len: usize, e: usize| {
+            if len == 0 || e >= len {
+                0
+            } else {
+                (len - e).div_ceil(e + 1)
+            }
+        };
+        let k_from_hamming_matches = |len: usize, minimum_matches: usize| {
+            if minimum_matches > len {
+                // An impossible threshold is intentionally left to exhaustive
+                // verification, which deterministically produces no match.
+                0
+            } else {
+                k_from_edits(len, len - minimum_matches)
+            }
+        };
         use MatchType::*;
         match self {
             Exact => len,
@@ -3144,11 +3354,11 @@ impl MatchType {
             ExactSuffix => len,
             ExactSearch => len,
             ExactBoundedMatch { .. } => len,
-            Hamming(t) => k_from_edits(len, t.get(len)),
-            HammingPrefix(t) => k_from_edits(len, t.get(len)),
-            HammingSuffix(t) => k_from_edits(len, t.get(len)),
-            HammingSearch(t) => k_from_edits(len, t.get(len)),
-            HammingBoundedMatch { threshold: t, .. } => k_from_edits(len, t.get(len)),
+            Hamming(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingPrefix(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingSuffix(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingSearch(t) => k_from_hamming_matches(len, t.get(len)),
+            HammingBoundedMatch { threshold: t, .. } => k_from_hamming_matches(len, t.get(len)),
             Edit(t) => k_from_edits(len, t.get(len)),
             EditPrefix(t) => k_from_edits(len, t.get(len)),
             EditSuffix(t) => k_from_edits(len, t.get(len)),
@@ -3195,7 +3405,7 @@ impl Threshold {
 
 #[cfg(test)]
 mod pipeline_config_tests {
-    use super::PipelineConfig;
+    use super::{MatchType, PipelineConfig, Threshold};
 
     #[test]
     fn defaults_keep_only_one_small_batch_per_worker_in_flight() {
@@ -3208,6 +3418,18 @@ mod pipeline_config_tests {
         assert_eq!(parallel.queue_capacity, 2);
         assert_eq!(parallel.max_in_flight_batches, 8);
         assert_eq!(parallel.batch_size, 256);
+    }
+
+    #[test]
+    fn hamming_seed_length_uses_mismatch_budget_not_minimum_matches() {
+        // At least 7 of 8 matching bases means at most one mismatch, which
+        // guarantees an exact seed of length ceil((8 - 1) / 2) = 4.
+        assert_eq!(MatchType::Hamming(Threshold::Count(7)).k(8), 4);
+        // A threshold that permits every base to differ has no guaranteed
+        // positive seed and must use exhaustive verification.
+        assert_eq!(MatchType::Hamming(Threshold::Count(0)).k(8), 0);
+        // Impossible and mixed-length thresholds never underflow.
+        assert_eq!(MatchType::Hamming(Threshold::Count(9)).k(8), 0);
     }
 }
 
@@ -3405,6 +3627,10 @@ mod graph_api_tests {
 
         fn produced_names(&self) -> Option<&[LabelOrAttr]> {
             Some(&self.produced)
+        }
+
+        fn effects_are_complete(&self) -> bool {
+            true
         }
 
         fn mutation_kind(&self) -> MutationKind {
@@ -3989,6 +4215,29 @@ mod graph_api_tests {
     }
 
     #[test]
+    fn disabling_optimizer_also_disables_runtime_terminal_fusion() {
+        use std::io::Cursor;
+
+        let mut builder = GraphBuilder::<NoTrace>::new();
+        builder.add(
+            InputFastqOp::from_reader(Cursor::new(b"@read\nACGT\n+\nIIII\n".to_vec())).unwrap(),
+        );
+        builder.add(ProjectOp::new([Label::new(b"seq1.*").unwrap()]));
+        builder.add(OutputFastqOp::from_writer(Vec::<u8>::new()));
+        let graph = builder
+            .compile_with(GraphOptimizationConfig::disabled())
+            .unwrap();
+
+        let mut request = ExecutionRequest::new(1);
+        request.mode = ExecutionMode::Pipeline;
+        request.pipeline.preserve_order = true;
+        let plan = graph.plan_execution(request).unwrap();
+        assert!(!plan.direct_output_rendering);
+        let report = graph.try_run_planned(request).unwrap();
+        assert!(!report.pipeline.unwrap().direct_output_rendering);
+    }
+
+    #[test]
     fn execution_planner_preserves_conservative_default_and_forced_backends() {
         let graph = compiled_projected_fastq();
         let automatic = graph.plan_execution(ExecutionRequest::new(4)).unwrap();
@@ -4079,7 +4328,8 @@ mod graph_api_tests {
         let (_, report) =
             plan_batch_configuration(PipelineConfig::new(8), hints, Default::default());
         assert!(report.estimated_peak_live_bytes <= report.memory_budget_bytes);
-        assert!(report.reason_codes.contains(&"bounded_peak_memory"));
+        assert!(report.memory_budget_satisfied);
+        assert!(report.reason_codes.contains(&"memory_budget_target"));
         assert!(report.reason_codes.contains(&"long_reads_reduce_batch"));
     }
 

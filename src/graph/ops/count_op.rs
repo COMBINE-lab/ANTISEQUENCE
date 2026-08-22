@@ -47,6 +47,10 @@ impl<T: Trace> GraphNode<T> for CountOp {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
     }

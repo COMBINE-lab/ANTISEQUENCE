@@ -18,6 +18,10 @@ impl<B: RangeBounds<usize> + Send + Sync, T: Trace> GraphNode<T> for TakeOp<B> {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
     }

@@ -62,6 +62,10 @@ impl<T: Trace> GraphNode<T> for TimeOp<T> {
             .optimize_for_compilation_from(optimization, live_out)]
     }
 
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
+    }
+
     fn name(&self) -> &'static str {
         Self::NAME
     }

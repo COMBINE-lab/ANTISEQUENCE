@@ -331,11 +331,8 @@ mod pipeline_tests {
 
         let mut g = Graph::<NoTrace>::new();
         g.add(
-            InputFastqOp::from_readers(vec![
-                Cursor::new(short.clone()),
-                Cursor::new(long.clone()),
-            ])
-            .unwrap(),
+            InputFastqOp::from_readers(vec![Cursor::new(short.clone()), Cursor::new(long.clone())])
+                .unwrap(),
         );
         assert!(g.run().is_err());
 
@@ -949,7 +946,7 @@ mod pipeline_tests {
 
     #[test]
     fn arbitrary_reader_construction_is_fallible() {
-        let result = InputFastqOp::from_readers([Cursor::new(Vec::<u8>::new())]);
+        let result = InputFastqOp::from_readers([Cursor::new(b"not FASTQ".to_vec())]);
         assert!(result.is_err());
     }
 
@@ -1145,6 +1142,18 @@ mod pipeline_tests {
         }
     }
 
+    struct FailingFlushWriter;
+
+    impl Write for FailingFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("intentional final flush failure"))
+        }
+    }
+
     #[test]
     fn test_try_graph_with_threads_returns_output_error() {
         let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
@@ -1155,6 +1164,19 @@ mod pipeline_tests {
         let error = g.try_run_with_threads(2).unwrap_err();
         assert!(matches!(error, crate::errors::Error::WorkerFailures { .. }));
         assert!(error.to_string().contains("intentional write failure"));
+    }
+
+    #[test]
+    fn final_flush_failure_is_returned_before_graph_success() {
+        let fq = fastq_bytes(&[("read1", "ACGT", "IIII")]);
+        let mut graph = Graph::<NoTrace>::new();
+        graph.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        graph.add(OutputFastqOp::from_writer(FailingFlushWriter));
+
+        let error = graph.try_run_with_threads(1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("intentional final flush failure"));
     }
 
     #[test]
@@ -1545,7 +1567,9 @@ mod pipeline_tests {
     fn test_match_type_k() {
         assert_eq!(Exact.k(4), 4);
         assert_eq!(ExactPrefix.k(4), 4);
-        assert_eq!(Hamming(Count(1)).k(4), 2);
+        // Hamming Count is a minimum-match threshold. One required match in
+        // four bases permits three mismatches, so the guaranteed seed is 1.
+        assert_eq!(Hamming(Count(1)).k(4), 1);
         assert_eq!(Edit(Count(1)).k(4), 2);
     }
 
@@ -2107,6 +2131,34 @@ mod pipeline_tests {
             1,
             "14bp Hamming match with 1 mismatch should succeed"
         );
+    }
+
+    #[test]
+    fn test_short_hamming_lookup_falls_back_for_non_acgt_input() {
+        let fq = fastq_bytes(&[("read1", "ACGN", "IIII")]);
+        let patterns = Patterns::from_strs(["ACGT"]);
+
+        let mut g = Graph::<NoTrace>::new();
+        g.add(InputFastqOp::from_reader(Cursor::new(fq)).unwrap());
+        g.add(MatchAnyOp::new(
+            te("seq1.* -> seq1.*"),
+            patterns,
+            Hamming(Count(3)),
+        ));
+        let counter = g.add(CountOp::new([true]));
+        g.run().unwrap();
+
+        assert_eq!(counter.counts()[0], 1);
+    }
+
+    #[test]
+    fn edit_match_rejects_pattern_quality_ambiguity_at_construction() {
+        let patterns = Patterns::from_strs(["ACGT", "ACGA"])
+            .with_ambiguity_policy(AmbiguityPolicy::Quality { min_delta: 1 });
+        assert!(matches!(
+            MatchAnyOp::try_new(te("seq1.* -> seq1.*"), patterns, Edit(Count(1))),
+            Err(crate::errors::Error::InvalidOperation { .. })
+        ));
     }
 
     #[test]

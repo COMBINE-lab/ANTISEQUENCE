@@ -27,6 +27,10 @@ impl<T: Trace> GraphNode<T> for TrimOp {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::Sequence
     }

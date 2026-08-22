@@ -115,8 +115,11 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
                     }
 
                     set = _mm256_and_si256(set, load_mask);
-                    let nonzero = _mm256_cmpgt_epi8(set, _mm256_setzero_si256());
-                    let mut nonzero_mask = _mm256_movemask_epi8(nonzero) as u32;
+                    // Each byte is an unsigned bit set of matching pattern
+                    // seeds. A signed greater-than comparison loses values
+                    // with bit 7 set, so derive `!= 0` from equality instead.
+                    let zero = _mm256_cmpeq_epi8(set, _mm256_setzero_si256());
+                    let mut nonzero_mask = !(_mm256_movemask_epi8(zero) as u32);
 
                     if nonzero_mask > 0 {
                         let mut a = Aligned::<{ L }>([0u8; L]);
@@ -124,10 +127,13 @@ impl<const K: usize> SeedSearcher for SmallSearcher<{ K }> {
 
                         while nonzero_mask > 0 {
                             let idx = nonzero_mask.trailing_zeros() as usize;
-                            let s = *a.0.as_ptr().add(idx) as usize;
-                            let hash_idx = s.trailing_zeros() as usize;
-                            let (pattern_idx, pattern_i) = *pattern_idxs.as_ptr().add(hash_idx);
-                            candidate_fn(SeedMatch { pattern_idx: pattern_idx as usize, pattern_i: pattern_i as usize, text_i: i + idx });
+                            let mut pattern_mask = *a.0.as_ptr().add(idx);
+                            while pattern_mask != 0 {
+                                let hash_idx = pattern_mask.trailing_zeros() as usize;
+                                let (pattern_idx, pattern_i) = *pattern_idxs.as_ptr().add(hash_idx);
+                                candidate_fn(SeedMatch { pattern_idx: pattern_idx as usize, pattern_i: pattern_i as usize, text_i: i + idx });
+                                pattern_mask &= pattern_mask - 1;
+                            }
 
                             nonzero_mask &= nonzero_mask - 1;
                         }
@@ -540,5 +546,38 @@ mod tests {
             }
         }
         assert!(expected.is_subset(&observed));
+    }
+
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn small_searcher_emits_every_pattern_sharing_a_seed() {
+        let patterns = [b"AC".as_slice(), b"AC".as_slice()];
+        let searcher = SmallSearcher::<2>::new(patterns.iter().copied().enumerate()).unwrap();
+        let mut observed = BTreeSet::new();
+        searcher.search(b"AC", |seed| {
+            observed.insert(seed.pattern_idx);
+        });
+        assert_eq!(observed, BTreeSet::from([0, 1]));
+    }
+
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn small_searcher_emits_a_candidate_stored_in_bit_seven() {
+        let patterns = [
+            b"CC".as_slice(),
+            b"CG".as_slice(),
+            b"CT".as_slice(),
+            b"GC".as_slice(),
+            b"GG".as_slice(),
+            b"GT".as_slice(),
+            b"TC".as_slice(),
+            b"AA".as_slice(),
+        ];
+        let searcher = SmallSearcher::<2>::new(patterns.iter().copied().enumerate()).unwrap();
+        let mut observed = BTreeSet::new();
+        searcher.search(b"AA", |seed| {
+            observed.insert(seed.pattern_idx);
+        });
+        assert!(observed.contains(&7));
     }
 }

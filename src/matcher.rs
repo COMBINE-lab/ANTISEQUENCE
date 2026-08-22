@@ -247,8 +247,11 @@ fn candidate_windows(
             }
         }
         MatchScope::Bounded { from, to } => {
-            if from > to || from > text_len {
+            if from > to {
                 return Err(ReferenceMatchError::InvalidBounds);
+            }
+            if from > text_len {
+                return Ok(windows);
             }
             let end_bound = to.saturating_add(1).min(text_len);
             for len in lengths.filter(|&len| len <= end_bound.saturating_sub(from)) {

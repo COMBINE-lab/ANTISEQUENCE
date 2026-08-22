@@ -11,11 +11,88 @@ use rustc_hash::FxHashMap;
 use thread_local::ThreadLocal;
 
 use flate2::{write::GzEncoder, Compression};
+use gzp::ZWriter;
 use gzp::{deflate::Gzip, par::compress::ParCompressBuilder};
 
 use crate::graph::*;
 
 type FileWriterMap = FxHashMap<Vec<u8>, Arc<Mutex<Box<dyn Write + Send>>>>;
+
+/// A gzip encoder whose first flush completes the stream and propagates footer
+/// and underlying-writer errors. `flate2::GzEncoder::flush` alone does not
+/// finalize the gzip member, while `Drop` cannot report `try_finish` failures.
+struct FinishingGzipWriter<W: Write> {
+    inner: GzEncoder<W>,
+    finished: bool,
+}
+
+impl<W: Write> FinishingGzipWriter<W> {
+    fn new(writer: W, level: u32) -> Self {
+        Self {
+            inner: GzEncoder::new(writer, Compression::new(level)),
+            finished: false,
+        }
+    }
+}
+
+impl<W: Write> Write for FinishingGzipWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.finished {
+            self.inner.try_finish()?;
+            self.finished = true;
+        }
+        self.inner.get_mut().flush()
+    }
+}
+
+/// Make gzp's mandatory `finish` operation reachable through the `Write`
+/// trait object stored by output nodes. Once finished, later flushes are
+/// harmless; writes after graph finalization fail explicitly.
+struct FinishingParallelWriter<P, W>
+where
+    P: Write + ZWriter<W>,
+    W: Write,
+{
+    inner: Option<P>,
+    _output: std::marker::PhantomData<W>,
+}
+
+impl<P, W> FinishingParallelWriter<P, W>
+where
+    P: Write + ZWriter<W>,
+    W: Write,
+{
+    fn new(inner: P) -> Self {
+        Self {
+            inner: Some(inner),
+            _output: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P, W> Write for FinishingParallelWriter<P, W>
+where
+    P: Write + ZWriter<W>,
+    W: Write,
+{
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("gzip stream is already finished"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let Some(mut inner) = self.inner.take() else {
+            return Ok(());
+        };
+        inner.finish().map(|_| ()).map_err(std::io::Error::other)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ParallelGzipStreamConfig {
@@ -34,7 +111,7 @@ fn parallel_gzip_stream_writer<W: Write + Send + 'static>(
         .map_err(std::io::Error::other)?
         .buffer_size(config.block_size)
         .map_err(std::io::Error::other)?;
-    Ok(builder.from_writer(writer))
+    Ok(FinishingParallelWriter::new(builder.from_writer(writer)))
 }
 
 fn gzip_member(input: &[u8], mut output: Vec<u8>, level: u32) -> Result<Vec<u8>> {
@@ -315,7 +392,7 @@ impl OutputFastqFileOp {
                 } else if file_path.ends_with(".gz") && !self.parallel_gzip_members {
                     Box::new(BufWriter::with_capacity(
                         1 << 20,
-                        GzEncoder::new(File::create(file_path)?, Compression::new(self.gzip_level)),
+                        FinishingGzipWriter::new(File::create(file_path)?, self.gzip_level),
                     ))
                 } else {
                     Box::new(BufWriter::with_capacity(1 << 20, File::create(file_path)?))
@@ -598,6 +675,10 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
     }
@@ -608,6 +689,32 @@ impl<T: Trace> GraphNode<T> for OutputFastqFileOp {
 
     fn cost_class(&self) -> CostClass {
         CostClass::Io
+    }
+
+    fn finish(&self) -> Result<()> {
+        let writers = self.file_writers.lock();
+        let mut failures = Vec::new();
+        for (file_name, writer) in writers.iter() {
+            if let Err(source) = writer.lock().flush() {
+                failures.push(Error::FileIo {
+                    file: utf8(file_name),
+                    source: Box::new(source),
+                });
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let summary = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(Error::WorkerFailures {
+                summary,
+                errors: failures,
+            })
+        }
     }
 
     fn supports_prepared_output(&self) -> bool {
@@ -1046,6 +1153,10 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
         Some(&[])
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::None
     }
@@ -1056,6 +1167,28 @@ impl<'writer, T: Trace> GraphNode<T> for OutputFastqOp<'writer> {
 
     fn cost_class(&self) -> CostClass {
         CostClass::Io
+    }
+
+    fn finish(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for writer in &self.writers {
+            if let Err(error) = writer.lock().flush() {
+                failures.push(Error::BytesIo(Box::new(error)));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let summary = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(Error::WorkerFailures {
+                summary,
+                errors: failures,
+            })
+        }
     }
 
     fn supports_prepared_output(&self) -> bool {

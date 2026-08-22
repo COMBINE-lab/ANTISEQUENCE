@@ -25,7 +25,7 @@ impl SetOp {
     pub fn new(label_or_attr: impl Into<LabelOrAttr>, expr: impl Into<Expr>) -> Self {
         let label_or_attr = label_or_attr.into();
         let mut expr = expr.into();
-        expr.optimize();
+        let expression_is_constant = expr.optimize();
         let mut required_names = expr.required_names();
         match &label_or_attr {
             LabelOrAttr::Label(_) => required_names.push(label_or_attr.clone()),
@@ -38,8 +38,7 @@ impl SetOp {
         let reorder_safe = matches!(
             &label_or_attr,
             LabelOrAttr::RecordAttr(_) | LabelOrAttr::LaneAttr(_)
-        ) && required_names.is_empty()
-            && expr.eval(&Read::new(), false).is_ok();
+        ) && expression_is_constant;
 
         Self {
             required_names,
@@ -53,6 +52,10 @@ impl SetOp {
 impl<T: Trace> GraphNode<T> for SetOp {
     fn produced_names(&self) -> Option<&[LabelOrAttr]> {
         Some(std::slice::from_ref(&self.label_or_attr))
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
     }
 
     fn mutation_kind(&self) -> MutationKind {

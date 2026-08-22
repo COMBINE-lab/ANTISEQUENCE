@@ -49,6 +49,10 @@ impl<T: Trace> GraphNode<T> for BernoulliOp {
         Some(&self.produced_names)
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::Metadata
     }

@@ -2,6 +2,8 @@ use needletail::*;
 use parking_lot::Mutex;
 use rapidgzip_core::Decoder as RapidGzipDecoder;
 use smallvec::SmallVec;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read as IoRead};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
@@ -23,6 +25,64 @@ fn chunk_size() -> usize {
 }
 
 type ReaderWithOrigin<'reader> = (Mutex<Box<dyn FastxReader + 'reader>>, Arc<Origin>);
+
+fn empty_fastx_reader<'reader>() -> Result<Box<dyn FastxReader + 'reader>> {
+    // needletail's public FastxReader trait mentions private concrete types, so
+    // downstream crates cannot implement an empty reader directly. Exhausting
+    // one internal, known-valid record gives us the same zero-record behavior
+    // without special-casing the hot read loop.
+    let mut reader = parse_fastx_reader(&b"@antisequence-empty\nA\n+\n!\n"[..])
+        .map_err(|error| Error::BytesIo(Box::new(error)))?;
+    reader
+        .next()
+        .transpose()
+        .map_err(|error| Error::BytesIo(Box::new(error)))?;
+    Ok(reader)
+}
+
+fn parse_reader_allow_empty<'reader>(
+    reader: impl std::io::Read + Send + 'reader,
+) -> Result<Box<dyn FastxReader + 'reader>> {
+    let mut reader = BufReader::new(reader);
+    if reader
+        .fill_buf()
+        .map_err(|error| Error::BytesIo(Box::new(error)))?
+        .is_empty()
+    {
+        empty_fastx_reader()
+    } else {
+        parse_fastx_reader(reader).map_err(|error| Error::BytesIo(Box::new(error)))
+    }
+}
+
+pub(super) fn gzip_file_is_empty(file: &str) -> Result<bool> {
+    let input = File::open(file).map_err(|source| Error::FileIo {
+        file: file.to_owned(),
+        source: Box::new(source),
+    })?;
+    let mut decoder = flate2::read::MultiGzDecoder::new(input);
+    let mut first = [0u8; 1];
+    Ok(decoder.read(&mut first).map_err(|source| Error::FileIo {
+        file: file.to_owned(),
+        source: Box::new(source),
+    })? == 0)
+}
+
+fn parse_file_allow_empty<'reader>(file: &str) -> Result<Box<dyn FastxReader + 'reader>> {
+    let metadata = std::fs::metadata(file).map_err(|source| Error::FileIo {
+        file: file.to_owned(),
+        source: Box::new(source),
+    })?;
+    if metadata.is_file()
+        && (metadata.len() == 0 || (file.ends_with(".gz") && gzip_file_is_empty(file)?))
+    {
+        return empty_fastx_reader();
+    }
+    parse_fastx_file(file).map_err(|error| Error::FileIo {
+        file: file.to_owned(),
+        source: Box::new(error),
+    })
+}
 
 #[derive(Clone, Copy)]
 struct LaneInputStats {
@@ -82,10 +142,7 @@ impl<'reader> InputFastqOp<'reader> {
 
     /// Stream reads created from fastq records from an input file.
     pub fn from_file(file: impl AsRef<str>) -> Result<Self> {
-        let reader = Mutex::new(parse_fastx_file(file.as_ref()).map_err(|e| Error::FileIo {
-            file: file.as_ref().to_owned(),
-            source: Box::new(e),
-        })?);
+        let reader = Mutex::new(parse_file_allow_empty(file.as_ref())?);
         let n_fastqs = 1;
 
         Ok(Self {
@@ -109,10 +166,7 @@ impl<'reader> InputFastqOp<'reader> {
             .map(|f| -> Result<ReaderWithOrigin<'reader>> {
                 let file = f.as_ref();
                 Ok((
-                    Mutex::new(parse_fastx_file(file).map_err(|error| Error::FileIo {
-                        file: file.to_owned(),
-                        source: Box::new(error),
-                    })?),
+                    Mutex::new(parse_file_allow_empty(file)?),
                     Arc::new(Origin::File(file.to_owned())),
                 ))
             })
@@ -143,29 +197,34 @@ impl<'reader> InputFastqOp<'reader> {
             .into_iter()
             .map(|value| -> Result<ReaderWithOrigin<'reader>> {
                 let file = value.as_ref();
+                let metadata = std::fs::metadata(file).map_err(|source| Error::FileIo {
+                    file: file.to_owned(),
+                    source: Box::new(source),
+                })?;
                 let reader: Box<dyn FastxReader> = if file.ends_with(".gz") {
-                    let decoder = RapidGzipDecoder::builder()
-                        .decoder_threads(decoder_threads)
-                        .decoded_chunk_size(chunk_size_bytes)
-                        .build()
-                        .map_err(|error| Error::FileIo {
+                    if metadata.is_file() && gzip_file_is_empty(file)? {
+                        empty_fastx_reader()?
+                    } else {
+                        let decoder = RapidGzipDecoder::builder()
+                            .decoder_threads(decoder_threads)
+                            .decoded_chunk_size(chunk_size_bytes)
+                            .build()
+                            .map_err(|error| Error::FileIo {
+                                file: file.to_owned(),
+                                source: Box::new(error),
+                            })?
+                            .open(file)
+                            .map_err(|error| Error::FileIo {
+                                file: file.to_owned(),
+                                source: Box::new(error),
+                            })?;
+                        parse_fastx_reader(decoder).map_err(|error| Error::FileIo {
                             file: file.to_owned(),
                             source: Box::new(error),
                         })?
-                        .open(file)
-                        .map_err(|error| Error::FileIo {
-                            file: file.to_owned(),
-                            source: Box::new(error),
-                        })?;
-                    parse_fastx_reader(decoder).map_err(|error| Error::FileIo {
-                        file: file.to_owned(),
-                        source: Box::new(error),
-                    })?
+                    }
                 } else {
-                    parse_fastx_file(file).map_err(|error| Error::FileIo {
-                        file: file.to_owned(),
-                        source: Box::new(error),
-                    })?
+                    parse_file_allow_empty(file)?
                 };
                 Ok((Mutex::new(reader), Arc::new(Origin::File(file.to_owned()))))
             })
@@ -184,10 +243,7 @@ impl<'reader> InputFastqOp<'reader> {
 
     /// Stream reads created from interleaved fastq records from an input file.
     pub fn from_file_interleaved(file: impl AsRef<str>, interleaved: usize) -> Result<Self> {
-        let reader = Mutex::new(parse_fastx_file(file.as_ref()).map_err(|e| Error::FileIo {
-            file: file.as_ref().to_owned(),
-            source: Box::new(e),
-        })?);
+        let reader = Mutex::new(parse_file_allow_empty(file.as_ref())?);
         let n_fastqs = interleaved;
 
         Ok(Self {
@@ -206,8 +262,7 @@ impl<'reader> InputFastqOp<'reader> {
 
     /// Stream reads created from fastq records from an arbitrary `Read`er.
     pub fn from_reader(reader: impl std::io::Read + Send + 'reader) -> Result<Self> {
-        let reader =
-            Mutex::new(parse_fastx_reader(reader).map_err(|e| Error::BytesIo(Box::new(e)))?);
+        let reader = Mutex::new(parse_reader_allow_empty(reader)?);
         let n_fastqs = 1;
 
         Ok(Self {
@@ -229,10 +284,7 @@ impl<'reader> InputFastqOp<'reader> {
             .into_iter()
             .map(|reader| -> Result<ReaderWithOrigin<'reader>> {
                 Ok((
-                    Mutex::new(
-                        parse_fastx_reader(reader)
-                            .map_err(|error| Error::BytesIo(Box::new(error)))?,
-                    ),
+                    Mutex::new(parse_reader_allow_empty(reader)?),
                     Arc::new(Origin::Bytes),
                 ))
             })
@@ -256,8 +308,7 @@ impl<'reader> InputFastqOp<'reader> {
         reader: impl std::io::Read + Send + 'reader,
         interleaved: usize,
     ) -> Result<Self> {
-        let reader =
-            Mutex::new(parse_fastx_reader(reader).map_err(|e| Error::BytesIo(Box::new(e)))?);
+        let reader = Mutex::new(parse_reader_allow_empty(reader)?);
         let n_fastqs = interleaved;
 
         Ok(Self {
@@ -515,5 +566,60 @@ impl<'reader, T: Trace> GraphNode<T> for InputFastqOp<'reader> {
             read_length_sum,
             shard_read_counts: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, io::Write, sync::atomic::AtomicUsize};
+
+    use flate2::{write::GzEncoder, Compression};
+
+    use super::*;
+    use crate::trace::NoTrace;
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    fn empty_path(extension: &str) -> std::path::PathBuf {
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "antisequence-empty-{}-{id}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    fn assert_empty(op: InputFastqOp<'_>) {
+        let (reads, done) = <InputFastqOp as GraphNode<NoTrace>>::run(&op, None, &NoTrace).unwrap();
+        assert!(done);
+        assert!(reads.is_none());
+    }
+
+    #[test]
+    fn empty_reader_is_a_valid_zero_record_input() {
+        assert_empty(InputFastqOp::from_reader(&b""[..]).unwrap());
+    }
+
+    #[test]
+    fn empty_plain_and_gzip_files_are_valid_zero_record_inputs() {
+        let plain = empty_path("fastq");
+        fs::write(&plain, []).unwrap();
+        assert_empty(InputFastqOp::from_file(plain.to_string_lossy()).unwrap());
+
+        let gzip = empty_path("fastq.gz");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&[]).unwrap();
+        fs::write(&gzip, encoder.finish().unwrap()).unwrap();
+        assert_empty(InputFastqOp::from_file(gzip.to_string_lossy()).unwrap());
+        assert_empty(
+            InputFastqOp::from_files_accelerated_gzip(
+                [gzip.to_string_lossy().into_owned()],
+                1,
+                1 << 20,
+            )
+            .unwrap(),
+        );
+
+        let _ = fs::remove_file(plain);
+        let _ = fs::remove_file(gzip);
     }
 }

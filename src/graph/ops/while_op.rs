@@ -25,7 +25,7 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(mut current_batch) = reads else {
-            return Err(Error::MissingNodeInput(self.name()))
+            return Err(Error::MissingNodeInput(self.name()));
         };
 
         let mut final_results = Vec::with_capacity(current_batch.len());
@@ -137,6 +137,10 @@ impl<T: Trace> GraphNode<T> for WhileOp<T> {
         vec![self
             .graph
             .optimize_for_compilation_from(optimization, &body_live)]
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
     }
 
     fn name(&self) -> &'static str {

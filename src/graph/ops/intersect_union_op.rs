@@ -40,6 +40,10 @@ impl<T: Trace> GraphNode<T> for IntersectOp {
         Some(&self.produced_names)
     }
 
+    fn effects_are_complete(&self) -> bool {
+        true
+    }
+
     fn mutation_kind(&self) -> MutationKind {
         MutationKind::Metadata
     }
@@ -116,6 +120,10 @@ impl UnionOp {
 impl<T: Trace> GraphNode<T> for UnionOp {
     fn produced_names(&self) -> Option<&[LabelOrAttr]> {
         Some(&self.produced_names)
+    }
+
+    fn effects_are_complete(&self) -> bool {
+        true
     }
 
     fn mutation_kind(&self) -> MutationKind {

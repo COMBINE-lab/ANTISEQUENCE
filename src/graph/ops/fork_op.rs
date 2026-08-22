@@ -18,7 +18,7 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
     fn run(&self, reads: Option<Vec<Read>>, trace: &T) -> Result<(Option<Vec<Read>>, bool)> {
         let start = trace.start(&reads);
         let Some(reads) = reads else {
-            return Err(Error::MissingNodeInput(self.name()))
+            return Err(Error::MissingNodeInput(self.name()));
         };
         let mut originals = Vec::with_capacity(reads.len());
         let mut branches = Vec::with_capacity(reads.len());
@@ -59,6 +59,10 @@ impl<T: Trace> GraphNode<T> for ForkOp<T> {
         _live_out: &[LabelOrAttr],
     ) -> Vec<GraphOptimizationReport> {
         vec![self.graph.optimize_for_compilation_from(optimization, &[])]
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.graph.finish()
     }
 
     fn name(&self) -> &'static str {
