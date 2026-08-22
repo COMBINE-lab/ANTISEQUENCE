@@ -5,7 +5,7 @@ All notable changes to ANTISEQUENCE are documented here. This project follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-21
+## [0.1.0] - 2026-08-22
 
 - Atomic graph execution lifecycle: a graph runs at most once, repeated
   execution returns the typed `GraphAlreadyRunning`/`GraphAlreadyFinished`

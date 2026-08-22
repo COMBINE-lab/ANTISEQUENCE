@@ -28,9 +28,10 @@ antisequence = { version = "0.1", default-features = false, features = ["release
 
 `baseline-simd` and `release-simd` are intentionally mutually exclusive so an
 application cannot accidentally combine incompatible block-aligner widths.
-The pre-release feature names `portable-simd` and `simd-avx2` remain aliases for
-Git users, but new consumers should use the role-based names. Applications can
-record [`compiled_simd_backend`](https://docs.rs/antisequence/latest/antisequence/fn.compiled_simd_backend.html)
+The legacy feature names `portable-simd` and `simd-avx2` remain aliases for
+existing Git users, but new consumers should use the role-based names.
+Applications can record
+[`compiled_simd_backend`](https://docs.rs/antisequence/latest/antisequence/fn.compiled_simd_backend.html)
 in their build or run provenance. `release-simd` does not add runtime CPU
 dispatch: an executable selecting it must advertise or check the AVX2 floor
 before invoking matcher code. seqproc performs that check and applies its
